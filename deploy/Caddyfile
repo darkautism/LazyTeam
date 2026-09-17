@@ -1,4 +1,18 @@
 {$LAZYTEAM_DOMAIN} {
     encode zstd gzip
-    reverse_proxy lazyteam:8787
+
+    @protocol path /health /mcp /mcp/* /.well-known/*
+    handle @protocol {
+        reverse_proxy lazyteam:8787
+    }
+
+    @worker path /api/workers/register /api/workers/* /api/executions/*
+    handle @worker {
+        reverse_proxy lazyteam:8787
+    }
+
+    # Management REST and the current Web UI stay private. ChatGPT manages the
+    # control plane through OAuth-protected MCP; local administrators can use the
+    # loopback-bound server port with LAZYTEAM_ADMIN_TOKEN.
+    respond 404
 }
