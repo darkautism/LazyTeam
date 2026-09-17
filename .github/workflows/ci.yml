@@ -92,3 +92,66 @@ jobs:
           docker build -t lazyteam:ci .
           docker compose -f docker-compose.yml config >/dev/null
           docker compose -f docker-compose.public.yml config >/dev/null
+          docker run --rm \
+            -e LAZYTEAM_DOMAIN=lazyteam.example.test \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10-alpine caddy validate --config /etc/caddy/Caddyfile
+
+          mkdir -p /tmp/lazyteam-docker-data
+          sudo chown 10001:10001 /tmp/lazyteam-docker-data
+          docker run -d --name lazyteam-ci-runtime \
+            -p 127.0.0.1:8877:8787 \
+            -v /tmp/lazyteam-docker-data:/data \
+            -e LAZYTEAM_LISTEN=0.0.0.0:8787 \
+            -e LAZYTEAM_DATABASE_URL=sqlite:///data/lazyteam.db?mode=rwc \
+            -e LAZYTEAM_PRODUCTION=true \
+            -e LAZYTEAM_PUBLIC_URL=https://lazyteam.example.test \
+            -e LAZYTEAM_OAUTH_PASSWORD=smoke-security-password-1234 \
+            -e LAZYTEAM_ADMIN_TOKEN=admin-security-smoke-token-0123456789abcdef \
+            -e LAZYTEAM_WORKER_TOKEN=worker-security-smoke-token-0123456789abcdef \
+            -e LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS=chatgpt.com,*.chatgpt.com \
+            -e LAZYTEAM_ALLOWED_REDIRECT_HOSTS=chatgpt.com,*.chatgpt.com \
+            lazyteam:ci
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8877/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8877/health >/dev/null
+
+          for i in $(seq 1 25); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' lazyteam-ci-runtime)
+            if [ "$health" = "healthy" ]; then break; fi
+            sleep 2
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' lazyteam-ci-runtime)" = "healthy"
+
+          curl -fsS -X POST http://127.0.0.1:8877/api/projects \
+            -H "Authorization: Bearer $LAZYTEAM_ADMIN_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"slug":"docker-persist","name":"Docker Persist","repo_url":"https://example.invalid/persist.git","default_branch":"main"}' >/dev/null
+
+          docker rm -f lazyteam-ci-runtime
+
+          docker run -d --name lazyteam-ci-runtime \
+            -p 127.0.0.1:8877:8787 \
+            -v /tmp/lazyteam-docker-data:/data \
+            -e LAZYTEAM_LISTEN=0.0.0.0:8787 \
+            -e LAZYTEAM_DATABASE_URL=sqlite:///data/lazyteam.db?mode=rwc \
+            -e LAZYTEAM_PRODUCTION=true \
+            -e LAZYTEAM_PUBLIC_URL=https://lazyteam.example.test \
+            -e LAZYTEAM_OAUTH_PASSWORD=smoke-security-password-1234 \
+            -e LAZYTEAM_ADMIN_TOKEN=admin-security-smoke-token-0123456789abcdef \
+            -e LAZYTEAM_WORKER_TOKEN=worker-security-smoke-token-0123456789abcdef \
+            -e LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS=chatgpt.com,*.chatgpt.com \
+            -e LAZYTEAM_ALLOWED_REDIRECT_HOSTS=chatgpt.com,*.chatgpt.com \
+            lazyteam:ci
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8877/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8877/api/projects \
+            -H "Authorization: Bearer $LAZYTEAM_ADMIN_TOKEN" \
+            | python3 -c 'import json,sys; data=json.load(sys.stdin); assert any(p["slug"] == "docker-persist" for p in data)'
+          docker rm -f lazyteam-ci-runtime
