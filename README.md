@@ -13,7 +13,7 @@ LazyTeam is a self-hosted control plane for coordinating AI coding workers acros
 - Persistent SQLite state.
 - Web control board at `/` for projects, tasks, workers, approval, and retry.
 - MCP Streamable HTTP at `/mcp` for ChatGPT and other MCP clients.
-- OAuth compatibility modeled after MCPX: RFC 9728 protected-resource metadata, RFC 8414 authorization-server metadata, PKCE S256, Dynamic Client Registration, authorization-code and rotating refresh-token grants, plus path-qualified discovery aliases.
+- OAuth compatibility modeled after MCPX: RFC 9728 protected-resource metadata, RFC 8414 authorization-server metadata, PKCE S256, Dynamic Client Registration, ChatGPT-style HTTPS Client ID Metadata Documents (CIMD), authorization-code and rotating refresh-token grants, plus path-qualified discovery aliases.
 
 ## Run the control plane
 
@@ -96,7 +96,7 @@ Expose the control plane over HTTPS, set `LAZYTEAM_PUBLIC_URL` to that externall
 https://lazyteam.example.com/mcp
 ```
 
-The server exposes OAuth discovery, Dynamic Client Registration, PKCE authorization, token refresh, and the RFC 9728 `resource_metadata` challenge used by MCP clients. The current authorization screen uses `LAZYTEAM_OAUTH_PASSWORD` as the human approval credential.
+The server exposes OAuth discovery, Dynamic Client Registration, HTTPS Client ID Metadata Documents, PKCE authorization, token refresh, and the RFC 9728 `resource_metadata` challenge used by MCP clients. The current authorization screen uses `LAZYTEAM_OAUTH_PASSWORD` as the human approval credential.
 
 Current MCP tools:
 
@@ -119,4 +119,10 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-CI also boots a real LazyTeam server and exercises OAuth discovery, DCR, PKCE authorization-code exchange, refresh-token rotation, and the unauthenticated MCP challenge.
+CI boots a real LazyTeam server and checks:
+
+- OAuth discovery and RFC 9728 protected-resource metadata.
+- DCR, PKCE authorization-code exchange, and refresh-token rotation.
+- Authenticated MCP `server/discover` and `tools/list`.
+- Unauthenticated MCP challenge metadata.
+- Multi-project worker matching, lease renewal, review approval, and dependency release.
