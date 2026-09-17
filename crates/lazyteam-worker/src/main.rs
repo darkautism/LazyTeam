@@ -18,10 +18,10 @@ const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 struct Args {
     #[arg(long, env = "LAZYTEAM_SERVER", default_value = "http://127.0.0.1:8787")]
     server: String,
-    /// Shared enrollment secret. It is used only to reach worker endpoints; every
-    /// registration also receives a rotating worker-specific credential.
+    /// Shared enrollment secret. Required only for first enrollment or recovery when
+    /// the persisted worker-specific credential is no longer accepted by the server.
     #[arg(long, env = "LAZYTEAM_WORKER_TOKEN")]
-    worker_token: String,
+    worker_token: Option<String>,
     #[arg(long, env = "LAZYTEAM_WORKER_NAME", default_value = "worker")]
     name: String,
     #[arg(long = "tag", value_parser = parse_tag)]
@@ -62,17 +62,47 @@ async fn main() -> anyhow::Result<()> {
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
     let projects: BTreeSet<String> = args.allowed_projects.into_iter().collect();
 
-    let worker_credential = register(
-        &client,
-        &server,
-        &args.worker_token,
-        worker_id,
-        &args.name,
-        tags,
-        projects,
-        args.slots,
-    ).await?;
-    info!(%worker_id, server = %server, "worker registered with worker-specific credential");
+    let mut worker_credential = match load_worker_credential(&args.state_dir).await? {
+        Some(credential) => credential,
+        None => {
+            let enrollment = args.worker_token.as_deref().context(
+                "LAZYTEAM_WORKER_TOKEN is required for first enrollment; after enrollment the worker credential is persisted",
+            )?;
+            let credential = register(
+                &client,
+                &server,
+                enrollment,
+                worker_id,
+                &args.name,
+                tags.clone(),
+                projects.clone(),
+                args.slots,
+            ).await?;
+            persist_worker_credential(&args.state_dir, &credential).await?;
+            info!(%worker_id, server = %server, "worker enrolled and credential persisted");
+            credential
+        }
+    };
+
+    // A server database restore/replacement may invalidate the persisted credential.
+    // Re-enroll only when an enrollment secret was intentionally supplied for recovery.
+    if heartbeat(&client, &server, &worker_credential, worker_id).await.is_err() {
+        let enrollment = args.worker_token.as_deref().context(
+            "persisted worker credential was rejected and no enrollment secret was supplied for recovery",
+        )?;
+        worker_credential = register(
+            &client,
+            &server,
+            enrollment,
+            worker_id,
+            &args.name,
+            tags,
+            projects,
+            args.slots,
+        ).await?;
+        persist_worker_credential(&args.state_dir, &worker_credential).await?;
+        info!(%worker_id, "worker re-enrolled after credential rejection");
+    }
 
     let runtime: Arc<dyn AgentRuntime> = Arc::new(PiRuntime {
         binary: args.pi_bin,
@@ -81,18 +111,17 @@ async fn main() -> anyhow::Result<()> {
     });
 
     loop {
-        if let Err(error) = heartbeat(&client, &server, &args.worker_token, &worker_credential, worker_id).await {
+        if let Err(error) = heartbeat(&client, &server, &worker_credential, worker_id).await {
             warn!(%error, "heartbeat failed");
             sleep(Duration::from_secs(5)).await;
             continue;
         }
-        match claim(&client, &server, &args.worker_token, &worker_credential, worker_id).await {
+        match claim(&client, &server, &worker_credential, worker_id).await {
             Ok(Some(assignment)) => {
                 info!(task = %assignment.task.id, execution = %assignment.execution.id, project = %assignment.project.slug, "claimed task");
                 if let Err(error) = execute_assignment(
                     &client,
                     &server,
-                    &args.worker_token,
                     &worker_credential,
                     &args.workspace_dir,
                     runtime.clone(),
@@ -114,10 +143,8 @@ fn enrollment_auth(request: RequestBuilder, token: &str) -> RequestBuilder {
     request.bearer_auth(token)
 }
 
-fn worker_auth(request: RequestBuilder, enrollment: &str, credential: &str) -> RequestBuilder {
-    request
-        .bearer_auth(enrollment)
-        .header(WORKER_CREDENTIAL_HEADER, credential)
+fn worker_auth(request: RequestBuilder, credential: &str) -> RequestBuilder {
+    request.header(WORKER_CREDENTIAL_HEADER, credential)
 }
 
 async fn register(
@@ -151,14 +178,14 @@ async fn register(
     Ok(credential)
 }
 
-async fn heartbeat(client: &Client, server: &str, enrollment: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<()> {
-    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/heartbeat")), enrollment, credential).send().await?;
+async fn heartbeat(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<()> {
+    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/heartbeat")), credential).send().await?;
     ensure_success(response).await?;
     Ok(())
 }
 
-async fn claim(client: &Client, server: &str, enrollment: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<Option<Assignment>> {
-    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/claim")), enrollment, credential).send().await?;
+async fn claim(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<Option<Assignment>> {
+    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/claim")), credential).send().await?;
     if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
     let response = ensure_success(response).await?;
     Ok(Some(response.json().await?))
@@ -167,7 +194,6 @@ async fn claim(client: &Client, server: &str, enrollment: &str, credential: &str
 async fn execute_assignment(
     client: &Client,
     server: &str,
-    enrollment_token: &str,
     worker_credential: &str,
     workspace_root: &Path,
     runtime: Arc<dyn AgentRuntime>,
@@ -176,7 +202,6 @@ async fn execute_assignment(
     let execution_id = assignment.execution.id;
     let renew_client = client.clone();
     let renew_server = server.to_string();
-    let renew_enrollment = enrollment_token.to_string();
     let renew_credential = worker_credential.to_string();
     let renew = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -184,7 +209,6 @@ async fn execute_assignment(
             tick.tick().await;
             match worker_auth(
                 renew_client.post(format!("{renew_server}/api/executions/{execution_id}/renew")),
-                &renew_enrollment,
                 &renew_credential,
             ).send().await {
                 Ok(response) if response.status().is_success() => {}
@@ -211,7 +235,6 @@ async fn execute_assignment(
     };
     let response = worker_auth(
         client.post(format!("{server}/api/executions/{}/finish", assignment.execution.id)),
-        enrollment_token,
         worker_credential,
     )
         .json(&json!({"result": result}))
@@ -312,4 +335,27 @@ async fn load_or_create_worker_id(dir: &Path) -> anyhow::Result<Uuid> {
     let id = Uuid::new_v4();
     tokio::fs::write(path, id.to_string()).await?;
     Ok(id)
+}
+
+async fn load_worker_credential(dir: &Path) -> anyhow::Result<Option<String>> {
+    let path = dir.join("worker-credential");
+    match tokio::fs::read_to_string(path).await {
+        Ok(raw) => {
+            let credential = raw.trim().to_string();
+            if credential.is_empty() { Ok(None) } else { Ok(Some(credential)) }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn persist_worker_credential(dir: &Path, credential: &str) -> anyhow::Result<()> {
+    let path = dir.join("worker-credential");
+    tokio::fs::write(&path, credential).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    Ok(())
 }
