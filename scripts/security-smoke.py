@@ -91,7 +91,7 @@ def main():
     expect(anonymous_admin.status == 401, f"anonymous admin API should be 401, got {anonymous_admin.status}")
 
     worker_on_admin = request("/api/projects", method="POST", obj=project_payload(slug), token=WORKER)
-    expect(worker_on_admin.status == 401, f"worker token reached admin API: {worker_on_admin.status}")
+    expect(worker_on_admin.status == 401, f"worker enrollment token reached admin API: {worker_on_admin.status}")
 
     admin_create = request("/api/projects", method="POST", obj=project_payload(slug), token=ADMIN)
     expect(admin_create.status == 200, f"admin token could not create project: HTTP {admin_create.status}")
@@ -126,13 +126,12 @@ def main():
     credential_b = register_worker(worker_b_id, "worker-b")
     headers_b = worker_headers(credential_b)
 
-    missing_credential = request(f"/api/workers/{worker_id}/heartbeat", method="POST", token=WORKER)
-    expect(missing_credential.status == 401, "shared enrollment token worked without worker-specific credential")
+    enrollment_only = request(f"/api/workers/{worker_id}/heartbeat", method="POST", token=WORKER)
+    expect(enrollment_only.status == 401, "enrollment secret worked as a runtime worker credential")
 
     wrong_credential = request(
         f"/api/workers/{worker_id}/heartbeat",
         method="POST",
-        token=WORKER,
         headers=headers_b,
     )
     expect(wrong_credential.status == 401, "worker B credential impersonated worker A")
@@ -140,15 +139,23 @@ def main():
     heartbeat = request(
         f"/api/workers/{worker_id}/heartbeat",
         method="POST",
-        token=WORKER,
         headers=headers_a,
     )
-    expect(heartbeat.status == 204, f"worker heartbeat failed: {heartbeat.status}")
+    expect(heartbeat.status == 204, f"worker-specific heartbeat failed without enrollment secret: {heartbeat.status}")
+
+    # Even a bogus Authorization header must not matter after enrollment; only the
+    # worker-specific credential is the runtime identity.
+    heartbeat_with_bogus_bearer = request(
+        f"/api/workers/{worker_id}/heartbeat",
+        method="POST",
+        token="not-the-enrollment-token",
+        headers=headers_a,
+    )
+    expect(heartbeat_with_bogus_bearer.status == 204, "runtime worker endpoint still depends on enrollment bearer")
 
     claim = request(
         f"/api/workers/{worker_id}/claim",
         method="POST",
-        token=WORKER,
         headers=headers_a,
     )
     expect(claim.status == 200, f"worker claim failed: {claim.status}")
@@ -159,7 +166,6 @@ def main():
     cross_worker_renew = request(
         f"/api/executions/{execution_id}/renew",
         method="POST",
-        token=WORKER,
         headers=headers_b,
     )
     expect(cross_worker_renew.status == 401, "worker B renewed worker A execution")
@@ -167,21 +173,12 @@ def main():
     own_renew = request(
         f"/api/executions/{execution_id}/renew",
         method="POST",
-        token=WORKER,
         headers=headers_a,
     )
     expect(own_renew.status == 204, f"worker A could not renew its execution: {own_renew.status}")
 
     approve_with_worker = request(f"/api/tasks/{task_json['id']}/approve", method="POST", obj={}, token=WORKER)
     expect(approve_with_worker.status == 401, "worker enrollment token reached review approval")
-
-    bogus_worker = request(
-        f"/api/workers/{worker_id}/heartbeat",
-        method="POST",
-        token="not-the-worker-token",
-        headers=headers_a,
-    )
-    expect(bogus_worker.status == 401, "bogus enrollment token was accepted")
 
     bad_dcr = request("/mcp/oauth/register", method="POST", obj={
         "redirect_uris": ["https://evil.example/callback"],
