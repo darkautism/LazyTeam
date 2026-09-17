@@ -13,22 +13,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
       - run: cargo test --workspace
-      - name: Build server for OAuth smoke
-        run: cargo build -p lazyteam-server
-      - name: Start server
+      - name: OAuth smoke test
         env:
           LAZYTEAM_LISTEN: 127.0.0.1:8787
           LAZYTEAM_PUBLIC_URL: http://127.0.0.1:8787
           LAZYTEAM_DATABASE_URL: sqlite:///tmp/lazyteam-ci.db?mode=rwc
           LAZYTEAM_OAUTH_PASSWORD: smoke-secret
-        run: nohup ./target/debug/lazyteam-server >/tmp/lazyteam-server.log 2>&1 &
-      - name: OAuth smoke test
-        env:
           LAZYTEAM_SMOKE_URL: http://127.0.0.1:8787
-          LAZYTEAM_OAUTH_PASSWORD: smoke-secret
         run: |
+          cargo build -p lazyteam-server
+          ./target/debug/lazyteam-server >/tmp/lazyteam-server.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8787/health >/dev/null; then break; fi
             sleep 1
           done
+          if ! curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+            cat /tmp/lazyteam-server.log
+            exit 1
+          fi
           python3 scripts/oauth-smoke.py
