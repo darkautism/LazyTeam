@@ -1,0 +1,4 @@
+{$LAZYTEAM_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy lazyteam:8787
+}
