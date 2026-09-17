@@ -11,6 +11,7 @@ import urllib.request
 BASE = os.environ.get("LAZYTEAM_SMOKE_URL", "http://127.0.0.1:8787")
 PASSWORD = os.environ.get("LAZYTEAM_OAUTH_PASSWORD", "smoke-secret")
 REDIRECT = "http://127.0.0.1:9911/callback"
+MCP_VERSION = "2026-07-28"
 
 
 def request(path, *, method="GET", data=None, headers=None, follow=True):
@@ -42,6 +43,22 @@ def read_json(resp):
 def expect(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+def mcp_call(token, method, params=None):
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params or {},
+    }).encode()
+    return request("/mcp", method="POST", data=body, headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_VERSION,
+        "Mcp-Method": method,
+    })
 
 
 def main():
@@ -114,6 +131,27 @@ def main():
     expect(tokens["token_type"] == "Bearer", "wrong token type")
     expect(tokens.get("refresh_token"), "refresh token missing")
 
+    discover = mcp_call(tokens["access_token"], "server/discover", {
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
+            "io.modelcontextprotocol/clientInfo": {"name": "lazyteam-smoke", "version": "1.0"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }
+    })
+    expect(discover.status == 200, f"authenticated server/discover failed with HTTP {discover.status}")
+    discovered = read_json(discover)
+    expect("tools" in discovered.get("result", {}).get("capabilities", {}), "server/discover did not advertise tools")
+    expect(MCP_VERSION in discovered.get("result", {}).get("supportedVersions", []), "server/discover omitted requested protocol version")
+
+    tools = mcp_call(tokens["access_token"], "tools/list", {
+        "_meta": {"io.modelcontextprotocol/protocolVersion": MCP_VERSION}
+    })
+    expect(tools.status == 200, f"authenticated tools/list failed with HTTP {tools.status}")
+    tool_result = read_json(tools)
+    names = {tool.get("name") for tool in tool_result.get("result", {}).get("tools", [])}
+    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_create", "tasks_approve", "tasks_retry", "workers_list"}
+    expect(required_tools.issubset(names), f"tools/list missing tools: {sorted(required_tools - names)}")
+
     refresh_resp = request("/mcp/oauth/token", method="POST", data={
         "grant_type": "refresh_token",
         "client_id": client_id,
@@ -130,12 +168,12 @@ def main():
     www = unauthorized.headers.get("WWW-Authenticate", "")
     expect("resource_metadata=" in www, "WWW-Authenticate lacks resource_metadata")
 
-    print("OAuth smoke test passed")
+    print("OAuth + MCP smoke test passed")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"OAuth smoke test failed: {exc}", file=sys.stderr)
+        print(f"OAuth + MCP smoke test failed: {exc}", file=sys.stderr)
         raise
