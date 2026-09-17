@@ -1,8 +1,10 @@
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
-use reqwest::{header::ACCEPT, redirect::Policy};
+use reqwest::{header::{ACCEPT, LOCATION}, redirect::Policy};
 use serde::Deserialize;
 use url::Url;
+
+use crate::security;
 
 const MAX_BODY: usize = 1 << 20;
 const MAX_REDIRECTS: usize = 8;
@@ -44,26 +46,57 @@ pub(crate) async fn resolve(client_id: &str) -> Result<CimdClient, String> {
         return Err("client_id is not an HTTPS metadata document URL".into());
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(Policy::custom(|attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                attempt.error("too many CIMD redirects")
-            } else if attempt.url().scheme() != "https" {
-                attempt.error("CIMD redirects must stay on HTTPS")
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .map_err(|e| format!("build CIMD client: {e}"))?;
+    let mut current = Url::parse(client_id).map_err(|e| format!("parse CIMD URL: {e}"))?;
+    let mut response = None;
 
-    let mut response = client
-        .get(client_id)
-        .header(ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("fetch CIMD: {e}"))?;
+    for redirects in 0..=MAX_REDIRECTS {
+        if !security::cimd_url_allowed(&current) {
+            return Err("CIMD URL host is not allowed".into());
+        }
+        let endpoint = security::resolve_public_endpoint(&current).await?;
+        let host = current
+            .host_str()
+            .ok_or_else(|| "CIMD URL has no host".to_string())?;
+
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(Policy::none());
+        if host.parse::<IpAddr>().is_err() {
+            // Pin the request to the addresses we just validated. This closes the DNS
+            // re-resolution window between SSRF validation and the actual connection.
+            builder = builder.resolve(host, endpoint);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| format!("build CIMD client: {e}"))?;
+
+        let resp = client
+            .get(current.clone())
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("fetch CIMD: {e}"))?;
+
+        if resp.status().is_redirection() {
+            if redirects >= MAX_REDIRECTS {
+                return Err("too many CIMD redirects".into());
+            }
+            let location = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| "CIMD redirect lacks Location".to_string())?;
+            current = current
+                .join(location)
+                .map_err(|e| format!("invalid CIMD redirect: {e}"))?;
+            // The next iteration rechecks scheme, allowlist, DNS and address class.
+            continue;
+        }
+        response = Some(resp);
+        break;
+    }
+
+    let mut response = response.ok_or_else(|| "CIMD redirect limit exceeded".to_string())?;
     if !response.status().is_success() {
         return Err(format!("fetch CIMD: HTTP {}", response.status()));
     }
@@ -83,8 +116,13 @@ pub(crate) async fn resolve(client_id: &str) -> Result<CimdClient, String> {
     if !doc.client_id.is_empty() && doc.client_id != client_id {
         return Err("CIMD client_id mismatch".into());
     }
-    if doc.redirect_uris.is_empty() || doc.redirect_uris.iter().any(|uri| !valid_redirect_uri(uri)) {
-        return Err("CIMD contains invalid redirect_uris".into());
+    if doc.redirect_uris.is_empty()
+        || doc
+            .redirect_uris
+            .iter()
+            .any(|uri| !security::redirect_uri_allowed(uri))
+    {
+        return Err("CIMD contains redirect_uris rejected by policy".into());
     }
 
     let mut method = doc.token_endpoint_auth_method.trim().to_string();
@@ -106,17 +144,6 @@ pub(crate) async fn resolve(client_id: &str) -> Result<CimdClient, String> {
         redirect_uris: doc.redirect_uris,
         token_endpoint_auth_method: method,
     })
-}
-
-fn valid_redirect_uri(raw: &str) -> bool {
-    let Ok(url) = Url::parse(raw) else {
-        return false;
-    };
-    match url.scheme() {
-        "https" => url.host_str().is_some() && url.username().is_empty() && url.password().is_none(),
-        "http" => matches!(url.host_str(), Some("127.0.0.1") | Some("localhost") | Some("::1")),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
