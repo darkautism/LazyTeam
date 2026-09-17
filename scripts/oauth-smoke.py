@@ -94,7 +94,7 @@ def main():
         "state": "ci-state",
         "password": PASSWORD,
     }, follow=False)
-    expect(auth.status == 302, f"authorize POST did not redirect: {auth.status}")
+    expect(auth.status in (302, 303), f"authorize POST did not redirect: {auth.status}")
     location = auth.headers["Location"]
     query = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
     expect(query.get("state") == ["ci-state"], "OAuth state was not preserved")
