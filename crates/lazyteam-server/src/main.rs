@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use anyhow::Context;
 use axum::{middleware, Router};
@@ -6,7 +6,7 @@ use clap::Parser;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -44,9 +44,14 @@ async fn main() -> anyhow::Result<()> {
     if args.database_url.starts_with("sqlite://data/") {
         tokio::fs::create_dir_all("data").await?;
     }
+    let connect_options = SqliteConnectOptions::from_str(&args.database_url)
+        .context("parse sqlite URL")?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal);
     let db = SqlitePoolOptions::new()
         .max_connections(8)
-        .connect(&args.database_url)
+        .connect_with(connect_options)
         .await
         .context("connect sqlite")?;
     sqlx::migrate!().run(&db).await.context("run migrations")?;
