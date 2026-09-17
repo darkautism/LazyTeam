@@ -13,6 +13,8 @@ use tracing::info;
 mod api;
 mod mcp;
 mod oauth;
+mod review;
+mod web;
 
 pub(crate) use api::{
     create_project, create_task, list_projects, list_tasks, list_workers, ApiError, AppState,
@@ -70,7 +72,9 @@ async fn main() -> anyhow::Result<()> {
         ));
 
     let app = Router::new()
+        .merge(web::router())
         .merge(api::router())
+        .merge(review::router())
         .merge(oauth::router())
         .merge(mcp_router)
         .layer(TraceLayer::new_for_http())
