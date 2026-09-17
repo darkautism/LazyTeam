@@ -1,52 +1,112 @@
 # LazyTeam
 
-LazyTeam is a self-hosted control plane for coordinating AI coding workers across multiple projects.
+LazyTeam is a self-hosted Rust control plane for coordinating AI coding workers across multiple projects.
 
 ## Current MVP
 
 - Rust control plane and Rust worker daemon.
 - Multiple first-class projects, each bound to a Git repository and default branch.
 - Shared worker pool with project access rules and key/value capability tags.
-- Workers connect outbound: register, heartbeat, claim, renew leases, and report results.
+- Workers connect outbound: enroll, heartbeat, claim, renew leases, and report results.
 - Task dependencies, execution attempts, stale-execution rejection, and lease-expiry requeue.
 - Pi RPC is the first worker runtime; an execution is considered finished only after Pi emits `agent_settled`.
 - Persistent SQLite state.
-- Web control board at `/` for projects, tasks, workers, approval, and retry.
 - MCP Streamable HTTP at `/mcp` for ChatGPT and other MCP clients.
-- OAuth compatibility modeled after MCPX: RFC 9728 protected-resource metadata, RFC 8414 authorization-server metadata, PKCE S256, Dynamic Client Registration, ChatGPT-style HTTPS Client ID Metadata Documents (CIMD), authorization-code and rotating refresh-token grants, plus path-qualified discovery aliases.
+- OAuth compatibility modeled after MCPX: RFC 9728 protected-resource metadata, RFC 8414 authorization-server metadata, PKCE S256, Dynamic Client Registration, HTTPS Client ID Metadata Documents (CIMD), authorization-code and rotating refresh-token grants, plus path-qualified discovery aliases.
 
-## Run the control plane
+## Public deployment
 
-Set a public URL that resolves to the server when connecting a remote MCP client. For local development, localhost is fine.
+Do not publish LazyTeam port `8787` directly to the Internet. The production profile places Caddy in front of LazyTeam and exposes only MCP/OAuth, health, and the worker runtime endpoints. Management REST and the current Web UI stay loopback-only.
+
+Set a DNS name that points at the host, then generate strong secrets:
 
 ```sh
-export LAZYTEAM_PUBLIC_URL=https://lazyteam.example.com
-export LAZYTEAM_OAUTH_PASSWORD='replace-with-a-strong-password'
-docker compose up --build
+export LAZYTEAM_DOMAIN=lazyteam.example.com
+export LAZYTEAM_OAUTH_PASSWORD="$(openssl rand -base64 32)"
+export LAZYTEAM_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export LAZYTEAM_WORKER_TOKEN="$(openssl rand -hex 32)"
+
+docker compose -f docker-compose.public.yml up -d --build
 ```
 
-Persistent data is stored in the `lazyteam-data` Docker volume. The server listens on port `8787` by default.
-
-Useful endpoints:
+The public endpoint is then:
 
 ```text
-/                                      Web UI
-/health                                Health check
-/api/projects                          Project API
-/api/tasks                             Task API
-/api/workers                           Worker registry
-/mcp                                   MCP Streamable HTTP
-/.well-known/oauth-protected-resource/mcp
-/.well-known/oauth-authorization-server
-/mcp/oauth/register
-/mcp/oauth/authorize
-/mcp/oauth/token
+https://lazyteam.example.com/mcp
 ```
 
-## Add a project
+Caddy obtains and renews the public TLS certificate. LazyTeam itself remains reachable on the host only through `127.0.0.1:8787` for local administration.
+
+Persistent server state is stored in the `lazyteam-data` Docker volume. The container runs as a non-root user with a read-only root filesystem, all Linux capabilities dropped, and `no-new-privileges` enabled.
+
+### Required production settings
+
+```text
+LAZYTEAM_PRODUCTION=true
+LAZYTEAM_PUBLIC_URL=https://lazyteam.example.com
+LAZYTEAM_OAUTH_PASSWORD=<strong human authorization password>
+LAZYTEAM_ADMIN_TOKEN=<strong local management bearer>
+LAZYTEAM_WORKER_TOKEN=<strong worker enrollment secret>
+LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS=chatgpt.com,*.chatgpt.com
+LAZYTEAM_ALLOWED_REDIRECT_HOSTS=chatgpt.com,*.chatgpt.com
+```
+
+Production startup fails if `LAZYTEAM_PUBLIC_URL` is not an absolute HTTPS URL, required credentials are missing/too short, or OAuth host allowlists are empty.
+
+The ChatGPT host values are defaults, not a universal trust rule. If the actual MCP client metadata or callback host changes, update the allowlists explicitly instead of opening them to `*`.
+
+### Public route boundary
+
+The provided Caddy configuration publishes only:
+
+```text
+/health
+/mcp
+/mcp/*
+/.well-known/*
+/api/workers/register
+/api/workers/*
+/api/executions/*
+```
+
+Everything else receives `404` at the public reverse proxy. In particular, Project/Task CRUD, review approval/retry, the Worker registry listing, and the current Web UI are not publicly routed.
+
+## Security model
+
+LazyTeam separates three identities:
+
+1. **ChatGPT / MCP clients** use OAuth Bearer tokens scoped to the `/mcp` protected resource.
+2. **Local administrators** use `LAZYTEAM_ADMIN_TOKEN` on management REST requests through the loopback-bound port.
+3. **Workers** use an enrollment secret only when joining, then receive an independent worker-specific credential.
+
+Worker-specific credentials are generated by the control plane, returned once in the `X-LazyTeam-Worker-Credential` response header, and stored in SQLite only as a SHA-256 hash. The Rust worker persists its credential in its state directory and uses it for heartbeat, claim, lease renewal, and completion. On Unix the credential file is set to mode `0600`.
+
+The shared `LAZYTEAM_WORKER_TOKEN` is therefore an **enrollment credential**, not the normal runtime worker identity. After workers are enrolled, it can be rotated without invalidating already-enrolled workers. Supplying a new enrollment secret to a worker is only needed for first enrollment or recovery after the server has lost/replaced its worker credential state.
+
+Execution renew/finish requests are checked against the worker that owns the execution, so a credential issued to Worker B cannot operate Worker A's execution.
+
+OAuth/CIMD hardening includes:
+
+- PKCE S256 required.
+- Exact registered redirect URI matching.
+- OAuth client metadata and redirect host allowlists.
+- Access tokens bound to the MCP resource and stored only as hashes.
+- One-time authorization codes and rotating refresh tokens.
+- CIMD HTTPS-only fetching with size/time limits.
+- DNS resolution before CIMD fetches and rejection of loopback, RFC1918, CGNAT, link-local, ULA, multicast, documentation and other special-use addresses.
+- Redirect-by-redirect URL/DNS validation and DNS pinning to close the validation/connect rebinding window.
+- Rate limits on DCR, authorization, token exchange, worker enrollment, and worker claiming.
+- 1 MiB request-body limit, request timeout, CSP, HSTS, `nosniff`, frame denial, `no-referrer`, and `no-store` response headers.
+
+The domain allowlists above protect OAuth client/callback identity. CORS or an HTTP `Origin` header is deliberately not treated as an authentication boundary because non-browser clients can forge those headers.
+
+## Local management
+
+Production management requests go through the loopback-bound port and require the admin bearer:
 
 ```sh
 curl -X POST http://127.0.0.1:8787/api/projects \
+  -H "Authorization: Bearer $LAZYTEAM_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "slug":"lazyteam",
@@ -59,13 +119,17 @@ curl -X POST http://127.0.0.1:8787/api/projects \
 
 A task stores a `project_id`. Workers remain a shared fleet and may allow all projects (`*`) or an explicit set of project slugs.
 
+The current Web UI is intentionally not part of the public Caddy route set. A future authenticated Pi-backed planner UI can be added without weakening the current management boundary.
+
 ## Run a worker
 
-The worker needs `git`, access to the project repositories it may execute, and Pi on `PATH` (or `LAZYTEAM_PI_BIN`).
+The worker needs `git`, access to the project repositories it may execute, and Pi on `PATH` (or `LAZYTEAM_PI_BIN`). On first enrollment it also needs the shared enrollment secret:
 
 ```sh
+export LAZYTEAM_WORKER_TOKEN='<enrollment secret>'
+
 cargo run -p lazyteam-worker -- \
-  --server http://127.0.0.1:8787 \
+  --server https://lazyteam.example.com \
   --name worker-01 \
   --project '*' \
   --tag os=linux \
@@ -73,7 +137,9 @@ cargo run -p lazyteam-worker -- \
   --tag rust=true
 ```
 
-The worker persists its identity locally, actively registers with the control plane, and claims only tasks whose project access and required tags match. Each execution gets a separate checkout and branch.
+The worker persists its identity and worker-specific credential under `LAZYTEAM_WORKER_STATE_DIR` (default `.lazyteam-worker`). Subsequent starts can omit `LAZYTEAM_WORKER_TOKEN` as long as the persisted credential remains valid.
+
+Each execution gets a separate checkout and branch.
 
 ## Task lifecycle
 
@@ -90,13 +156,13 @@ queued -> assigned -> running -> review -> done
 
 ## Connect ChatGPT through MCP
 
-Expose the control plane over HTTPS, set `LAZYTEAM_PUBLIC_URL` to that externally reachable origin, then add this MCP endpoint to the client:
+Add the public MCP endpoint to ChatGPT:
 
 ```text
 https://lazyteam.example.com/mcp
 ```
 
-The server exposes OAuth discovery, Dynamic Client Registration, HTTPS Client ID Metadata Documents, PKCE authorization, token refresh, and the RFC 9728 `resource_metadata` challenge used by MCP clients. The current authorization screen uses `LAZYTEAM_OAUTH_PASSWORD` as the human approval credential.
+The server exposes OAuth discovery, Dynamic Client Registration, HTTPS Client ID Metadata Documents, PKCE authorization, token refresh, and the RFC 9728 `resource_metadata` challenge. The authorization page uses `LAZYTEAM_OAUTH_PASSWORD` for the human approval step.
 
 Current MCP tools:
 
@@ -110,19 +176,30 @@ tasks_retry
 workers_list
 ```
 
-The intent is that a strong planner such as ChatGPT talks only to the control plane, creates project-scoped work through MCP, and lets idle workers claim matching tasks automatically.
+The intended flow is that a strong planner such as ChatGPT talks to the OAuth-protected MCP control plane, creates project-scoped work, and lets idle workers claim matching tasks automatically.
 
 ## Development
+
+For non-production local development, the security middleware keeps the original unauthenticated local REST workflow unless credentials/production mode are enabled:
 
 ```sh
 cargo check --workspace
 cargo test --workspace
+cargo run -p lazyteam-server
 ```
 
-CI boots a real LazyTeam server and checks:
+CI boots real LazyTeam servers and gates the public deployment on:
 
+- `cargo check --workspace` and `cargo test --workspace`.
 - OAuth discovery and RFC 9728 protected-resource metadata.
 - DCR, PKCE authorization-code exchange, and refresh-token rotation.
 - Authenticated MCP `server/discover` and `tools/list`.
 - Unauthenticated MCP challenge metadata.
 - Multi-project worker matching, lease renewal, review approval, and dependency release.
+- Anonymous/admin/worker role separation.
+- Per-worker credential isolation and cross-worker execution rejection.
+- OAuth callback/client host policy and private CIMD rejection.
+- OAuth rate limiting.
+- Production rejection of insecure HTTP public URLs.
+- Production Docker image build.
+- Local and public Docker Compose configuration validation.
