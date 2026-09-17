@@ -12,10 +12,14 @@ use uuid::Uuid;
 mod runtime;
 use runtime::{AgentRuntime, PiRuntime};
 
+const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
+
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long, env = "LAZYTEAM_SERVER", default_value = "http://127.0.0.1:8787")]
     server: String,
+    /// Shared enrollment secret. It is used only to reach worker endpoints; every
+    /// registration also receives a rotating worker-specific credential.
     #[arg(long, env = "LAZYTEAM_WORKER_TOKEN")]
     worker_token: String,
     #[arg(long, env = "LAZYTEAM_WORKER_NAME", default_value = "worker")]
@@ -58,8 +62,17 @@ async fn main() -> anyhow::Result<()> {
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
     let projects: BTreeSet<String> = args.allowed_projects.into_iter().collect();
 
-    register(&client, &server, &args.worker_token, worker_id, &args.name, tags, projects, args.slots).await?;
-    info!(%worker_id, server = %server, "worker registered");
+    let worker_credential = register(
+        &client,
+        &server,
+        &args.worker_token,
+        worker_id,
+        &args.name,
+        tags,
+        projects,
+        args.slots,
+    ).await?;
+    info!(%worker_id, server = %server, "worker registered with worker-specific credential");
 
     let runtime: Arc<dyn AgentRuntime> = Arc::new(PiRuntime {
         binary: args.pi_bin,
@@ -68,15 +81,23 @@ async fn main() -> anyhow::Result<()> {
     });
 
     loop {
-        if let Err(error) = heartbeat(&client, &server, &args.worker_token, worker_id).await {
+        if let Err(error) = heartbeat(&client, &server, &args.worker_token, &worker_credential, worker_id).await {
             warn!(%error, "heartbeat failed");
             sleep(Duration::from_secs(5)).await;
             continue;
         }
-        match claim(&client, &server, &args.worker_token, worker_id).await {
+        match claim(&client, &server, &args.worker_token, &worker_credential, worker_id).await {
             Ok(Some(assignment)) => {
                 info!(task = %assignment.task.id, execution = %assignment.execution.id, project = %assignment.project.slug, "claimed task");
-                if let Err(error) = execute_assignment(&client, &server, &args.worker_token, &args.workspace_dir, runtime.clone(), assignment).await {
+                if let Err(error) = execute_assignment(
+                    &client,
+                    &server,
+                    &args.worker_token,
+                    &worker_credential,
+                    &args.workspace_dir,
+                    runtime.clone(),
+                    assignment,
+                ).await {
                     error!(%error, "assignment execution failed");
                 }
             }
@@ -89,21 +110,27 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn auth(request: RequestBuilder, token: &str) -> RequestBuilder {
+fn enrollment_auth(request: RequestBuilder, token: &str) -> RequestBuilder {
     request.bearer_auth(token)
+}
+
+fn worker_auth(request: RequestBuilder, enrollment: &str, credential: &str) -> RequestBuilder {
+    request
+        .bearer_auth(enrollment)
+        .header(WORKER_CREDENTIAL_HEADER, credential)
 }
 
 async fn register(
     client: &Client,
     server: &str,
-    token: &str,
+    enrollment_token: &str,
     id: Uuid,
     name: &str,
     tags: BTreeMap<String, String>,
     allowed_projects: BTreeSet<String>,
     slots: u32,
-) -> anyhow::Result<()> {
-    let response = auth(client.post(format!("{server}/api/workers/register")), token).json(&json!({
+) -> anyhow::Result<String> {
+    let response = enrollment_auth(client.post(format!("{server}/api/workers/register")), enrollment_token).json(&json!({
         "id": id,
         "name": name,
         "os": std::env::consts::OS,
@@ -114,18 +141,24 @@ async fn register(
         "worker_version": env!("CARGO_PKG_VERSION"),
         "protocol_version": 1
     })).send().await?;
+    let response = ensure_success(response).await?;
+    let credential = response
+        .headers()
+        .get(WORKER_CREDENTIAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .context("server did not return a worker-specific credential")?
+        .to_string();
+    Ok(credential)
+}
+
+async fn heartbeat(client: &Client, server: &str, enrollment: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<()> {
+    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/heartbeat")), enrollment, credential).send().await?;
     ensure_success(response).await?;
     Ok(())
 }
 
-async fn heartbeat(client: &Client, server: &str, token: &str, worker_id: Uuid) -> anyhow::Result<()> {
-    let response = auth(client.post(format!("{server}/api/workers/{worker_id}/heartbeat")), token).send().await?;
-    ensure_success(response).await?;
-    Ok(())
-}
-
-async fn claim(client: &Client, server: &str, token: &str, worker_id: Uuid) -> anyhow::Result<Option<Assignment>> {
-    let response = auth(client.post(format!("{server}/api/workers/{worker_id}/claim")), token).send().await?;
+async fn claim(client: &Client, server: &str, enrollment: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<Option<Assignment>> {
+    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/claim")), enrollment, credential).send().await?;
     if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
     let response = ensure_success(response).await?;
     Ok(Some(response.json().await?))
@@ -134,7 +167,8 @@ async fn claim(client: &Client, server: &str, token: &str, worker_id: Uuid) -> a
 async fn execute_assignment(
     client: &Client,
     server: &str,
-    worker_token: &str,
+    enrollment_token: &str,
+    worker_credential: &str,
     workspace_root: &Path,
     runtime: Arc<dyn AgentRuntime>,
     assignment: Assignment,
@@ -142,17 +176,17 @@ async fn execute_assignment(
     let execution_id = assignment.execution.id;
     let renew_client = client.clone();
     let renew_server = server.to_string();
-    let renew_token = worker_token.to_string();
+    let renew_enrollment = enrollment_token.to_string();
+    let renew_credential = worker_credential.to_string();
     let renew = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         loop {
             tick.tick().await;
-            match renew_client
-                .post(format!("{renew_server}/api/executions/{execution_id}/renew"))
-                .bearer_auth(&renew_token)
-                .send()
-                .await
-            {
+            match worker_auth(
+                renew_client.post(format!("{renew_server}/api/executions/{execution_id}/renew")),
+                &renew_enrollment,
+                &renew_credential,
+            ).send().await {
                 Ok(response) if response.status().is_success() => {}
                 Ok(response) => warn!(status = %response.status(), %execution_id, "lease renew rejected"),
                 Err(error) => warn!(%error, %execution_id, "lease renew failed"),
@@ -175,9 +209,10 @@ async fn execute_assignment(
             artifacts: vec![],
         },
     };
-    let response = auth(
+    let response = worker_auth(
         client.post(format!("{server}/api/executions/{}/finish", assignment.execution.id)),
-        worker_token,
+        enrollment_token,
+        worker_credential,
     )
         .json(&json!({"result": result}))
         .send().await?;
