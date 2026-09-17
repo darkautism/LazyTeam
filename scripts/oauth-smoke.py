@@ -45,6 +45,14 @@ def expect(condition, message):
         raise AssertionError(message)
 
 
+def mcp_meta():
+    return {
+        "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
+        "io.modelcontextprotocol/clientInfo": {"name": "lazyteam-smoke", "version": "1.0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+
+
 def mcp_call(token, method, params=None):
     body = json.dumps({
         "jsonrpc": "2.0",
@@ -131,21 +139,13 @@ def main():
     expect(tokens["token_type"] == "Bearer", "wrong token type")
     expect(tokens.get("refresh_token"), "refresh token missing")
 
-    discover = mcp_call(tokens["access_token"], "server/discover", {
-        "_meta": {
-            "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
-            "io.modelcontextprotocol/clientInfo": {"name": "lazyteam-smoke", "version": "1.0"},
-            "io.modelcontextprotocol/clientCapabilities": {},
-        }
-    })
+    discover = mcp_call(tokens["access_token"], "server/discover", {"_meta": mcp_meta()})
     expect(discover.status == 200, f"authenticated server/discover failed with HTTP {discover.status}")
     discovered = read_json(discover)
     expect("tools" in discovered.get("result", {}).get("capabilities", {}), "server/discover did not advertise tools")
     expect(MCP_VERSION in discovered.get("result", {}).get("supportedVersions", []), "server/discover omitted requested protocol version")
 
-    tools = mcp_call(tokens["access_token"], "tools/list", {
-        "_meta": {"io.modelcontextprotocol/protocolVersion": MCP_VERSION}
-    })
+    tools = mcp_call(tokens["access_token"], "tools/list", {"_meta": mcp_meta()})
     expect(tools.status == 200, f"authenticated tools/list failed with HTTP {tools.status}")
     tool_result = read_json(tools)
     names = {tool.get("name") for tool in tool_result.get("result", {}).get("tools", [])}
