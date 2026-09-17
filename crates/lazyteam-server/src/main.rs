@@ -14,7 +14,10 @@ mod api;
 mod mcp;
 mod oauth;
 
-use api::AppState;
+pub(crate) use api::{
+    create_project, create_task, list_projects, list_tasks, list_workers, ApiError, AppState,
+    CreateProject, CreateTask,
+};
 
 #[derive(Parser, Debug)]
 struct Args {
