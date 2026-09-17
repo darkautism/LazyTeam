@@ -75,7 +75,7 @@ def main():
     expect(worker_on_admin.status == 401, f"worker token reached admin API: {worker_on_admin.status}")
 
     admin_create = request("/api/projects", method="POST", obj=project_payload(slug), token=ADMIN)
-    expect(admin_create.status == 200, f"admin token could not create project: {admin_create.status} {admin_create.read()!r}")
+    expect(admin_create.status == 200, f"admin token could not create project: HTTP {admin_create.status}")
     project = read_json(admin_create)
 
     anonymous_tasks = request("/api/tasks")
@@ -91,7 +91,7 @@ def main():
         "expected_outcome": "exercise worker role separation",
         "required_tags": {"rust": "true"},
     })
-    expect(task.status == 200, f"admin could not create task: {task.status}")
+    expect(task.status == 200, f"admin could not create task: HTTP {task.status}")
     task_json = read_json(task)
 
     worker_id = str(uuid.uuid4())
@@ -100,7 +100,8 @@ def main():
     admin_worker = request("/api/workers/register", method="POST", obj=worker_payload(worker_id), token=ADMIN)
     expect(admin_worker.status == 401, "admin credential was accepted as worker credential")
     good_worker = request("/api/workers/register", method="POST", obj=worker_payload(worker_id), token=WORKER)
-    expect(good_worker.status == 200, f"worker registration failed: {good_worker.status}")
+    expect(good_worker.status == 200, f"worker registration failed: HTTP {good_worker.status}")
+    good_worker.read()
 
     claim = request(f"/api/workers/{worker_id}/claim", method="POST", token=WORKER)
     expect(claim.status == 200, f"worker claim failed: {claim.status}")
@@ -127,7 +128,8 @@ def main():
         "client_name": "allowed",
         "token_endpoint_auth_method": "none",
     })
-    expect(good_dcr.status == 201, f"allowed ChatGPT redirect was rejected: {good_dcr.status} {good_dcr.read()!r}")
+    expect(good_dcr.status == 201, f"allowed ChatGPT redirect was rejected: HTTP {good_dcr.status}")
+    good_dcr.read()
 
     bad_cimd_query = urllib.parse.urlencode({
         "client_id": "https://127.0.0.1/client-metadata.json",
@@ -139,8 +141,6 @@ def main():
     bad_cimd = request("/mcp/oauth/authorize?" + bad_cimd_query)
     expect(bad_cimd.status == 403, f"private CIMD client host was not blocked before fetch: {bad_cimd.status}")
 
-    # The token endpoint is deliberately rate limited. Invalid requests still consume
-    # budget, which prevents cheap brute-force/DoS amplification against the DB.
     limited = None
     for _ in range(125):
         limited = request(
