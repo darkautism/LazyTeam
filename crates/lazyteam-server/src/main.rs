@@ -11,6 +11,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 mod api;
+mod cimd;
 mod mcp;
 mod oauth;
 mod review;
