@@ -13,7 +13,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
       - run: cargo test --workspace
-      - name: OAuth smoke test
+      - name: End-to-end smoke tests
         env:
           LAZYTEAM_LISTEN: 127.0.0.1:8787
           LAZYTEAM_PUBLIC_URL: http://127.0.0.1:8787
@@ -32,3 +32,4 @@ jobs:
             exit 1
           fi
           python3 scripts/oauth-smoke.py
+          python3 scripts/control-plane-smoke.py
