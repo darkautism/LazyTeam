@@ -34,7 +34,7 @@ def read_json(resp):
 
 def post_json(path, obj, expected=200):
     resp = request(path, method="POST", obj=obj)
-    expect(resp.status == expected, f"POST {path}: expected {expected}, got {resp.status}: {resp.read()!r}")
+    expect(resp.status == expected, f"POST {path}: expected {expected}, got {resp.status}")
     return read_json(resp)
 
 
@@ -104,7 +104,7 @@ def main():
         method="POST",
         obj={"result": {"status": "completed", "summary": "parent done"}},
     )
-    expect(finish.status == 204, f"finish failed: {finish.status}: {finish.read()!r}")
+    expect(finish.status == 204, f"finish failed: {finish.status}")
 
     blocked_claim = request(f"/api/workers/{worker_id}/claim", method="POST")
     expect(blocked_claim.status == 204, "child ran before parent review approval or foreign project was assigned")
