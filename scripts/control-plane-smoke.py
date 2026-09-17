@@ -7,15 +7,16 @@ import urllib.request
 import uuid
 
 BASE = os.environ.get("LAZYTEAM_SMOKE_URL", "http://127.0.0.1:8787")
+WORKER_CREDENTIAL_HEADER = "X-LazyTeam-Worker-Credential"
 
 
-def request(path, *, method="GET", obj=None):
+def request(path, *, method="GET", obj=None, headers=None):
     data = None
-    headers = {}
+    h = dict(headers or {})
     if obj is not None:
         data = json.dumps(obj).encode()
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(BASE + path, data=data, headers=h, method=method)
     try:
         return urllib.request.urlopen(req, timeout=5)
     except urllib.error.HTTPError as exc:
@@ -32,8 +33,8 @@ def read_json(resp):
     return json.loads(raw.decode()) if raw else None
 
 
-def post_json(path, obj, expected=200):
-    resp = request(path, method="POST", obj=obj)
+def post_json(path, obj, expected=200, headers=None):
+    resp = request(path, method="POST", obj=obj, headers=headers)
     expect(resp.status == expected, f"POST {path}: expected {expected}, got {resp.status}")
     return read_json(resp)
 
@@ -54,7 +55,7 @@ def main():
     })
 
     worker_id = str(uuid.uuid4())
-    worker = post_json("/api/workers/register", {
+    registration = request("/api/workers/register", method="POST", obj={
         "id": worker_id,
         "name": "smoke-worker",
         "os": "linux",
@@ -65,7 +66,12 @@ def main():
         "worker_version": "smoke",
         "protocol_version": 1,
     })
+    expect(registration.status == 200, f"worker registration failed: {registration.status}")
+    credential = registration.headers.get(WORKER_CREDENTIAL_HEADER)
+    expect(bool(credential), "worker registration did not issue a credential")
+    worker = read_json(registration)
     expect(worker["id"] == worker_id, "worker ID mismatch")
+    worker_headers = {WORKER_CREDENTIAL_HEADER: credential}
 
     foreign_task = post_json("/api/tasks", {
         "project_id": project_b["id"],
@@ -90,29 +96,30 @@ def main():
         "priority": 20,
     })
 
-    claim = request(f"/api/workers/{worker_id}/claim", method="POST")
+    claim = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
     expect(claim.status == 200, f"first claim failed: {claim.status}")
     assignment = read_json(claim)
     expect(assignment["task"]["id"] == parent["id"], "scheduler ignored project/dependency matching")
     execution_id = assignment["execution"]["id"]
 
-    renew = request(f"/api/executions/{execution_id}/renew", method="POST")
+    renew = request(f"/api/executions/{execution_id}/renew", method="POST", headers=worker_headers)
     expect(renew.status == 204, f"lease renew failed: {renew.status}")
 
     finish = request(
         f"/api/executions/{execution_id}/finish",
         method="POST",
         obj={"result": {"status": "completed", "summary": "parent done"}},
+        headers=worker_headers,
     )
     expect(finish.status == 204, f"finish failed: {finish.status}")
 
-    blocked_claim = request(f"/api/workers/{worker_id}/claim", method="POST")
+    blocked_claim = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
     expect(blocked_claim.status == 204, "child ran before parent review approval or foreign project was assigned")
 
     approved = post_json(f"/api/tasks/{parent['id']}/approve", {}, expected=200)
     expect(approved["state"] == "done", "parent approval did not mark done")
 
-    child_claim = request(f"/api/workers/{worker_id}/claim", method="POST")
+    child_claim = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
     expect(child_claim.status == 200, f"child did not unlock after approval: {child_claim.status}")
     child_assignment = read_json(child_claim)
     expect(child_assignment["task"]["id"] == child["id"], "wrong child assignment")
@@ -122,6 +129,7 @@ def main():
         f"/api/executions/{child_execution}/finish",
         method="POST",
         obj={"result": {"status": "completed", "summary": "child done"}},
+        headers=worker_headers,
     )
     expect(finish_child.status == 204, f"child finish failed: {finish_child.status}")
     post_json(f"/api/tasks/{child['id']}/approve", {}, expected=200)
