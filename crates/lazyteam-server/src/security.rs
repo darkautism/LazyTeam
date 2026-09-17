@@ -185,18 +185,19 @@ pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
             return unauthorized("admin");
         }
     } else if path.starts_with("/api/") {
-        let worker_endpoint = path == "/api/workers/register"
-            || (path.starts_with("/api/workers/") && path != "/api/workers")
-            || path.starts_with("/api/executions/");
-        let expected = if worker_endpoint {
-            config().worker_token.as_deref()
-        } else {
-            config().admin_token.as_deref()
-        };
-        if expected.is_some() || production() {
-            if !bearer_matches(&request, expected) {
-                return unauthorized(if worker_endpoint { "worker" } else { "admin" });
+        if path == "/api/workers/register" {
+            // The shared worker secret is an enrollment credential only. Normal worker
+            // traffic is authenticated by the per-worker credential issued at enrollment.
+            if production() && !bearer_matches(&request, config().worker_token.as_deref()) {
+                return unauthorized("worker-enrollment");
             }
+        } else if (path.starts_with("/api/workers/") && path != "/api/workers")
+            || path.starts_with("/api/executions/")
+        {
+            // Per-worker authentication and execution ownership are enforced in the
+            // endpoint handlers where the worker/execution ID is available.
+        } else if production() && !bearer_matches(&request, config().admin_token.as_deref()) {
+            return unauthorized("admin");
         }
     }
 
