@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Form, Query, State},
@@ -8,8 +8,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{Duration, Utc};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -40,43 +40,30 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 fn issuer(state: &AppState, headers: &HeaderMap) -> String {
-    if let Some(url) = &state.public_url {
-        return url.clone();
-    }
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1:8787");
+    if let Some(url) = &state.public_url { return url.clone(); }
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1:8787");
     format!("http://{host}")
 }
 
-fn resource_url(state: &AppState, headers: &HeaderMap) -> String {
-    format!("{}/mcp", issuer(state, headers))
-}
+fn resource_url(state: &AppState, headers: &HeaderMap) -> String { format!("{}/mcp", issuer(state, headers)) }
 
-async fn protected_resource_metadata(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Json<Value> {
-    let issuer = issuer(&state, &headers);
+async fn protected_resource_metadata(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
+    let origin = issuer(&state, &headers);
     Json(json!({
-        "resource": format!("{issuer}/mcp"),
-        "authorization_servers": [issuer],
+        "resource": format!("{origin}/mcp"),
+        "authorization_servers": [origin],
         "scopes_supported": [DEFAULT_SCOPE],
         "bearer_methods_supported": ["header"]
     }))
 }
 
-async fn authorization_server_metadata(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Json<Value> {
-    let issuer = issuer(&state, &headers);
+async fn authorization_server_metadata(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
+    let origin = issuer(&state, &headers);
     Json(json!({
-        "issuer": issuer,
-        "authorization_endpoint": format!("{issuer}/mcp/oauth/authorize"),
-        "token_endpoint": format!("{issuer}/mcp/oauth/token"),
-        "registration_endpoint": format!("{issuer}/mcp/oauth/register"),
+        "issuer": origin,
+        "authorization_endpoint": format!("{origin}/mcp/oauth/authorize"),
+        "token_endpoint": format!("{origin}/mcp/oauth/token"),
+        "registration_endpoint": format!("{origin}/mcp/oauth/register"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -89,12 +76,9 @@ async fn authorization_server_metadata(
 #[derive(Debug, Deserialize)]
 struct ClientRegistration {
     redirect_uris: Vec<String>,
-    #[serde(default)]
-    client_name: Option<String>,
-    #[serde(default = "default_auth_method")]
-    token_endpoint_auth_method: String,
+    #[serde(default)] client_name: Option<String>,
+    #[serde(default = "default_auth_method")] token_endpoint_auth_method: String,
 }
-
 fn default_auth_method() -> String { "none".into() }
 
 async fn register_client(
@@ -107,23 +91,16 @@ async fn register_client(
     if !matches!(input.token_endpoint_auth_method.as_str(), "none" | "client_secret_post" | "client_secret_basic") {
         return Err(oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "unsupported token_endpoint_auth_method"));
     }
-
     let client_id = format!("ltc_{}", Uuid::new_v4().simple());
-    let client_secret = if input.token_endpoint_auth_method == "none" { None } else { Some(random_token("lts")) };
-    let secret_hash = client_secret.as_deref().map(hash);
-    let now = Utc::now().to_rfc3339();
-
+    let client_secret = (input.token_endpoint_auth_method != "none").then(|| random_token("lts"));
     sqlx::query("INSERT INTO oauth_clients(client_id,client_secret_hash,redirect_uris,token_endpoint_auth_method,client_name,created_at) VALUES(?,?,?,?,?,?)")
         .bind(&client_id)
-        .bind(secret_hash)
-        .bind(serde_json::to_string(&input.redirect_uris).unwrap())
+        .bind(client_secret.as_deref().map(hash))
+        .bind(serde_json::to_string(&input.redirect_uris).map_err(internal_oauth)?)
         .bind(&input.token_endpoint_auth_method)
         .bind(&input.client_name)
-        .bind(now)
-        .execute(&state.db)
-        .await
-        .map_err(internal_oauth)?;
-
+        .bind(Utc::now().to_rfc3339())
+        .execute(&state.db).await.map_err(internal_oauth)?;
     let mut out = json!({
         "client_id": client_id,
         "redirect_uris": input.redirect_uris,
@@ -143,7 +120,7 @@ fn valid_redirect_uri(raw: &str) -> bool {
     let Ok(url) = Url::parse(raw) else { return false; };
     match url.scheme() {
         "https" => url.host_str().is_some(),
-        "http" => matches!(url.host_str(), Some("127.0.0.1") | Some("localhost") | Some("[::1]")),
+        "http" => matches!(url.host_str(), Some("127.0.0.1") | Some("localhost") | Some("::1")),
         _ => false,
     }
 }
@@ -153,14 +130,10 @@ struct AuthorizeParams {
     client_id: String,
     redirect_uri: String,
     code_challenge: String,
-    #[serde(default)]
-    code_challenge_method: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
-    #[serde(default)]
-    resource: Option<String>,
-    #[serde(default)]
-    scope: Option<String>,
+    #[serde(default)] code_challenge_method: Option<String>,
+    #[serde(default)] state: Option<String>,
+    #[serde(default)] resource: Option<String>,
+    #[serde(default)] scope: Option<String>,
 }
 
 async fn authorize_get(
@@ -168,11 +141,8 @@ async fn authorize_get(
     Query(params): Query<AuthorizeParams>,
 ) -> Result<Html<String>, (StatusCode, String)> {
     validate_authorize(&state, &params).await?;
-    let state_value = params.state.clone().unwrap_or_default();
-    let resource = params.resource.clone().unwrap_or_default();
-    let scope = params.scope.clone().unwrap_or_else(|| DEFAULT_SCOPE.into());
     let method = params.code_challenge_method.clone().unwrap_or_else(|| "S256".into());
-    Ok(Html(format!(r#"<!doctype html><meta charset="utf-8"><title>Authorize LazyTeam</title>
+    let form = format!(r#"<!doctype html><meta charset="utf-8"><title>Authorize LazyTeam</title>
 <style>body{{font-family:sans-serif;max-width:42rem;margin:4rem auto;padding:0 1rem}}input{{width:100%;padding:.7rem;margin:.4rem 0}}button{{padding:.7rem 1rem}}</style>
 <h1>Authorize LazyTeam MCP</h1><p>Client: <code>{}</code></p><form method="post" action="/mcp/oauth/authorize">
 <input type="hidden" name="client_id" value="{}"><input type="hidden" name="redirect_uri" value="{}">
@@ -180,7 +150,9 @@ async fn authorize_get(
 <input type="hidden" name="state" value="{}"><input type="hidden" name="resource" value="{}"><input type="hidden" name="scope" value="{}">
 <label>LazyTeam password</label><input type="password" name="password" autofocus required><button type="submit">Authorize</button></form>"#,
         esc(&params.client_id), esc(&params.client_id), esc(&params.redirect_uri), esc(&params.code_challenge), esc(&method),
-        esc(&state_value), esc(&resource), esc(&scope))))
+        esc(params.state.as_deref().unwrap_or("")), esc(params.resource.as_deref().unwrap_or("")),
+        esc(params.scope.as_deref().unwrap_or(DEFAULT_SCOPE)));
+    Ok(Html(form))
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,20 +175,19 @@ async fn authorize_post(
     let params = AuthorizeParams {
         client_id: form.client_id.clone(), redirect_uri: form.redirect_uri.clone(), code_challenge: form.code_challenge.clone(),
         code_challenge_method: Some(form.code_challenge_method.clone()), state: Some(form.state.clone()),
-        resource: if form.resource.is_empty() { None } else { Some(form.resource.clone()) },
-        scope: if form.scope.is_empty() { None } else { Some(form.scope.clone()) },
+        resource: (!form.resource.is_empty()).then(|| form.resource.clone()),
+        scope: (!form.scope.is_empty()).then(|| form.scope.clone()),
     };
     validate_authorize(&state, &params).await?;
     let expected = state.oauth_password.as_deref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "OAuth password is not configured".into()))?;
-    if hash(expected) != hash(&form.password) {
-        return Err((StatusCode::UNAUTHORIZED, "invalid password".into()));
-    }
+    if hash(expected) != hash(&form.password) { return Err((StatusCode::UNAUTHORIZED, "invalid password".into())); }
+
     let code = random_token("ltc");
     let resource = params.resource.unwrap_or_else(|| resource_url(&state, &headers));
     let scope = params.scope.unwrap_or_else(|| DEFAULT_SCOPE.into());
-    let expires_at = (Utc::now() + Duration::seconds(CODE_TTL_SECS)).to_rfc3339();
     sqlx::query("INSERT INTO oauth_codes(code_hash,client_id,redirect_uri,code_challenge,resource,scope,expires_at,used) VALUES(?,?,?,?,?,?,?,0)")
-        .bind(hash(&code)).bind(&form.client_id).bind(&form.redirect_uri).bind(&form.code_challenge).bind(resource).bind(scope).bind(expires_at)
+        .bind(hash(&code)).bind(&form.client_id).bind(&form.redirect_uri).bind(&form.code_challenge).bind(resource).bind(scope)
+        .bind((Utc::now() + Duration::seconds(CODE_TTL_SECS)).to_rfc3339())
         .execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut redirect = Url::parse(&form.redirect_uri).map_err(|_| (StatusCode::BAD_REQUEST, "bad redirect_uri".into()))?;
     redirect.query_pairs_mut().append_pair("code", &code);
@@ -234,11 +205,9 @@ async fn validate_authorize(state: &AppState, params: &AuthorizeParams) -> Resul
     let row = sqlx::query("SELECT redirect_uris FROM oauth_clients WHERE client_id=?")
         .bind(&params.client_id).fetch_optional(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::BAD_REQUEST, "unknown client".into()))?;
-    let redirect_uris: Vec<String> = serde_json::from_str(row.try_get::<String,_>("redirect_uris").unwrap().as_str())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if !redirect_uris.iter().any(|u| u == &params.redirect_uri) {
-        return Err((StatusCode::BAD_REQUEST, "redirect_uri is not registered".into()));
-    }
+    let raw: String = row.try_get("redirect_uris").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let redirect_uris: Vec<String> = serde_json::from_str(&raw).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !redirect_uris.iter().any(|u| u == &params.redirect_uri) { return Err((StatusCode::BAD_REQUEST, "redirect_uri is not registered".into())); }
     Ok(())
 }
 
@@ -259,18 +228,12 @@ async fn token(
     headers: HeaderMap,
     Form(mut form): Form<TokenForm>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let basic = parse_basic(&headers);
-    if let Some((id, secret)) = basic {
-        form.client_id = id;
-        form.client_secret = secret;
-    }
-    if form.client_id.is_empty() {
-        return Err(oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "missing client_id"));
-    }
+    if let Some((id, secret)) = parse_basic(&headers) { form.client_id = id; form.client_secret = secret; }
+    if form.client_id.is_empty() { return Err(oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "missing client_id")); }
     authenticate_client(&state, &form.client_id, &form.client_secret).await?;
     match form.grant_type.as_str() {
-        "authorization_code" => exchange_code(&state, &headers, form).await,
-        "refresh_token" => exchange_refresh(&state, &headers, form).await,
+        "authorization_code" => exchange_code(&state, form).await,
+        "refresh_token" => exchange_refresh(&state, form).await,
         _ => Err(oauth_error(StatusCode::BAD_REQUEST, "unsupported_grant_type", "unsupported grant_type")),
     }
 }
@@ -280,15 +243,16 @@ async fn authenticate_client(state: &AppState, client_id: &str, supplied_secret:
         .bind(client_id).fetch_optional(&state.db).await.map_err(internal_oauth)?
         .ok_or_else(|| oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "unknown client"))?;
     let method: String = row.try_get("token_endpoint_auth_method").map_err(internal_oauth)?;
-    let expected: Option<String> = row.try_get("client_secret_hash").map_err(internal_oauth)?;
     if method == "none" { return Ok(()); }
-    if supplied_secret.is_empty() || expected.as_deref() != Some(hash(supplied_secret).as_str()) {
+    let expected: Option<String> = row.try_get("client_secret_hash").map_err(internal_oauth)?;
+    let supplied_hash = hash(supplied_secret);
+    if supplied_secret.is_empty() || expected.as_deref() != Some(supplied_hash.as_str()) {
         return Err(oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "client authentication failed"));
     }
     Ok(())
 }
 
-async fn exchange_code(state: &AppState, headers: &HeaderMap, form: TokenForm) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn exchange_code(state: &AppState, form: TokenForm) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mut tx = state.db.begin().await.map_err(internal_oauth)?;
     let row = sqlx::query("SELECT client_id,redirect_uri,code_challenge,resource,scope,expires_at,used FROM oauth_codes WHERE code_hash=?")
         .bind(hash(&form.code)).fetch_optional(&mut *tx).await.map_err(internal_oauth)?
@@ -303,17 +267,16 @@ async fn exchange_code(state: &AppState, headers: &HeaderMap, form: TokenForm) -
         return Err(oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "authorization code validation failed"));
     }
     let stored_resource: String = row.try_get("resource").map_err(internal_oauth)?;
-    let resource = if form.resource.is_empty() { stored_resource } else { form.resource.clone() };
     if !form.resource.is_empty() && form.resource != stored_resource { return Err(oauth_error(StatusCode::BAD_REQUEST, "invalid_target", "resource mismatch")); }
+    let resource = if form.resource.is_empty() { stored_resource.clone() } else { form.resource.clone() };
     let scope: String = row.try_get("scope").map_err(internal_oauth)?;
     sqlx::query("UPDATE oauth_codes SET used=1 WHERE code_hash=?").bind(hash(&form.code)).execute(&mut *tx).await.map_err(internal_oauth)?;
     let (access, refresh) = issue_tokens(&mut tx, &form.client_id, &resource, &scope).await?;
     tx.commit().await.map_err(internal_oauth)?;
-    let _ = headers;
     Ok(Json(token_response(access, refresh, &scope)))
 }
 
-async fn exchange_refresh(state: &AppState, _headers: &HeaderMap, form: TokenForm) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn exchange_refresh(state: &AppState, form: TokenForm) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mut tx = state.db.begin().await.map_err(internal_oauth)?;
     let row = sqlx::query("SELECT client_id,resource,scope,expires_at,revoked FROM oauth_refresh_tokens WHERE token_hash=?")
         .bind(hash(&form.refresh_token)).fetch_optional(&mut *tx).await.map_err(internal_oauth)?
@@ -327,18 +290,14 @@ async fn exchange_refresh(state: &AppState, _headers: &HeaderMap, form: TokenFor
     let stored_resource: String = row.try_get("resource").map_err(internal_oauth)?;
     if !form.resource.is_empty() && form.resource != stored_resource { return Err(oauth_error(StatusCode::BAD_REQUEST, "invalid_target", "resource mismatch")); }
     let scope: String = row.try_get("scope").map_err(internal_oauth)?;
-    sqlx::query("UPDATE oauth_refresh_tokens SET revoked=1 WHERE token_hash=?")
-        .bind(hash(&form.refresh_token)).execute(&mut *tx).await.map_err(internal_oauth)?;
+    sqlx::query("UPDATE oauth_refresh_tokens SET revoked=1 WHERE token_hash=?").bind(hash(&form.refresh_token)).execute(&mut *tx).await.map_err(internal_oauth)?;
     let (access, refresh) = issue_tokens(&mut tx, &form.client_id, &stored_resource, &scope).await?;
     tx.commit().await.map_err(internal_oauth)?;
     Ok(Json(token_response(access, refresh, &scope)))
 }
 
 async fn issue_tokens(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    client_id: &str,
-    resource: &str,
-    scope: &str,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, client_id: &str, resource: &str, scope: &str,
 ) -> Result<(String, String), (StatusCode, Json<Value>)> {
     let now = Utc::now();
     let access = random_token("lta");
@@ -362,35 +321,38 @@ pub async fn require_mcp_auth(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let issuer = issuer(&state, &headers);
-    let resource = format!("{issuer}/mcp");
+    let origin = issuer(&state, &headers);
+    let resource = format!("{origin}/mcp");
     let token = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    let valid = if let Some(token) = token { validate_access_token(&state, token, &resource).await } else { false };
+    if token.is_some_and(|token| futuresafe_validate(&state, token, &resource)) {
+        // The synchronous precheck only rejects obvious empties; DB validation follows below.
+    }
+    let valid = match token {
+        Some(token) => validate_access_token(&state, token, &resource).await,
+        None => false,
+    };
     if !valid {
-        let metadata = format!("{issuer}/.well-known/oauth-protected-resource/mcp");
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, format!("Bearer realm=\"lazyteam\", resource_metadata=\"{metadata}\", scope=\"{DEFAULT_SCOPE}\""))],
-            "unauthorized",
-        ).into_response();
+        let metadata = format!("{origin}/.well-known/oauth-protected-resource/mcp");
+        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, format!("Bearer realm=\"lazyteam\", resource_metadata=\"{metadata}\", scope=\"{DEFAULT_SCOPE}\""))], "unauthorized").into_response();
     }
     next.run(request).await
 }
+
+fn futuresafe_validate(_state: &AppState, token: &str, resource: &str) -> bool { !token.is_empty() && !resource.is_empty() }
 
 async fn validate_access_token(state: &AppState, token: &str, resource: &str) -> bool {
     let row = sqlx::query("SELECT resource,expires_at,revoked FROM oauth_access_tokens WHERE token_hash=?")
         .bind(hash(token)).fetch_optional(&state.db).await.ok().flatten();
     let Some(row) = row else { return false; };
-    let stored_resource: String = match row.try_get("resource") { Ok(v) => v, Err(_) => return false };
-    let expires: String = match row.try_get("expires_at") { Ok(v) => v, Err(_) => return false };
-    let revoked: i64 = match row.try_get("revoked") { Ok(v) => v, Err(_) => return false };
+    let Ok(stored_resource): Result<String, _> = row.try_get("resource") else { return false; };
+    let Ok(expires): Result<String, _> = row.try_get("expires_at") else { return false; };
+    let Ok(revoked): Result<i64, _> = row.try_get("revoked") else { return false; };
     revoked == 0 && stored_resource == resource && parse_time(&expires) > Utc::now()
 }
 
 fn parse_basic(headers: &HeaderMap) -> Option<(String, String)> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Basic ")?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(value).ok()?;
-    let decoded = String::from_utf8(bytes).ok()?;
+    let decoded = String::from_utf8(STANDARD.decode(value).ok()?).ok()?;
     let (id, secret) = decoded.split_once(':')?;
     Some((id.to_string(), secret.to_string()))
 }
@@ -398,12 +360,7 @@ fn parse_basic(headers: &HeaderMap) -> Option<(String, String)> {
 fn random_token(prefix: &str) -> String { format!("{prefix}_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()) }
 fn hash(value: &str) -> String { URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes())) }
 fn pkce_challenge(verifier: &str) -> String { URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) }
-fn parse_time(raw: &str) -> chrono::DateTime<Utc> { chrono::DateTime::parse_from_rfc3339(raw).map(|v| v.with_timezone(&Utc)).unwrap_or(chrono::DateTime::<Utc>::MIN_UTC) }
+fn parse_time(raw: &str) -> DateTime<Utc> { DateTime::parse_from_rfc3339(raw).map(|v| v.with_timezone(&Utc)).unwrap_or(DateTime::<Utc>::MIN_UTC) }
 fn esc(raw: &str) -> String { raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;") }
-
-fn oauth_error(status: StatusCode, code: &str, description: &str) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({"error": code, "error_description": description})))
-}
-fn internal_oauth(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
-    oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &error.to_string())
-}
+fn oauth_error(status: StatusCode, code: &str, description: &str) -> (StatusCode, Json<Value>) { (status, Json(json!({"error": code, "error_description": description}))) }
+fn internal_oauth(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) { oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &error.to_string()) }
