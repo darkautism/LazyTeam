@@ -57,6 +57,7 @@ def main():
     expect(meta["registration_endpoint"] == BASE + "/mcp/oauth/register", "DCR endpoint mismatch")
     expect("S256" in meta["code_challenge_methods_supported"], "S256 not advertised")
     expect("refresh_token" in meta["grant_types_supported"], "refresh token not advertised")
+    expect(meta.get("client_id_metadata_document_supported") is True, "CIMD support not advertised")
 
     registration = json.dumps({
         "redirect_uris": [REDIRECT],
@@ -64,7 +65,7 @@ def main():
         "token_endpoint_auth_method": "none",
     }).encode()
     reg = request("/mcp/oauth/register", method="POST", data=registration, headers={"Content-Type": "application/json"})
-    expect(reg.status == 201, f"DCR failed: {reg.status} {reg.read()!r}")
+    expect(reg.status == 201, f"DCR failed with HTTP {reg.status}")
     client = read_json(reg)
     client_id = client["client_id"]
 
@@ -108,7 +109,7 @@ def main():
         "code_verifier": verifier,
         "resource": BASE + "/mcp",
     })
-    expect(token_resp.status == 200, f"token exchange failed: {token_resp.status} {token_resp.read()!r}")
+    expect(token_resp.status == 200, f"token exchange failed with HTTP {token_resp.status}")
     tokens = read_json(token_resp)
     expect(tokens["token_type"] == "Bearer", "wrong token type")
     expect(tokens.get("refresh_token"), "refresh token missing")
@@ -119,7 +120,7 @@ def main():
         "refresh_token": tokens["refresh_token"],
         "resource": BASE + "/mcp",
     })
-    expect(refresh_resp.status == 200, f"refresh failed: {refresh_resp.status} {refresh_resp.read()!r}")
+    expect(refresh_resp.status == 200, f"refresh failed with HTTP {refresh_resp.status}")
     refreshed = read_json(refresh_resp)
     expect(refreshed.get("access_token"), "refreshed access token missing")
     expect(refreshed.get("refresh_token") != tokens["refresh_token"], "refresh token did not rotate")
