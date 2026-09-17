@@ -11,8 +11,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    create_project, create_task, list_projects, list_tasks, list_workers, AppState, CreateProject,
-    CreateTask,
+    create_project, create_task, list_projects, list_tasks, list_workers, review, AppState,
+    CreateProject, CreateTask,
 };
 
 #[derive(Clone)]
@@ -54,6 +54,11 @@ pub struct TaskCreateParams {
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub priority: i32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskIdParams {
+    pub task_id: String,
 }
 
 #[tool_router]
@@ -121,6 +126,26 @@ impl LazyTeamMcp {
         json_result(&task)
     }
 
+    #[tool(name = "tasks_approve", description = "Approve a task in review, mark it done, and release dependent tasks")]
+    async fn tasks_approve(
+        &self,
+        Parameters(input): Parameters<TaskIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let transition = review::approve_task(&self.state, task_id).await.map_err(api_to_mcp)?;
+        json_result(&transition)
+    }
+
+    #[tool(name = "tasks_retry", description = "Requeue a task from review, failed, or blocked")]
+    async fn tasks_retry(
+        &self,
+        Parameters(input): Parameters<TaskIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let transition = review::retry_task(&self.state, task_id).await.map_err(api_to_mcp)?;
+        json_result(&transition)
+    }
+
     #[tool(name = "workers_list", description = "List registered LazyTeam workers and their capabilities")]
     async fn workers_list(&self) -> Result<CallToolResult, McpError> {
         let Json(items) = list_workers(State(self.state.clone())).await.map_err(api_to_mcp)?;
@@ -134,9 +159,14 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, and a distributed AI worker pool. Use project-scoped tasks; workers are matched deterministically by project access and capability tags.".to_string(),
+                "LazyTeam controls projects, tasks, executions, and a distributed AI worker pool. Use project-scoped tasks; workers are matched deterministically by project access and capability tags. Approve reviewed tasks to release their dependencies.".to_string(),
             )
     }
+}
+
+fn parse_task_id(raw: &str) -> Result<Uuid, McpError> {
+    Uuid::parse_str(raw)
+        .map_err(|e| McpError::invalid_params("invalid task_id", Some(serde_json::json!({"error": e.to_string()}))))
 }
 
 fn api_to_mcp((status, message): crate::ApiError) -> McpError {
