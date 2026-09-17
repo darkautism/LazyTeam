@@ -2,17 +2,19 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use lazyteam_core::{
     worker_matches_task, Assignment, Execution, ExecutionResult, ExecutionState, Project, Tags, Task,
     TaskState, Worker, WorkerState,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use tokio::time::interval;
 use tracing::warn;
@@ -20,6 +22,7 @@ use uuid::Uuid;
 
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
+const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 
 pub(crate) type ApiError = (StatusCode, String);
 pub(crate) type ApiResult<T> = Result<Json<T>, ApiError>;
@@ -162,24 +165,32 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> ApiResult<
     rows.iter().map(task_from_row).collect::<Result<Vec<_>,_>>().map(Json)
 }
 
-async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<RegisterWorker>) -> ApiResult<Worker> {
+async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<RegisterWorker>) -> Result<Response, ApiError> {
     if input.protocol_version != PROTOCOL_VERSION {
         return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol {}; expected {}", input.protocol_version, PROTOCOL_VERSION)));
     }
     let id = input.id.unwrap_or_else(Uuid::new_v4);
     let now = Utc::now();
+    let credential = format!("ltw_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let credential_hash = hash_secret(&credential);
     let mut tags = input.tags;
     tags.entry("os".into()).or_insert_with(|| input.os.clone());
     tags.entry("arch".into()).or_insert_with(|| input.arch.clone());
     let worker = Worker { id, name: input.name, state: WorkerState::Idle, os: input.os, arch: input.arch, tags,
         allowed_projects: input.allowed_projects, slots: input.slots.max(1), running_slots: 0,
         protocol_version: input.protocol_version, worker_version: input.worker_version, last_heartbeat_at: now };
-    sqlx::query("INSERT INTO workers(id,name,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,state=CASE WHEN workers.running_slots>0 THEN 'busy' ELSE 'idle' END,os=excluded.os,arch=excluded.arch,tags=excluded.tags,allowed_projects=excluded.allowed_projects,slots=excluded.slots,protocol_version=excluded.protocol_version,worker_version=excluded.worker_version,last_heartbeat_at=excluded.last_heartbeat_at")
+    sqlx::query("INSERT INTO workers(id,name,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at,credential_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,state=CASE WHEN workers.running_slots>0 THEN 'busy' ELSE 'idle' END,os=excluded.os,arch=excluded.arch,tags=excluded.tags,allowed_projects=excluded.allowed_projects,slots=excluded.slots,protocol_version=excluded.protocol_version,worker_version=excluded.worker_version,last_heartbeat_at=excluded.last_heartbeat_at,credential_hash=excluded.credential_hash")
         .bind(id.to_string()).bind(&worker.name).bind("idle").bind(&worker.os).bind(&worker.arch).bind(json(&worker.tags)?)
         .bind(json(&worker.allowed_projects)?).bind(worker.slots as i64).bind(0_i64).bind(worker.protocol_version as i64)
-        .bind(&worker.worker_version).bind(ts(now)).bind(ts(now)).execute(&state.db).await.map_err(db_error)?;
+        .bind(&worker.worker_version).bind(ts(now)).bind(ts(now)).bind(credential_hash)
+        .execute(&state.db).await.map_err(db_error)?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
-    Ok(Json(worker_from_row(&row)?))
+    let mut response = Json(worker_from_row(&row)?).into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static(WORKER_CREDENTIAL_HEADER),
+        HeaderValue::from_str(&credential).map_err(internal)?,
+    );
+    Ok(response)
 }
 
 pub(crate) async fn list_workers(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Worker>> {
@@ -187,14 +198,16 @@ pub(crate) async fn list_workers(State(state): State<Arc<AppState>>) -> ApiResul
     rows.iter().map(worker_from_row).collect::<Result<Vec<_>,_>>().map(Json)
 }
 
-async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
     let changed = sqlx::query("UPDATE workers SET last_heartbeat_at=?, state=CASE WHEN state='draining' THEN state WHEN running_slots>0 THEN 'busy' ELSE 'idle' END WHERE id=?")
         .bind(ts(Utc::now())).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
     if changed == 0 { return Err((StatusCode::NOT_FOUND, "worker not found".into())); }
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&row)?;
@@ -235,14 +248,17 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) ->
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn renew_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+async fn renew_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
     let now = Utc::now();
     let lease = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
     let mut tx = state.db.begin().await.map_err(db_error)?;
-    let row = sqlx::query("SELECT task_id FROM executions WHERE id=? AND state IN ('assigned','running')")
+    let row = sqlx::query("SELECT task_id,worker_id FROM executions WHERE id=? AND state IN ('assigned','running')")
         .bind(id.to_string()).fetch_optional(&mut *tx).await.map_err(db_error)?
         .ok_or((StatusCode::CONFLICT, "execution is not active".into()))?;
     let task_id: String = row.try_get("task_id").map_err(internal)?;
+    let worker_id: String = row.try_get("worker_id").map_err(internal)?;
+    let worker_id = uuid(worker_id)?;
+    require_worker(&state.db, worker_id, &headers).await?;
     if !is_latest_execution(&mut tx, &task_id, id).await? { return Err((StatusCode::CONFLICT, "stale execution".into())); }
     sqlx::query("UPDATE executions SET state='running',lease_until=?,started_at=COALESCE(started_at,?) WHERE id=?")
         .bind(ts(lease)).bind(ts(now)).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
@@ -252,7 +268,7 @@ async fn renew_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, Json(input): Json<FinishExecution>) -> Result<StatusCode, ApiError> {
+async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(input): Json<FinishExecution>) -> Result<StatusCode, ApiError> {
     let now = Utc::now();
     let mut tx = state.db.begin().await.map_err(db_error)?;
     let row = sqlx::query("SELECT task_id,worker_id FROM executions WHERE id=? AND state IN ('assigned','running')")
@@ -260,6 +276,7 @@ async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState
         .ok_or((StatusCode::CONFLICT, "execution is not active".into()))?;
     let task_id: String = row.try_get("task_id").map_err(internal)?;
     let worker_id: String = row.try_get("worker_id").map_err(internal)?;
+    require_worker(&state.db, uuid(worker_id.clone())?, &headers).await?;
     if !is_latest_execution(&mut tx, &task_id, id).await? { return Err((StatusCode::CONFLICT, "stale execution".into())); }
     let success = input.result.status == "completed";
     sqlx::query("UPDATE executions SET state=?,finished_at=?,result=? WHERE id=?")
@@ -271,6 +288,37 @@ async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState
         .bind(&worker_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn require_worker(db: &SqlitePool, worker_id: Uuid, headers: &HeaderMap) -> Result<(), ApiError> {
+    let supplied = headers
+        .get(WORKER_CREDENTIAL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or((StatusCode::UNAUTHORIZED, "worker credential required".into()))?;
+    let stored: Option<String> = sqlx::query_scalar("SELECT credential_hash FROM workers WHERE id=?")
+        .bind(worker_id.to_string())
+        .fetch_optional(db)
+        .await
+        .map_err(db_error)?
+        .flatten();
+    let Some(stored) = stored else {
+        return Err((StatusCode::UNAUTHORIZED, "worker credential rejected".into()));
+    };
+    if !secure_hash_eq(&hash_secret(supplied), &stored) {
+        return Err((StatusCode::UNAUTHORIZED, "worker credential rejected".into()));
+    }
+    Ok(())
+}
+
+fn hash_secret(value: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
+}
+
+fn secure_hash_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (x, y) in a.as_bytes().iter().zip(b.as_bytes()) { diff |= x ^ y; }
+    diff == 0
 }
 
 async fn dependencies_satisfied(db: &SqlitePool, task: &Task) -> Result<bool, ApiError> {
