@@ -10,6 +10,7 @@ import uuid
 BASE = os.environ.get("LAZYTEAM_SECURITY_SMOKE_URL", "http://127.0.0.1:8788")
 ADMIN = os.environ.get("LAZYTEAM_ADMIN_TOKEN", "admin-security-smoke-token-0123456789abcdef")
 WORKER = os.environ.get("LAZYTEAM_WORKER_TOKEN", "worker-security-smoke-token-0123456789abcdef")
+WORKER_CREDENTIAL_HEADER = "X-LazyTeam-Worker-Credential"
 
 
 def request(path, *, method="GET", obj=None, data=None, token=None, headers=None):
@@ -46,10 +47,10 @@ def project_payload(slug):
     }
 
 
-def worker_payload(worker_id):
+def worker_payload(worker_id, name="security-smoke-worker"):
     return {
         "id": worker_id,
-        "name": "security-smoke-worker",
+        "name": name,
         "os": "linux",
         "arch": "x86_64",
         "tags": {"rust": "true"},
@@ -58,6 +59,24 @@ def worker_payload(worker_id):
         "worker_version": "security-smoke",
         "protocol_version": 1,
     }
+
+
+def register_worker(worker_id, name):
+    response = request(
+        "/api/workers/register",
+        method="POST",
+        obj=worker_payload(worker_id, name),
+        token=WORKER,
+    )
+    expect(response.status == 200, f"worker registration failed: HTTP {response.status}")
+    credential = response.headers.get(WORKER_CREDENTIAL_HEADER)
+    expect(bool(credential), "worker registration did not issue a worker credential")
+    response.read()
+    return credential
+
+
+def worker_headers(credential):
+    return {WORKER_CREDENTIAL_HEADER: credential}
 
 
 def main():
@@ -81,7 +100,7 @@ def main():
     anonymous_tasks = request("/api/tasks")
     expect(anonymous_tasks.status == 401, "anonymous task listing was not rejected")
     worker_tasks = request("/api/tasks", token=WORKER)
-    expect(worker_tasks.status == 401, "worker token reached task listing")
+    expect(worker_tasks.status == 401, "worker enrollment token reached task listing")
     admin_tasks = request("/api/tasks", token=ADMIN)
     expect(admin_tasks.status == 200, "admin token could not list tasks")
 
@@ -98,23 +117,71 @@ def main():
     anonymous_worker = request("/api/workers/register", method="POST", obj=worker_payload(worker_id))
     expect(anonymous_worker.status == 401, "anonymous worker registration was not rejected")
     admin_worker = request("/api/workers/register", method="POST", obj=worker_payload(worker_id), token=ADMIN)
-    expect(admin_worker.status == 401, "admin credential was accepted as worker credential")
-    good_worker = request("/api/workers/register", method="POST", obj=worker_payload(worker_id), token=WORKER)
-    expect(good_worker.status == 200, f"worker registration failed: HTTP {good_worker.status}")
-    good_worker.read()
+    expect(admin_worker.status == 401, "admin credential was accepted as worker enrollment credential")
 
-    claim = request(f"/api/workers/{worker_id}/claim", method="POST", token=WORKER)
+    credential_a = register_worker(worker_id, "worker-a")
+    headers_a = worker_headers(credential_a)
+
+    worker_b_id = str(uuid.uuid4())
+    credential_b = register_worker(worker_b_id, "worker-b")
+    headers_b = worker_headers(credential_b)
+
+    missing_credential = request(f"/api/workers/{worker_id}/heartbeat", method="POST", token=WORKER)
+    expect(missing_credential.status == 401, "shared enrollment token worked without worker-specific credential")
+
+    wrong_credential = request(
+        f"/api/workers/{worker_id}/heartbeat",
+        method="POST",
+        token=WORKER,
+        headers=headers_b,
+    )
+    expect(wrong_credential.status == 401, "worker B credential impersonated worker A")
+
+    heartbeat = request(
+        f"/api/workers/{worker_id}/heartbeat",
+        method="POST",
+        token=WORKER,
+        headers=headers_a,
+    )
+    expect(heartbeat.status == 204, f"worker heartbeat failed: {heartbeat.status}")
+
+    claim = request(
+        f"/api/workers/{worker_id}/claim",
+        method="POST",
+        token=WORKER,
+        headers=headers_a,
+    )
     expect(claim.status == 200, f"worker claim failed: {claim.status}")
     assignment = read_json(claim)
     expect(assignment["task"]["id"] == task_json["id"], "worker claimed unexpected task")
+    execution_id = assignment["execution"]["id"]
+
+    cross_worker_renew = request(
+        f"/api/executions/{execution_id}/renew",
+        method="POST",
+        token=WORKER,
+        headers=headers_b,
+    )
+    expect(cross_worker_renew.status == 401, "worker B renewed worker A execution")
+
+    own_renew = request(
+        f"/api/executions/{execution_id}/renew",
+        method="POST",
+        token=WORKER,
+        headers=headers_a,
+    )
+    expect(own_renew.status == 204, f"worker A could not renew its execution: {own_renew.status}")
 
     approve_with_worker = request(f"/api/tasks/{task_json['id']}/approve", method="POST", obj={}, token=WORKER)
-    expect(approve_with_worker.status == 401, "worker token reached review approval")
+    expect(approve_with_worker.status == 401, "worker enrollment token reached review approval")
 
-    bogus_worker = request(f"/api/workers/{worker_id}/heartbeat", method="POST", token="not-the-worker-token")
-    expect(bogus_worker.status == 401, "bogus worker token was accepted")
-    heartbeat = request(f"/api/workers/{worker_id}/heartbeat", method="POST", token=WORKER)
-    expect(heartbeat.status == 204, f"worker heartbeat failed: {heartbeat.status}")
+    bogus_worker = request(
+        f"/api/workers/{worker_id}/heartbeat",
+        method="POST",
+        token="not-the-worker-token",
+        headers=headers_a,
+    )
+    expect(bogus_worker.status == 401, "bogus enrollment token was accepted")
 
     bad_dcr = request("/mcp/oauth/register", method="POST", obj={
         "redirect_uris": ["https://evil.example/callback"],
