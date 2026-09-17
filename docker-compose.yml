@@ -1,0 +1,17 @@
+services:
+  lazyteam:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      LAZYTEAM_LISTEN: "0.0.0.0:8787"
+      LAZYTEAM_DATABASE_URL: "sqlite:///data/lazyteam.db?mode=rwc"
+      LAZYTEAM_PUBLIC_URL: "${LAZYTEAM_PUBLIC_URL:-http://localhost:8787}"
+      LAZYTEAM_OAUTH_PASSWORD: "${LAZYTEAM_OAUTH_PASSWORD:?set LAZYTEAM_OAUTH_PASSWORD}"
+      RUST_LOG: "${RUST_LOG:-lazyteam_server=info,tower_http=info}"
+    volumes:
+      - lazyteam-data:/data
+
+volumes:
+  lazyteam-data:
