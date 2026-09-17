@@ -13,6 +13,7 @@ chrono.workspace = true
 clap.workspace = true
 lazyteam-core = { path = "../lazyteam-core" }
 rand.workspace = true
+reqwest.workspace = true
 rmcp = { version = "3.4", features = ["server", "transport-streamable-http-server"] }
 serde.workspace = true
 serde_json.workspace = true
