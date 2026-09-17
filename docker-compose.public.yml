@@ -1,0 +1,60 @@
+services:
+  lazyteam:
+    build: .
+    restart: unless-stopped
+    expose:
+      - "8787"
+    environment:
+      LAZYTEAM_LISTEN: "0.0.0.0:8787"
+      LAZYTEAM_DATABASE_URL: "sqlite:///data/lazyteam.db?mode=rwc"
+      LAZYTEAM_PRODUCTION: "true"
+      LAZYTEAM_PUBLIC_URL: "https://${LAZYTEAM_DOMAIN:?set LAZYTEAM_DOMAIN}"
+      LAZYTEAM_OAUTH_PASSWORD: "${LAZYTEAM_OAUTH_PASSWORD:?set LAZYTEAM_OAUTH_PASSWORD}"
+      LAZYTEAM_ADMIN_TOKEN: "${LAZYTEAM_ADMIN_TOKEN:?set LAZYTEAM_ADMIN_TOKEN}"
+      LAZYTEAM_WORKER_TOKEN: "${LAZYTEAM_WORKER_TOKEN:?set LAZYTEAM_WORKER_TOKEN}"
+      LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS: "${LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS:-chatgpt.com,*.chatgpt.com}"
+      LAZYTEAM_ALLOWED_REDIRECT_HOSTS: "${LAZYTEAM_ALLOWED_REDIRECT_HOSTS:-chatgpt.com,*.chatgpt.com}"
+      RUST_LOG: "${RUST_LOG:-lazyteam_server=info,tower_http=info}"
+    volumes:
+      - lazyteam-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      lazyteam:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      LAZYTEAM_DOMAIN: "${LAZYTEAM_DOMAIN:?set LAZYTEAM_DOMAIN}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  lazyteam-data:
+  caddy-data:
+  caddy-config:
