@@ -1,6 +1,3 @@
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
