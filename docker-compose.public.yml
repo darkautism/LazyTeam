@@ -4,6 +4,8 @@ services:
     restart: unless-stopped
     expose:
       - "8787"
+    ports:
+      - "127.0.0.1:8787:8787"
     environment:
       LAZYTEAM_LISTEN: "0.0.0.0:8787"
       LAZYTEAM_DATABASE_URL: "sqlite:///data/lazyteam.db?mode=rwc"
