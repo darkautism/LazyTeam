@@ -48,6 +48,8 @@ def main():
            "role selector must call onWorkerRoleChange()")
     expect('<option value="worker">Worker</option>' in ui, "Worker role option missing")
     expect('<option value="reviewer">Reviewer</option>' in ui, "Reviewer role option missing")
+    expect(re.search(r"Changing role replaces Initial prompt.*customized prompt.*overwrite confirmation", ui, re.I | re.S),
+           "role selector must show a hint that changing role replaces the prompt and customized prompts need overwrite confirmation")
 
     # 3. Role change replaces the prompt with the role default.
     expect("function defaultPromptForRole(role)" in ui, "defaultPromptForRole helper missing")

@@ -95,7 +95,7 @@ dialog{width:min(620px,calc(100vw - 30px));border:1px solid var(--line);border-r
     <div class="field"><label>Slots</label><input id="worker-config-slots" type="number" min="1" value="1"></div>
     <div class="field wide"><label>Tags</label><input id="worker-config-tags" placeholder="rust=true, gpu=none"></div>
     <div class="field wide"><label>Allowed projects</label><input id="worker-config-projects" placeholder="*, lazyteam"></div>
-    <div class="field"><label>Role</label><select id="worker-config-role" onchange="onWorkerRoleChange()"><option value="worker">Worker</option><option value="reviewer">Reviewer</option></select></div>
+    <div class="field"><label>Role</label><select id="worker-config-role" onchange="onWorkerRoleChange()"><option value="worker">Worker</option><option value="reviewer">Reviewer</option></select><div class="subtle">Changing role replaces Initial prompt with that role's default; a customized prompt requires overwrite confirmation.</div></div>
     <div class="field"><label>Agent</label><select id="worker-config-agent"><option value="pi">Pi</option></select></div>
     <div class="field"><label>Provider</label><select id="worker-config-provider" onchange="renderWorkerModels()"></select></div>
     <div class="field wide"><label>Model</label><select id="worker-config-model"></select></div>

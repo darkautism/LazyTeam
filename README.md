@@ -202,7 +202,7 @@ LazyTeam separates three responsibilities:
 
 - **Worker** agents claim implementation tasks (`assigned`/`running`), edit code in the task workspace, and publish a stable review ref when the execution finishes.
 - **Reviewer** agents (protocol 3) claim pinned review leases for tasks in `review`, verify the exact candidate commit independently, and return an approve/retry JSON verdict. They never modify source, commit, push, or merge.
-- The **main agent** (ChatGPT / MCP through `tasks_approve` / `tasks_merged`) owns the merge handoff: approval moves `review -> merge_pending`, and only an explicit `tasks_merged(task_id, merge_commit_sha)` call after the real merge moves `merge_pending -> done`.
+- The **main agent** (ChatGPT / MCP) owns the merge handoff. A reviewer-role worker's approve verdict already moves the task directly `review -> merge_pending`; `tasks_approve` is only the fallback for when the main agent performs the review itself. The normal main-agent path starts at `merge_pending`: integrate the exact reviewed candidate, resolve conflicts if any, push upstream, then call `tasks_merged(task_id, merge_commit_sha)` to move the task to `done`.
 
 After a worker is enrolled, open **Workers → Configure** in the private UI. The server becomes the source of truth for the worker name, role, tags, allowed projects, slots, agent selection, provider/model selection, and initial prompt. A running worker fetches this configuration before claiming work, so changes apply to subsequent tasks without re-enrollment. The worker list shows each worker's role (`worker` or `reviewer`) as a pill next to its name.
 
@@ -228,7 +228,7 @@ Before deciding, an MCP reviewer calls `reviews_get(task_id)`. The response is d
 
 A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, pins the task back to the worker that produced the reviewed attempt, and injects the feedback into the same persistent task session. The task workspace and Pi session are reused instead of being recreated, improving continuity and provider prompt-cache reuse.
 
-Approval is only a review verdict: `tasks_approve` moves the task to `merge_pending`. It does **not** release dependencies or delete worker state. After the reviewed ref is actually merged into the default branch, the merger calls `tasks_merged(task_id, merge_commit_sha)`. Only then does the task become `done`, dependencies unlock, and the original worker receive a cleanup item. The worker then deletes the task workspace, Pi session directory, and best-effort deletes the temporary review branch.
+A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`; `tasks_approve` is only the fallback when the main agent reviews the candidate itself. Neither path releases dependencies or deletes worker state. The main agent then integrates the exact reviewed candidate, resolves conflicts if any, pushes upstream, and calls `tasks_merged(task_id, merge_commit_sha)` once the reviewed ref is actually merged into the default branch. Only then does the task become `done`, dependencies unlock, and the original worker receive a cleanup item. The worker then deletes the task workspace, Pi session directory, and best-effort deletes the temporary review branch.
 
 The worker also captures up to 256 KiB of textual patch evidence and marks truncated patches explicitly, but the pullable review ref is the primary path for full-context review.
 
@@ -244,7 +244,7 @@ queued -> assigned -> running -> review -> merge_pending -> done
 
 - Completed worker executions enter `review` and publish a stable review ref.
 - Review retry requires feedback and is sticky to the same worker so workspace/session state is reused.
-- `tasks_approve` moves `review -> merge_pending`; dependencies remain blocked.
+- A reviewer approve verdict moves `review -> merge_pending` directly (`tasks_approve` is only the main-agent self-review fallback); dependencies remain blocked.
 - `tasks_merged` requires a merge commit SHA, moves `merge_pending -> done`, releases dependencies, and queues worker cleanup.
 - Every execution still gets its own UUID/attempt record, but attempts share the task workspace/session until merge.
 
