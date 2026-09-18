@@ -192,11 +192,19 @@ fn parse_tag(raw: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // The sandbox self-exec path must run before Tokio creates worker threads.  Linux user
+    // namespaces reject unshare(CLONE_NEWUSER) from a multithreaded process on some kernels.
     if let Some(result) = sandbox::maybe_handle_entrypoint() {
         return result;
     }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
