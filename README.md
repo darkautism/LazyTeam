@@ -29,11 +29,19 @@ export LAZYTEAM_WORKER_TOKEN="$(openssl rand -hex 32)"
 docker compose -f docker-compose.public.yml up -d --build
 ```
 
-The public endpoint is then:
+The canonical public MCP endpoint is:
 
 ```text
 https://lazyteam.example.com/mcp
 ```
+
+For client UIs that normalize the configured server URL to the site root, LazyTeam also serves an OAuth-protected MCP alias at:
+
+```text
+https://lazyteam.example.com/
+```
+
+Both endpoints publish RFC 9728 metadata for their own resource identifier. The private dashboard moved to `/ui` and is not exposed by the public Caddy profile.
 
 Caddy obtains and renews the public TLS certificate. LazyTeam itself remains reachable on the host only through `127.0.0.1:8787` for local administration.
 
@@ -82,6 +90,7 @@ The ChatGPT host values are defaults, not a universal trust rule. If the actual 
 The provided Caddy configuration publishes only:
 
 ```text
+/
 /health
 /mcp
 /mcp/*
