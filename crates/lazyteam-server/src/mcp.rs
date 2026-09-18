@@ -67,13 +67,35 @@ impl LazyTeamMcp {
         Self { state, tool_router: Self::tool_router() }
     }
 
-    #[tool(name = "projects_list", description = "List all LazyTeam projects")]
+    #[tool(
+        name = "projects_list",
+        title = "List projects",
+        description = "List all LazyTeam projects",
+        annotations(
+            title = "List projects",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn projects_list(&self) -> Result<CallToolResult, McpError> {
         let Json(items) = list_projects(State(self.state.clone())).await.map_err(api_to_mcp)?;
         json_result(&items)
     }
 
-    #[tool(name = "projects_create", description = "Create a LazyTeam project bound to a Git repository")]
+    #[tool(
+        name = "projects_create",
+        title = "Create project",
+        description = "Create a LazyTeam project bound to a Git repository",
+        annotations(
+            title = "Create project",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn projects_create(
         &self,
         Parameters(input): Parameters<ProjectCreateParams>,
@@ -92,13 +114,35 @@ impl LazyTeamMcp {
         json_result(&project)
     }
 
-    #[tool(name = "tasks_list", description = "List tasks across all LazyTeam projects")]
+    #[tool(
+        name = "tasks_list",
+        title = "List tasks",
+        description = "List tasks across all LazyTeam projects",
+        annotations(
+            title = "List tasks",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn tasks_list(&self) -> Result<CallToolResult, McpError> {
         let Json(items) = list_tasks(State(self.state.clone())).await.map_err(api_to_mcp)?;
         json_result(&items)
     }
 
-    #[tool(name = "tasks_create", description = "Create and queue a task in a LazyTeam project")]
+    #[tool(
+        name = "tasks_create",
+        title = "Create task",
+        description = "Create and queue a task in a LazyTeam project",
+        annotations(
+            title = "Create task",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn tasks_create(
         &self,
         Parameters(input): Parameters<TaskCreateParams>,
@@ -126,7 +170,18 @@ impl LazyTeamMcp {
         json_result(&task)
     }
 
-    #[tool(name = "tasks_approve", description = "Approve a task in review, mark it done, and release dependent tasks")]
+    #[tool(
+        name = "tasks_approve",
+        title = "Approve task",
+        description = "Approve a task in review, mark it done, and release dependent tasks",
+        annotations(
+            title = "Approve task",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn tasks_approve(
         &self,
         Parameters(input): Parameters<TaskIdParams>,
@@ -136,7 +191,18 @@ impl LazyTeamMcp {
         json_result(&transition)
     }
 
-    #[tool(name = "tasks_retry", description = "Requeue a task from review, failed, or blocked")]
+    #[tool(
+        name = "tasks_retry",
+        title = "Retry task",
+        description = "Requeue a task from review, failed, or blocked",
+        annotations(
+            title = "Retry task",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn tasks_retry(
         &self,
         Parameters(input): Parameters<TaskIdParams>,
@@ -146,7 +212,18 @@ impl LazyTeamMcp {
         json_result(&transition)
     }
 
-    #[tool(name = "workers_list", description = "List registered LazyTeam workers and their capabilities")]
+    #[tool(
+        name = "workers_list",
+        title = "List workers",
+        description = "List registered LazyTeam workers and their capabilities",
+        annotations(
+            title = "List workers",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn workers_list(&self) -> Result<CallToolResult, McpError> {
         let Json(items) = list_workers(State(self.state.clone())).await.map_err(api_to_mcp)?;
         json_result(&items)

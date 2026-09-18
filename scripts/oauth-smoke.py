@@ -89,6 +89,17 @@ def mcp_call(
     return request(path, method="POST", data=json.dumps(message).encode(), headers=headers)
 
 
+EXPECTED_TOOL_ANNOTATIONS = {
+    "projects_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "projects_create": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "tasks_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "tasks_create": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "tasks_approve": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    "tasks_retry": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "workers_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+}
+
+
 def validate_tool_schemas(tools):
     for tool in tools:
         name = tool.get("name", "<unnamed>")
@@ -101,6 +112,13 @@ def validate_tool_schemas(tools):
         expect(isinstance(required, list), f"{name} inputSchema required is not an array")
         expect(all(isinstance(item, str) for item in required), f"{name} inputSchema required contains non-strings")
         expect(set(required).issubset(properties), f"{name} inputSchema requires unknown properties")
+        expect(isinstance(tool.get("title"), str) and tool["title"], f"{name} title is missing")
+        annotations = tool.get("annotations")
+        expect(isinstance(annotations, dict), f"{name} annotations are missing")
+        expected = EXPECTED_TOOL_ANNOTATIONS.get(name)
+        expect(expected is not None, f"{name} has no expected annotation contract")
+        for key, value in expected.items():
+            expect(annotations.get(key) is value, f"{name} {key} mismatch: {annotations.get(key)!r}")
         json.dumps(schema)
 
 
