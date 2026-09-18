@@ -285,9 +285,12 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
     }
     fs::create_dir_all(&root).with_context(|| format!("create namespace root {}", root.display()))?;
 
-    let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
-    if unsafe { libc::unshare(flags) } != 0 {
-        bail!("unshare user/mount namespace failed: {}", std::io::Error::last_os_error());
+    // Some vendor kernels reject creating user+mount namespaces in one unshare(2)
+    // call even though util-linux `unshare --user --map-root-user --mount` works.  Match
+    // that safe ordering explicitly: create USER first, install uid/gid maps, become root
+    // only inside that user namespace, then create the MOUNT namespace.
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+        bail!("unshare user namespace failed: {}", std::io::Error::last_os_error());
     }
 
     // Map namespace uid/gid 0 to the unprivileged host worker user.  This gives enough
@@ -303,6 +306,9 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
     }
     if unsafe { libc::setresuid(0, 0, 0) } != 0 {
         bail!("setresuid inside user namespace failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        bail!("unshare mount namespace failed: {}", std::io::Error::last_os_error());
     }
 
     let slash = CString::new("/")?;
