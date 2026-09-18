@@ -101,7 +101,7 @@ def main():
     expect(">Approve<" not in ui and ">Retry<" not in ui,
            "board must not contain manual Approve/Retry buttons")
     expect(re.search(r"onclick=\"[^\"]*[Aa]pprove", ui) is None, "board must not wire Approve actions")
-    m = re.search(r"function mergeCard\(\s*x\s*\)\{(.*?)\n\}", ui, re.S)
+    m = re.search(r"function mergeCard\(\s*x\s*\)\{([^}]*)\}", ui, re.S)
     expect(m, "mergeCard renderer missing")
     expect("<button" not in m.group(1), "MergePending cards must have no action buttons")
     expect(re.search(r"main agent.*merge|merge.*main agent", ui, re.I),

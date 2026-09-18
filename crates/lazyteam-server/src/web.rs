@@ -43,8 +43,6 @@ mod tests {
         assert!(INDEX.contains("/provider-key"));
         assert!(INDEX.contains("API keys are write-only"));
         assert!(INDEX.contains("modelCostLabel"));
-        assert!(INDEX.contains("Re-dispatch"));
-        assert!(INDEX.contains("deleteTask"));
         assert!(INDEX.contains("Unclaimed"));
         assert!(INDEX.contains("Working"));
         assert!(INDEX.contains("Review"));
@@ -61,7 +59,9 @@ mod tests {
         assert!(INDEX.contains("-webkit-box-orient:vertical"));
         assert!(INDEX.contains("text-overflow:ellipsis"));
         assert!(INDEX.contains("card-title"));
-        assert!(INDEX.contains("card-actions"));
+        assert!(INDEX.contains("white-space:nowrap"));
+        assert!(INDEX.contains("height:calc(1.35em * 3)"));
+        assert!(!INDEX.contains("card-actions"));
         assert!(!INDEX.contains("worker-pill"));
         assert!(!INDEX.contains("ChatGPT / MCP review"));
         assert!(!INDEX.contains("'unclaimed'"));
