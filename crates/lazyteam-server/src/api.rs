@@ -209,6 +209,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/{id}", axum::routing::patch(update_project).delete(delete_project))
         .route("/api/tasks", get(list_tasks).post(create_task))
+        .route("/api/tasks/{id}", axum::routing::delete(delete_task))
         .route("/api/tasks/{id}/review", get(review_evidence))
         .route("/api/task-board", get(task_board))
         .route("/api/workers", get(list_workers))
@@ -346,8 +347,46 @@ pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input):
 }
 
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Task>> {
-    let rows = sqlx::query("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC").fetch_all(&state.db).await.map_err(db_error)?;
+    let rows = sqlx::query("SELECT * FROM tasks WHERE state!='cancelled' ORDER BY priority DESC, created_at ASC").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(task_from_row).collect::<Result<Vec<_>,_>>().map(Json)
+}
+
+pub(crate) async fn delete_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+    let task_id = id.to_string();
+    let current: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+        .bind(&task_id).fetch_optional(&state.db).await.map_err(db_error)?;
+    let Some(current) = current else { return Err((StatusCode::NOT_FOUND, "task not found".into())); };
+    if matches!(current.as_str(), "assigned" | "running" | "merge_pending" | "done") {
+        return Err((StatusCode::CONFLICT, "active, merge-pending, or completed tasks cannot be deleted".into()));
+    }
+
+    let rows = sqlx::query("SELECT id,dependencies FROM tasks WHERE id!=? AND state!='cancelled'")
+        .bind(&task_id).fetch_all(&state.db).await.map_err(db_error)?;
+    for row in rows {
+        let other_id: String = row.try_get("id").map_err(internal)?;
+        let dependencies_raw: String = row.try_get("dependencies").map_err(internal)?;
+        let dependencies: Vec<Uuid> = serde_json::from_str(&dependencies_raw).map_err(internal)?;
+        if dependencies.contains(&id) {
+            return Err((StatusCode::CONFLICT, format!("task is still required by dependent task {other_id}")));
+        }
+    }
+
+    let worker_id: Option<String> = sqlx::query_scalar("SELECT worker_id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(&task_id).fetch_optional(&state.db).await.map_err(db_error)?;
+    let now = ts(Utc::now());
+    let mut tx = state.db.begin().await.map_err(db_error)?;
+    let changed = sqlx::query("UPDATE tasks SET state='cancelled',sticky_worker_id=NULL,updated_at=? WHERE id=? AND state NOT IN ('assigned','running','merge_pending','done')")
+        .bind(&now).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if changed == 0 {
+        tx.rollback().await.map_err(db_error)?;
+        return Err((StatusCode::CONFLICT, "task changed while deleting".into()));
+    }
+    if let Some(worker_id) = worker_id {
+        sqlx::query("INSERT INTO task_cleanup(task_id,worker_id,created_at) VALUES(?,?,?) ON CONFLICT(task_id) DO UPDATE SET worker_id=excluded.worker_id,created_at=excluded.created_at")
+            .bind(&task_id).bind(worker_id).bind(&now).execute(&mut *tx).await.map_err(db_error)?;
+    }
+    tx.commit().await.map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> ApiResult<ReviewEvidence> {
@@ -378,15 +417,20 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
 }
 
 async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
-    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id ORDER BY t.priority DESC, t.created_at ASC")
+    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
         .fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(|row| {
         let task = task_from_row(row)?;
         let worker_id: Option<String> = row.try_get("board_worker_id").map_err(internal)?;
         let worker_name: Option<String> = row.try_get("board_worker_name").map_err(internal)?;
-        let worker = match (worker_id, worker_name) {
-            (Some(id), Some(name)) => Some(WorkerRef { id: uuid(id)?, name }),
-            _ => None,
+        let show_worker = matches!(task.state, TaskState::Assigned | TaskState::Running | TaskState::Review | TaskState::MergePending | TaskState::Done);
+        let worker = if show_worker {
+            match (worker_id, worker_name) {
+                (Some(id), Some(name)) => Some(WorkerRef { id: uuid(id)?, name }),
+                _ => None,
+            }
+        } else {
+            None
         };
         let result: Option<String> = row.try_get("board_result").map_err(internal)?;
         let result = result.map(dejson).transpose()?;
@@ -614,8 +658,8 @@ async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState
     sqlx::query("UPDATE executions SET state=?,finished_at=?,result=? WHERE id=?")
         .bind(if success { "completed" } else { "failed" }).bind(ts(now)).bind(json(&input.result)?).bind(id.to_string())
         .execute(&mut *tx).await.map_err(db_error)?;
-    sqlx::query("UPDATE tasks SET state=?,updated_at=? WHERE id=?")
-        .bind(if success { "review" } else { "failed" }).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+    sqlx::query("UPDATE tasks SET state=?,sticky_worker_id=CASE WHEN ? THEN sticky_worker_id ELSE NULL END,updated_at=? WHERE id=?")
+        .bind(if success { "review" } else { "draft" }).bind(success).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
     sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state='draining' THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
         .bind(&worker_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;

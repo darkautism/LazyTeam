@@ -73,6 +73,39 @@ def main():
     expect(worker["id"] == worker_id, "worker ID mismatch")
     worker_headers = {WORKER_CREDENTIAL_HEADER: credential}
 
+    failure_task = post_json("/api/tasks", {
+        "project_id": project_a["id"],
+        "title": "failure returns unclaimed",
+        "expected_outcome": "become unclaimed after a failed execution",
+        "required_tags": {"rust": "true"},
+        "priority": 200,
+    })
+    failure_claim = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
+    expect(failure_claim.status == 200, f"failure smoke claim failed: {failure_claim.status}")
+    failure_assignment = read_json(failure_claim)
+    expect(failure_assignment["task"]["id"] == failure_task["id"], "failure smoke task was not claimed")
+    failure_finish = request(
+        f"/api/executions/{failure_assignment['execution']['id']}/finish",
+        method="POST",
+        obj={"result": {"status": "failed", "summary": "intentional smoke failure"}},
+        headers=worker_headers,
+    )
+    expect(failure_finish.status == 204, f"failure smoke finish failed: {failure_finish.status}")
+    board = read_json(request("/api/task-board"))
+    failure_board = next(item for item in board if item["task"]["id"] == failure_task["id"])
+    expect(failure_board["task"]["state"] == "draft", "failed execution did not return task to unclaimed/draft")
+    expect(failure_board["worker"] is None, "unclaimed task still exposed its previous worker")
+    redispatched = post_json(f"/api/tasks/{failure_task['id']}/retry", {}, expected=200)
+    expect(redispatched["state"] == "queued", "draft task did not re-dispatch to queued")
+    deleted = request(f"/api/tasks/{failure_task['id']}", method="DELETE")
+    expect(deleted.status == 204, f"task delete failed: {deleted.status}")
+    visible_tasks = read_json(request("/api/tasks"))
+    expect(all(task["id"] != failure_task["id"] for task in visible_tasks), "deleted task remained visible")
+    cleanup = read_json(request(f"/api/workers/{worker_id}/cleanup", headers=worker_headers))
+    expect(any(item["task_id"] == failure_task["id"] for item in cleanup), "deleted task did not queue worker cleanup")
+    ack = request(f"/api/workers/{worker_id}/cleanup/{failure_task['id']}", method="POST", headers=worker_headers)
+    expect(ack.status == 204, f"deleted task cleanup ack failed: {ack.status}")
+
     foreign_task = post_json("/api/tasks", {
         "project_id": project_b["id"],
         "title": "must not run here",

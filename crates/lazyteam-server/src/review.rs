@@ -112,7 +112,7 @@ pub(crate) async fn retry_task(state: &AppState, id: Uuid, reason: Option<&str>)
     let current: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
         .bind(id.to_string()).fetch_optional(&state.db).await.map_err(internal)?;
     let Some(current) = current else { return Err((StatusCode::NOT_FOUND, "task not found".into())); };
-    if !matches!(current.as_str(), "review" | "merge_pending" | "failed" | "blocked") {
+    if !matches!(current.as_str(), "draft" | "review" | "merge_pending" | "failed" | "blocked") {
         return Err((StatusCode::CONFLICT, "task is not retryable from its current state".into()));
     }
     let reason = reason.map(str::trim).filter(|value| !value.is_empty());

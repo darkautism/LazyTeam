@@ -142,7 +142,7 @@ function clearViews(){$('#queue-cards').innerHTML=$('#working-cards').innerHTML=
 
 async function refreshBoard(){
   [projects,board]=await Promise.all([api('/api/projects'),api('/api/task-board')]);const pm=Object.fromEntries(projects.map(p=>[p.id,p]));
-  const queue=board.filter(x=>['queued','failed','blocked'].includes(x.task.state));
+  const queue=board.filter(x=>['draft','queued','failed','blocked'].includes(x.task.state));
   const working=board.filter(x=>['assigned','running'].includes(x.task.state));
   const review=board.filter(x=>['review','merge_pending'].includes(x.task.state));
   renderLane('#queue-cards','#queue-count',queue,x=>taskCard(x,pm));
@@ -151,14 +151,18 @@ async function refreshBoard(){
 }
 function renderLane(sel,countSel,items,render){$(countSel).textContent=items.length;$(sel).innerHTML=items.length?items.map(render).join(''):'<div class="empty">Nothing here</div>'}
 function taskCard(x,pm){
-  const t=x.task,p=pm[t.project_id];const worker=x.worker?'<span class="pill worker-pill">'+esc(x.worker.name)+'</span>':'';
-  return '<article class="card"><div class="card-title">'+esc(t.title)+'</div><div class="meta"><span class="pill">'+esc(p?.slug||short(t.project_id))+'</span><span>'+esc(t.state)+'</span>'+worker+'</div>'+(t.expected_outcome?'<div class="summary">'+esc(t.expected_outcome)+'</div>':'')+'</article>';
+  const t=x.task,p=pm[t.project_id],retryable=['draft','failed','blocked'].includes(t.state),state=retryable?'unclaimed':t.state;
+  const actions='<div class="row-actions">'+(retryable?'<button class="secondary" onclick="redispatchTask(\''+t.id+'\')">Re-dispatch</button>':'')+'<button class="secondary danger" onclick="deleteTask(\''+t.id+'\')">Delete</button></div>';
+  return '<article class="card"><div class="card-title">'+esc(t.title)+'</div><div class="meta"><span class="pill">'+esc(p?.slug||short(t.project_id))+'</span><span>'+esc(state)+'</span></div>'+(t.expected_outcome?'<div class="summary">'+esc(t.expected_outcome)+'</div>':'')+actions+'</article>';
 }
 function reviewCard(x,pm){
   const t=x.task,p=pm[t.project_id],summary=x.result?.summary||t.expected_outcome||'Ready for review';
   const state=t.state==='merge_pending'?'Approved · waiting for merge':'ChatGPT / MCP review';
-  return '<article class="card"><div class="card-title">'+esc(t.title)+'</div><div class="meta"><span class="pill">'+esc(p?.slug||short(t.project_id))+'</span>'+(x.worker?'<span class="pill worker-pill">'+esc(x.worker.name)+'</span>':'')+'<span class="pill">'+esc(state)+'</span></div><div class="summary">'+esc(summary)+'</div></article>';
+  const actions=t.state==='review'?'<div class="row-actions"><button class="secondary danger" onclick="deleteTask(\''+t.id+'\')">Delete</button></div>':'';
+  return '<article class="card"><div class="card-title">'+esc(t.title)+'</div><div class="meta"><span class="pill">'+esc(p?.slug||short(t.project_id))+'</span>'+(x.worker?'<span class="pill worker-pill">'+esc(x.worker.name)+'</span>':'')+'<span class="pill">'+esc(state)+'</span></div><div class="summary">'+esc(summary)+'</div>'+actions+'</article>';
 }
+async function redispatchTask(id){try{await api('/api/tasks/'+id+'/retry',{method:'POST',body:'{}'});await refreshBoard()}catch(e){alert(e.message)}}
+async function deleteTask(id){if(!confirm('Delete this task from LazyTeam? Its last worker workspace will be queued for cleanup.'))return;try{await api('/api/tasks/'+id,{method:'DELETE'});await refreshBoard()}catch(e){alert(e.message)}}
 
 async function refreshProjects(){projects=await api('/api/projects');$('#project-list').innerHTML=projects.length?projects.map(projectRow).join(''):'<div class="empty">No projects</div>'}
 function gitAuthLabel(p){const a=p.git_auth||{mode:'worker'};if(a.mode==='ssh_key')return 'Git SSH key'+(a.credential_configured?' · stored':'');if(a.mode==='https_basic')return 'Git HTTPS'+(a.username?' · '+a.username:'')+(a.credential_configured?' · stored':'');return 'Git on worker'}

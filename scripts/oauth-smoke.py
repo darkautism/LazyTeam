@@ -98,6 +98,7 @@ EXPECTED_TOOL_ANNOTATIONS = {
     "tasks_approve": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     "tasks_merged": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     "tasks_retry": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "tasks_delete": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     "workers_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 }
 

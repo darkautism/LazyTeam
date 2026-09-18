@@ -11,7 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    create_project, create_task, list_projects, list_tasks, list_workers, review, review_evidence, AppState,
+    create_project, create_task, delete_task, list_projects, list_tasks, list_workers, review, review_evidence, AppState,
     CreateProject, CreateTask,
 };
 
@@ -255,7 +255,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "tasks_retry",
         title = "Retry task",
-        description = "Requeue a task from review, failed, or blocked. A review retry requires a concise reason, which is delivered to the next worker attempt",
+        description = "Re-dispatch an unclaimed/draft, review, failed, or blocked task. A review retry requires a concise reason, which is delivered to the next worker attempt",
         annotations(
             title = "Retry task",
             read_only_hint = false,
@@ -280,6 +280,27 @@ impl LazyTeamMcp {
         }
         let transition = review::retry_task(&self.state, task_id, input.reason.as_deref()).await.map_err(api_to_mcp)?;
         json_result(&transition)
+    }
+
+    #[tool(
+        name = "tasks_delete",
+        title = "Delete task",
+        description = "Remove an obsolete unclaimed/review/failed task from LazyTeam views and queue cleanup on its last worker. Active, merge-pending, and completed tasks are protected.",
+        annotations(
+            title = "Delete task",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tasks_delete(
+        &self,
+        Parameters(input): Parameters<TaskIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        delete_task(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        json_result(&serde_json::json!({"task_id": task_id, "deleted": true}))
     }
 
     #[tool(
