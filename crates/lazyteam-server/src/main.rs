@@ -124,6 +124,8 @@ async fn main() -> anyhow::Result<()> {
         .context("connect sqlite")?;
     sqlx::migrate!().run(&db).await.context("run migrations")?;
 
+    let mcp_config = mcp_http_config(public_url.as_deref())?;
+    let root_mcp_config = mcp_http_config(public_url.as_deref())?;
     let state = Arc::new(AppState {
         db,
         public_url,
@@ -134,17 +136,13 @@ async fn main() -> anyhow::Result<()> {
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp::LazyTeamMcp::new(mcp_state.clone())),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(true)
-            .with_json_response(true),
+        mcp_config,
     );
     let root_mcp_state = state.clone();
     let root_mcp_service = StreamableHttpService::new(
         move || Ok(mcp::LazyTeamMcp::new(root_mcp_state.clone())),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(true)
-            .with_json_response(true),
+        root_mcp_config,
     );
     let mcp_router = Router::<Arc<AppState>>::new()
         .route_service("/", root_mcp_service)
@@ -171,6 +169,27 @@ async fn main() -> anyhow::Result<()> {
     info!(listen = %args.listen, production = args.production, "LazyTeam control plane listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn mcp_http_config(public_url: Option<&str>) -> anyhow::Result<StreamableHttpServerConfig> {
+    let mut allowed_hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Some(public) = public_url {
+        let parsed = Url::parse(public).context("parse LAZYTEAM_PUBLIC_URL for MCP host guard")?;
+        if let Some(host) = parsed.host_str() {
+            let host = host.to_ascii_lowercase();
+            if !allowed_hosts.iter().any(|allowed| allowed == &host) {
+                allowed_hosts.push(host);
+            }
+        }
+    }
+    Ok(StreamableHttpServerConfig::default()
+        .with_allowed_hosts(allowed_hosts)
+        .with_legacy_session_mode(true)
+        .with_json_response(true))
 }
 
 fn validate_public_url(public: &str) -> anyhow::Result<()> {
@@ -200,4 +219,76 @@ fn parse_hosts(raw: &str) -> Vec<String> {
         .filter(|v| !v.is_empty())
         .map(str::to_ascii_lowercase)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header;
+
+    #[test]
+    fn mcp_host_guard_allows_public_url_host_and_loopback() {
+        let config = mcp_http_config(Some("https://LazyTeam.Example.Test:8443/path")).unwrap();
+        assert!(config.allowed_hosts.iter().any(|host| host == "lazyteam.example.test"));
+        assert!(config.allowed_hosts.iter().any(|host| host == "localhost"));
+        assert!(config.allowed_hosts.iter().any(|host| host == "127.0.0.1"));
+        assert!(config.allowed_hosts.iter().any(|host| host == "::1"));
+    }
+
+    #[tokio::test]
+    async fn public_host_reaches_mcp_discovery() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
+        let state = Arc::new(AppState {
+            db,
+            public_url: Some("https://lazyteam.example.test".to_string()),
+            oauth_password: None,
+        });
+        let mcp_state = state.clone();
+        let service = StreamableHttpService::new(
+            move || Ok(mcp::LazyTeamMcp::new(mcp_state.clone())),
+            LocalSessionManager::default().into(),
+            mcp_http_config(state.public_url.as_deref()).unwrap(),
+        );
+        let app = Router::new().route_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .header(header::HOST, "lazyteam.example.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "server/discover")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "discover-public-host",
+                "method": "server/discover",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientInfo": {
+                            "name": "lazyteam-public-host-test",
+                            "version": "1.0"
+                        },
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK, "public Host was rejected: {body}");
+        assert!(body.contains("2026-07-28"), "discover omitted modern protocol: {body}");
+    }
 }
