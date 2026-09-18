@@ -5,6 +5,7 @@ image="${1:-lazyteam-worker:release-candidate}"
 
 docker run --rm "$image" lazyteam-worker --help >/dev/null
 
+set +e
 output="$(
   docker run --rm \
     --read-only \
@@ -16,17 +17,26 @@ output="$(
     --cap-add DAC_OVERRIDE \
     --cap-add SETGID \
     --cap-add SETUID \
-    --security-opt no-new-privileges:true \
+    --security-opt no-new-privileges=true \
     --security-opt seccomp=unconfined \
     --security-opt apparmor=unconfined \
-    "$image" lazyteam-worker --sandbox-diagnose
+    "$image" lazyteam-worker --sandbox-diagnose 2>&1
 )"
+status=$?
+set -e
 printf '%s\n' "$output"
+
+if [ "$status" -ne 0 ]; then
+  compact="$(printf '%s' "$output" | tail -c 4000 | tr '\n' ' ')"
+  echo "::error title=Worker container sandbox failed::$compact"
+  exit "$status"
+fi
 
 case "$output" in
   *"LazyTeam agent sandbox ready"*) ;;
   *)
-    echo "worker container sandbox diagnostic did not report ready" >&2
+    compact="$(printf '%s' "$output" | tail -c 4000 | tr '\n' ' ')"
+    echo "::error title=Worker container sandbox incomplete::$compact"
     exit 1
     ;;
 esac
