@@ -57,7 +57,7 @@ impl AgentSandbox {
 
         let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
         let mut read_only = BTreeSet::new();
-        for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/sys"] {
+        for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
             if let Ok(path) = std::fs::canonicalize(path) {
                 read_only.insert(path);
             }
