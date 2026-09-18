@@ -85,6 +85,12 @@ def main():
     expect(health.headers.get("X-Content-Type-Options") == "nosniff", "nosniff missing")
     expect(health.headers.get("Strict-Transport-Security"), "HSTS missing in production")
 
+    root_mcp = request("/", method="POST", data=b"{}", headers={"Content-Type": "application/json"})
+    expect(root_mcp.status == 401, f"production root MCP should challenge with OAuth, got {root_mcp.status}")
+    root_www = root_mcp.headers.get("WWW-Authenticate", "")
+    expect("resource_metadata=" in root_www, "production root MCP did not expose OAuth resource metadata")
+    expect("lazyteam-admin" not in root_www, "production root MCP was intercepted by admin auth")
+
     slug = "security-" + uuid.uuid4().hex[:8]
 
     anonymous_admin = request("/api/projects", method="POST", obj=project_payload(slug))
