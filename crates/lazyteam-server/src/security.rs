@@ -265,6 +265,21 @@ fn host_allowed(host: &str, allowed: &[String]) -> bool {
     })
 }
 
+fn is_worker_runtime_path(path: &str) -> bool {
+    (path.starts_with("/api/workers/")
+        && (path.ends_with("/heartbeat")
+            || path.ends_with("/claim")
+            || path.ends_with("/review-claim")
+            || path.ends_with("/config")
+            || path.ends_with("/capabilities")
+            || path.ends_with("/capability-build")
+            || path.ends_with("/agent-auth")
+            || path.ends_with("/cleanup")
+            || path.contains("/cleanup/")))
+        || path.starts_with("/api/executions/")
+        || path.starts_with("/api/reviews/")
+}
+
 pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
     if let Err(response) = rate_limit_for(&request) {
         return response;
@@ -284,11 +299,7 @@ pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
             if (production() || config().worker_token.is_some()) && !worker_enrollment_matches(&request) {
                 return unauthorized("worker-enrollment");
             }
-        } else if (path.starts_with("/api/workers/")
-            && (path.ends_with("/heartbeat") || path.ends_with("/claim") || path.ends_with("/review-claim") || path.ends_with("/config") || path.ends_with("/capabilities") || path.ends_with("/agent-auth") || path.ends_with("/cleanup") || path.contains("/cleanup/")))
-            || path.starts_with("/api/executions/")
-            || path.starts_with("/api/reviews/")
-        {
+        } else if is_worker_runtime_path(path) {
             // Per-worker authentication and execution ownership are enforced in the
             // endpoint handlers where the worker/execution ID is available.
         } else if (production() || config().admin_token.is_some())
@@ -509,6 +520,13 @@ mod tests {
             assert!(!is_public_ip(raw.parse().unwrap()), "{raw} must be rejected");
         }
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn managed_capability_build_is_worker_runtime_traffic() {
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/capability-build"));
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/capabilities"));
+        assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000"));
     }
 
     #[test]

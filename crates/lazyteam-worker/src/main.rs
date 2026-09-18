@@ -334,14 +334,23 @@ async fn async_main() -> anyhow::Result<()> {
         warn!(%error, "initial agent capability report failed");
     }
     let mut runtime_config = fetch_runtime_config(&client, &server, &worker_credential, worker_id).await?;
-    reconcile_managed_capabilities(
+    match reconcile_managed_capabilities(
         &client, &server, &worker_credential, worker_id, &args.state_dir, &args.pi_bin,
         &mut runtime_config, &mut local_installed_capabilities, &mut agent_rootfs,
         &mut agent_sandbox, &mut probe_runtime,
-    ).await?;
-    agent_capabilities = probe_runtime.capabilities().await;
-    if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
-        warn!(%error, "agent capability refresh after rootfs reconciliation failed");
+    ).await {
+        Ok(()) => {
+            agent_capabilities = probe_runtime.capabilities().await;
+            if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
+                warn!(%error, "agent capability refresh after rootfs reconciliation failed");
+            }
+        }
+        Err(error) => {
+            warn!(%error, "initial managed capability reconciliation failed; worker remains pending and will retry");
+            let _ = report_capability_build_error(
+                &client, &server, &worker_credential, worker_id, &local_installed_capabilities, &error.to_string(),
+            ).await;
+        }
     }
     let mut next_capability_probe = Instant::now() + Duration::from_secs(60);
     let mut active_jobs = JoinSet::<anyhow::Result<()>>::new();
