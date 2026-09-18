@@ -101,9 +101,9 @@ jobs:
           sudo chown 10001:10001 /tmp/lazyteam-docker-data
           docker run -d --name lazyteam-ci-runtime \
             -p 127.0.0.1:8877:8787 \
-            -v /tmp/lazyteam-docker-data:/data \
+            -v /tmp/lazyteam-docker-data:/app/data \
             -e LAZYTEAM_LISTEN=0.0.0.0:8787 \
-            -e LAZYTEAM_DATABASE_URL=sqlite:///data/lazyteam.db?mode=rwc \
+            -e LAZYTEAM_DATABASE_URL=sqlite:///app/data/lazyteam.db?mode=rwc \
             -e LAZYTEAM_PRODUCTION=true \
             -e LAZYTEAM_PUBLIC_URL=https://lazyteam.example.test \
             -e LAZYTEAM_OAUTH_PASSWORD=smoke-security-password-1234 \
@@ -135,9 +135,9 @@ jobs:
 
           docker run -d --name lazyteam-ci-runtime \
             -p 127.0.0.1:8877:8787 \
-            -v /tmp/lazyteam-docker-data:/data \
+            -v /tmp/lazyteam-docker-data:/app/data \
             -e LAZYTEAM_LISTEN=0.0.0.0:8787 \
-            -e LAZYTEAM_DATABASE_URL=sqlite:///data/lazyteam.db?mode=rwc \
+            -e LAZYTEAM_DATABASE_URL=sqlite:///app/data/lazyteam.db?mode=rwc \
             -e LAZYTEAM_PRODUCTION=true \
             -e LAZYTEAM_PUBLIC_URL=https://lazyteam.example.test \
             -e LAZYTEAM_OAUTH_PASSWORD=smoke-security-password-1234 \
