@@ -198,13 +198,21 @@ There is intentionally no implicit `127.0.0.1:8787` fallback anymore: a fresh wo
 
 ### Worker and agent configuration
 
-After a worker is enrolled, open **Workers → Configure** in the private UI. The server becomes the source of truth for the worker name, tags, allowed projects, slots, agent selection, provider/model selection, and initial prompt. A running worker fetches this configuration before claiming work, so changes apply to subsequent tasks without re-enrollment.
+LazyTeam separates three responsibilities:
+
+- **Worker** agents claim implementation tasks (`assigned`/`running`), edit code in the task workspace, and publish a stable review ref when the execution finishes.
+- **Reviewer** agents (protocol 3) claim pinned review leases for tasks in `review`, verify the exact candidate commit independently, and return an approve/retry JSON verdict. They never modify source, commit, push, or merge.
+- The **main agent** (ChatGPT / MCP through `tasks_approve` / `tasks_merged`) owns the merge handoff: approval moves `review -> merge_pending`, and only an explicit `tasks_merged(task_id, merge_commit_sha)` call after the real merge moves `merge_pending -> done`.
+
+After a worker is enrolled, open **Workers → Configure** in the private UI. The server becomes the source of truth for the worker name, role, tags, allowed projects, slots, agent selection, provider/model selection, and initial prompt. A running worker fetches this configuration before claiming work, so changes apply to subsequent tasks without re-enrollment. The worker list shows each worker's role (`worker` or `reviewer`) as a pill next to its name.
+
+The **Role** selector switches a registered agent between Worker and Reviewer. Changing the role replaces the **Initial prompt** with that role's default prompt: the Worker default (`lazyteam_core::DEFAULT_WORKER_PROMPT`) or the Reviewer default (`lazyteam_core::DEFAULT_REVIEWER_PROMPT`). If the current prompt has been customized, the UI asks for explicit confirmation that changing role will overwrite the customized prompt; cancelling keeps both the previous role selection and the prompt unchanged. Saving the dialog PATCHes `role` together with the existing agent/provider/model/prompt fields. Assigning the Reviewer role requires a protocol 3 worker; older workers must be updated/restarted first.
 
 Agent integrations are capability-driven instead of assuming every CLI exposes the same controls. Each worker reports whether its agent supports model discovery, what login mode it exposes (`unsupported`, `local_interactive`, or `remote`), and the provider/model catalog it can discover. The UI adapts to those capabilities.
 
 Pi is the only agent backend currently implemented. The worker probes Pi through RPC `get_available_models` and refreshes the catalog every 60 seconds. The provider/model dropdowns are populated only from models reported by that worker. Pi authentication is currently treated as **local interactive**: if the catalog cannot be loaded because Pi needs authentication, run Pi on that worker and use `/login`; the worker will discover the models after the next refresh. LazyTeam does not pretend a remote-login API exists when an agent backend does not expose one.
 
-The default initial prompt is deliberately agent-independent:
+The default worker initial prompt is deliberately agent-independent:
 
 ```text
 You are an autonomous LazyTeam coding worker. Execute only the assigned task in the provided repository workspace. Treat the task description and acceptance criteria as the contract. Inspect before editing, make the smallest correct change, preserve unrelated behavior, and follow repository instructions. Run relevant validation and never wait for interactive input. Do not broaden scope. If blocked, stop and report the concrete blocker. Do not expose secrets or modify external systems unless the task explicitly requires it. Finish with a concise summary of what changed, validation performed, and any remaining risks.
@@ -214,7 +222,7 @@ A task keeps one stable worker workspace and one stable agent session across rev
 
 ### Reviewer configuration
 
-Review policy is project-scoped because different repositories can require different standards. The current UI exposes **ChatGPT / MCP** review only; there are intentionally no Approve/Retry buttons in the board and no temporary manual-review workflow. Projects still have an independent reviewer prompt.
+Review policy is project-scoped because different repositories can require different standards. Projects have an independent ChatGPT / MCP reviewer prompt, and the Home board keeps review work in two distinct lanes: **Review** holds only tasks in `review` state, while **MergePending** holds only tasks in `merge_pending` state. MergePending cards carry no Approve/Retry buttons; the lane and its cards state that reviewed candidates are waiting for the main agent to merge.
 
 Before deciding, an MCP reviewer calls `reviews_get(task_id)`. The response is designed for an actual review machine, not a patch-only judgment: it contains the project/task contract, full worker execution environment, latest execution, reviewer prompt, and a structured checkout bundle with repository URL, default branch, published review ref, commit SHA, and base SHA. The patch/summary/validation fields remain useful evidence, but the reviewer should fetch the review ref into an execution environment and run appropriate inspection/tests whenever practical.
 
