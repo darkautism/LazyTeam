@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="${PATH:-/usr/bin:/bin}:/usr/sbin:/sbin"
 
 UBUNTU_VERSION="${LAZYTEAM_UBUNTU_VERSION:-24.04.3}"
 CACHE_ROOT="${LAZYTEAM_CONTAINER_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/lazyteam/containers}"
@@ -38,7 +39,8 @@ if [[ ! -x "$rootfs/bin/bash" ]]; then
   tar --no-same-owner -xzf "$archive" -C "$rootfs"
 fi
 
-unshare --user --map-root-user --mount --pid --fork   chroot "$rootfs" /bin/bash -lc '
+unshare --user --map-root-user --mount --pid --fork \
+  chroot "$rootfs" /bin/bash -lc '
     . /etc/os-release
     printf "container_os=%s\n" "$PRETTY_NAME"
     printf "container_arch=%s\n" "$(uname -m)"
