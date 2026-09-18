@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, fmt};
 use uuid::Uuid;
 
 pub type Tags = BTreeMap<String, String>;
@@ -89,6 +89,48 @@ impl Default for AgentConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitAuthMode {
+    #[default]
+    Worker,
+    SshKey,
+    HttpsBasic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GitAuthConfig {
+    #[serde(default)]
+    pub mode: GitAuthMode,
+    #[serde(default)]
+    pub credential_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum GitCredential {
+    #[default]
+    Worker,
+    SshKey { private_key: String },
+    HttpsBasic { username: String, secret: String },
+}
+
+impl fmt::Debug for GitCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Worker => formatter.write_str("GitCredential::Worker"),
+            Self::SshKey { .. } => formatter.write_str("GitCredential::SshKey { private_key: [REDACTED] }"),
+            Self::HttpsBasic { username, .. } => formatter
+                .debug_struct("GitCredential::HttpsBasic")
+                .field("username", username)
+                .field("secret", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: Uuid,
@@ -102,6 +144,8 @@ pub struct Project {
     pub default_task_tags: Tags,
     #[serde(default)]
     pub reviewer: ReviewerConfig,
+    #[serde(default)]
+    pub git_auth: GitAuthConfig,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -234,6 +278,8 @@ pub struct Assignment {
     pub project: Project,
     pub task: Task,
     pub execution: Execution,
+    #[serde(default)]
+    pub git_credential: GitCredential,
 }
 
 pub fn worker_can_run_project(worker: &Worker, project: &Project) -> bool {
@@ -313,6 +359,7 @@ mod tests {
             required_worker_tags: BTreeMap::from([("cpu".into(), "rk3588".into())]),
             default_task_tags: BTreeMap::new(),
             reviewer: ReviewerConfig::default(),
+            git_auth: GitAuthConfig::default(),
             enabled: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),

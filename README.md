@@ -152,6 +152,22 @@ A task stores a `project_id`. Workers remain a shared fleet and may allow all pr
 
 The Web UI is intentionally not part of the public Caddy route set. Open the loopback/private UI at `http://127.0.0.1:8787/ui`, click **Connect**, paste `LAZYTEAM_ADMIN_TOKEN`, and connect. The token is kept only in browser `sessionStorage`; the compact header shows only **Connected** while it is valid.
 
+### Project Git access
+
+Each project chooses how workers authenticate for clone/fetch/push:
+
+- **Worker-managed** (default): LazyTeam sends no repository secret. Configure SSH/Git credentials directly on each worker. This preserves the existing deployment model and requires no additional server key.
+- **SSH private key**: store a project-scoped private key in LazyTeam. Workers receive it only with an authenticated assignment/cleanup response, write it to an ephemeral `0600` file for Git/SSH, and remove that file after the Git operation.
+- **HTTPS username + password/token**: store a username plus a password or access token. Workers pass the resulting Authorization header to Git through process environment/config instead of command-line arguments.
+
+Server-managed secrets are write-only from the Project UI/API: project reads expose only the auth mode, username where applicable, and `credential_configured=true`; the secret itself is never returned. Secrets are encrypted at rest with AES-256-GCM using `LAZYTEAM_GIT_CREDENTIAL_KEY`. Set that variable to a base64-encoded 32-byte key before selecting a server-managed credential mode, for example:
+
+```sh
+export LAZYTEAM_GIT_CREDENTIAL_KEY="$(python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))')"
+```
+
+Keep this master key stable and outside the database/backups. Without it, worker-managed projects continue to operate normally, while creation or use of server-managed credentials is rejected. Worker protocol 2 understands project-supplied Git credentials; protocol 1 workers remain eligible only for worker-managed projects.
+
 ## Run a worker
 
 The worker needs `git`, access to the project repositories it may execute, and Pi on `PATH` (or `LAZYTEAM_PI_BIN`). The preferred bootstrap path does **not** require the remote machine to know `LAZYTEAM_PUBLIC_URL` or the shared enrollment secret in advance:

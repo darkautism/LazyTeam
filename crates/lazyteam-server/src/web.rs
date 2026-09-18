@@ -37,6 +37,10 @@ mod tests {
         assert!(INDEX.contains("worker-config-model"));
         assert!(INDEX.contains("project-reviewer-prompt"));
         assert!(INDEX.contains("ChatGPT / MCP"));
+        assert!(INDEX.contains("project-git-worker-managed"));
+        assert!(INDEX.contains("project-git-auth-mode"));
+        assert!(INDEX.contains("project-git-secret"));
+        assert!(INDEX.contains("I will configure repository credentials on each worker"));
         assert!(INDEX.contains("merge_pending"));
         assert!(!INDEX.contains(">Approve</button>"));
         assert!(!INDEX.contains(">Retry</button>"));

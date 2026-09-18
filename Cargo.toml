@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"

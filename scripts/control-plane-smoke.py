@@ -155,6 +155,78 @@ def main():
     expect(by_id[child["id"]]["state"] == "done", "child final state mismatch")
     expect(by_id[foreign_task["id"]]["state"] == "queued", "foreign project task was consumed")
 
+    if os.environ.get("LAZYTEAM_GIT_CREDENTIAL_KEY"):
+        credential_value = "example-credential-value"
+        managed = post_json("/api/projects", {
+            "slug": f"managed-git-{suffix}",
+            "name": "Managed Git",
+            "repo_url": "https://example.invalid/private.git",
+            "default_branch": "main",
+            "git_auth": {
+                "mode": "https_basic",
+                "username": "smoke-user",
+                "secret": credential_value,
+            },
+        })
+        expect(managed["git_auth"]["mode"] == "https_basic", "managed Git auth mode missing")
+        expect(managed["git_auth"]["username"] == "smoke-user", "managed Git username missing")
+        expect(managed["git_auth"]["credential_configured"] is True, "managed Git credential status missing")
+        expect(credential_value not in json.dumps(managed), "project create response exposed Git credential")
+        project_listing = read_json(request("/api/projects"))
+        expect(credential_value not in json.dumps(project_listing), "project list exposed Git credential")
+
+        managed_task = post_json("/api/tasks", {
+            "project_id": managed["id"],
+            "title": "managed credential task",
+            "expected_outcome": "credential is delivered only to protocol 2 worker",
+            "priority": 200,
+        })
+
+        legacy_id = str(uuid.uuid4())
+        legacy_registration = request("/api/workers/register", method="POST", obj={
+            "id": legacy_id,
+            "name": "legacy-managed-worker",
+            "os": "linux",
+            "arch": "x86_64",
+            "allowed_projects": [managed["slug"]],
+            "slots": 1,
+            "worker_version": "smoke-v1",
+            "protocol_version": 1,
+        })
+        expect(legacy_registration.status == 200, f"protocol 1 compatibility registration failed: {legacy_registration.status}")
+        legacy_headers = {WORKER_CREDENTIAL_HEADER: legacy_registration.headers.get(WORKER_CREDENTIAL_HEADER)}
+        legacy_claim = request(f"/api/workers/{legacy_id}/claim", method="POST", headers=legacy_headers)
+        expect(legacy_claim.status == 204, "protocol 1 worker received a server-managed Git task")
+
+        managed_worker_id = str(uuid.uuid4())
+        managed_registration = request("/api/workers/register", method="POST", obj={
+            "id": managed_worker_id,
+            "name": "managed-git-worker",
+            "os": "linux",
+            "arch": "x86_64",
+            "allowed_projects": [managed["slug"]],
+            "slots": 1,
+            "worker_version": "smoke-v2",
+            "protocol_version": 2,
+        })
+        expect(managed_registration.status == 200, f"protocol 2 worker registration failed: {managed_registration.status}")
+        managed_headers = {WORKER_CREDENTIAL_HEADER: managed_registration.headers.get(WORKER_CREDENTIAL_HEADER)}
+        managed_claim = request(f"/api/workers/{managed_worker_id}/claim", method="POST", headers=managed_headers)
+        expect(managed_claim.status == 200, f"protocol 2 worker could not claim managed Git task: {managed_claim.status}")
+        managed_assignment = read_json(managed_claim)
+        expect(managed_assignment["task"]["id"] == managed_task["id"], "protocol 2 worker claimed wrong managed Git task")
+        expect(managed_assignment["git_credential"]["mode"] == "https_basic", "worker assignment omitted Git auth mode")
+        expect(managed_assignment["git_credential"]["username"] == "smoke-user", "worker assignment omitted Git username")
+        expect(managed_assignment["git_credential"]["secret"] == credential_value, "worker assignment received wrong Git credential")
+        managed_execution = managed_assignment["execution"]["id"]
+        managed_finish = request(
+            f"/api/executions/{managed_execution}/finish",
+            method="POST",
+            obj={"result": {"status": "completed", "summary": "credential delivery checked"}},
+            headers=managed_headers,
+        )
+        expect(managed_finish.status == 204, f"managed Git smoke finish failed: {managed_finish.status}")
+
     print("Control-plane smoke test passed")
 
 

@@ -20,6 +20,7 @@ jobs:
           LAZYTEAM_PUBLIC_URL: http://127.0.0.1:8787
           LAZYTEAM_DATABASE_URL: sqlite:///tmp/lazyteam-ci.db?mode=rwc
           LAZYTEAM_OAUTH_PASSWORD: smoke-secret
+          LAZYTEAM_GIT_CREDENTIAL_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
           LAZYTEAM_SMOKE_URL: http://127.0.0.1:8787
         run: |
           cargo build -p lazyteam-server

@@ -1,9 +1,9 @@
 use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
 use clap::Parser;
-use lazyteam_core::{AgentCapabilities, AgentConfig, Assignment, ExecutionResult};
+use lazyteam_core::{AgentCapabilities, AgentConfig, Assignment, ExecutionResult, GitCredential};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -65,6 +65,85 @@ struct WorkerCleanup {
     task_id: Uuid,
     project_slug: String,
     review_ref: String,
+    git_credential: GitCredential,
+}
+
+struct GitAuthContext {
+    env: Vec<(String, String)>,
+    key_path: Option<PathBuf>,
+}
+
+impl GitAuthContext {
+    async fn prepare(state_dir: &Path, task_id: Uuid, nonce: Uuid, credential: &GitCredential) -> anyhow::Result<Self> {
+        let mut env = vec![("GIT_TERMINAL_PROMPT".into(), "0".into())];
+        let mut key_path = None;
+        match credential {
+            GitCredential::Worker => {}
+            GitCredential::HttpsBasic { username, secret } => {
+                if username.trim().is_empty() || secret.is_empty() {
+                    bail!("server-managed HTTPS Git credential is incomplete");
+                }
+                let value = STANDARD.encode(format!("{username}:{secret}"));
+                env.push(("GIT_CONFIG_COUNT".into(), "1".into()));
+                env.push(("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()));
+                env.push(("GIT_CONFIG_VALUE_0".into(), format!("Authorization: Basic {value}")));
+            }
+            GitCredential::SshKey { private_key } => {
+                if private_key.trim().is_empty() {
+                    bail!("server-managed SSH private key is empty");
+                }
+                let dir = state_dir.join("git-auth");
+                tokio::fs::create_dir_all(&dir).await?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await?;
+                }
+                let path = dir.join(format!("{}-{}.key", task_id.simple(), nonce.simple()));
+                tokio::fs::write(&path, private_key.as_bytes()).await?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+                }
+                let quoted = shell_quote(&path)?;
+                env.push(("GIT_SSH_COMMAND".into(), format!("ssh -i {quoted} -o IdentitiesOnly=yes -o BatchMode=yes")));
+                key_path = Some(path);
+            }
+        }
+        Ok(Self { env, key_path })
+    }
+
+    fn apply(&self, command: &mut Command) {
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+    }
+
+    async fn cleanup(&self) {
+        if let Some(path) = &self.key_path {
+            if let Err(error) = tokio::fs::remove_file(path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(%error, "failed to remove ephemeral Git SSH key");
+                }
+            }
+        }
+    }
+}
+
+fn shell_quote(path: &Path) -> anyhow::Result<String> {
+    let raw = path.to_str().context("non-utf8 Git credential path")?;
+    Ok(format!("'{}'", raw.replace('\'', "'\"'\"'")))
+}
+
+async fn clear_stale_git_auth(state_dir: &Path) -> anyhow::Result<()> {
+    let dir = state_dir.join("git-auth");
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(()) => info!(path = %dir.display(), "removed stale ephemeral Git credential files"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove stale Git credential files"),
+    }
+    Ok(())
 }
 
 fn parse_join_code_server(raw: &str) -> anyhow::Result<String> {
@@ -110,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     tokio::fs::create_dir_all(&args.state_dir).await?;
+    clear_stale_git_auth(&args.state_dir).await?;
     tokio::fs::create_dir_all(&args.workspace_dir).await?;
     let worker_id = load_or_create_worker_id(&args.state_dir).await?;
     let join_server = args.join_code.as_deref().map(parse_join_code_server).transpose()?;
@@ -222,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
                     &server,
                     &worker_credential,
                     &args.workspace_dir,
+                    &args.state_dir,
                     runtime,
                     &runtime_config.agent.initial_prompt,
                     assignment,
@@ -266,7 +347,7 @@ async fn register(
         "allowed_projects": allowed_projects,
         "slots": slots,
         "worker_version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": 1,
+        "protocol_version": 2,
         "agent_type": "pi",
         "agent_capabilities": agent_capabilities
     })).send().await?;
@@ -308,8 +389,14 @@ async fn process_cleanup(client: &Client, server: &str, credential: &str, worker
     for item in items {
         let workspace = workspace_root.join(&item.project_slug).join(item.task_id.to_string());
         if workspace.exists() {
-            if let Err(error) = command_ok(&workspace, "git", &["push", "origin", "--delete", &item.review_ref]).await {
-                warn!(%error, task = %item.task_id, "review branch cleanup skipped or already deleted");
+            match GitAuthContext::prepare(state_dir, item.task_id, Uuid::new_v4(), &item.git_credential).await {
+                Ok(auth) => {
+                    if let Err(error) = command_ok_with_auth(&workspace, "git", &["push", "origin", "--delete", &item.review_ref], &auth).await {
+                        warn!(%error, task = %item.task_id, "review branch cleanup skipped or already deleted");
+                    }
+                    auth.cleanup().await;
+                }
+                Err(error) => warn!(%error, task = %item.task_id, "review branch cleanup credential setup failed"),
             }
             tokio::fs::remove_dir_all(&workspace).await?;
         }
@@ -340,6 +427,7 @@ async fn execute_assignment(
     server: &str,
     worker_credential: &str,
     workspace_root: &Path,
+    state_dir: &Path,
     runtime: Arc<dyn AgentRuntime>,
     initial_prompt: &str,
     assignment: Assignment,
@@ -363,7 +451,14 @@ async fn execute_assignment(
         }
     });
 
-    let outcome = run_task(workspace_root, runtime, initial_prompt, &assignment).await;
+    let outcome = match GitAuthContext::prepare(state_dir, assignment.task.id, assignment.execution.id, &assignment.git_credential).await {
+        Ok(auth) => {
+            let result = run_task(workspace_root, runtime, initial_prompt, &assignment, &auth).await;
+            auth.cleanup().await;
+            result
+        }
+        Err(error) => Err(error),
+    };
     renew.abort();
 
     let result = match outcome {
@@ -393,18 +488,18 @@ async fn execute_assignment(
     Ok(())
 }
 
-async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, assignment: &Assignment) -> anyhow::Result<ExecutionResult> {
+async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
     let workspace = workspace_root
         .join(&assignment.project.slug)
         .join(assignment.task.id.to_string());
-    let base_sha = prepare_workspace(&workspace, assignment).await?;
+    let base_sha = prepare_workspace(&workspace, assignment, git_auth).await?;
     let prompt = build_prompt(initial_prompt, assignment);
     let session_name = assignment.task.id.to_string();
     let agent = runtime.run(&workspace, &prompt, &session_name).await?;
     auto_commit(&workspace, assignment).await?;
     let commit_sha = Some(git_output(&workspace, &["rev-parse", "HEAD"]).await?);
     let review_ref = task_branch(assignment);
-    command_ok(&workspace, "git", &["push", "origin", &format!("HEAD:refs/heads/{review_ref}")]).await?;
+    command_ok_with_auth(&workspace, "git", &["push", "origin", &format!("HEAD:refs/heads/{review_ref}")], git_auth).await?;
     let changed_files = git_output(&workspace, &["diff", "--name-only", &base_sha])
         .await.unwrap_or_default().lines().filter(|s| !s.is_empty()).map(str::to_string).collect();
     let raw_patch = git_output(&workspace, &["diff", "--no-ext-diff", "--unified=40", &base_sha]).await.unwrap_or_default();
@@ -460,7 +555,7 @@ fn task_branch(assignment: &Assignment) -> String {
     format!("lazyteam/task-{}", assignment.task.id.simple())
 }
 
-async fn prepare_workspace(path: &Path, assignment: &Assignment) -> anyhow::Result<String> {
+async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<String> {
     let branch = task_branch(assignment);
     if path.exists() {
         let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]).await?;
@@ -469,10 +564,11 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment) -> anyhow::Resu
         return git_output(path, &["rev-parse", &format!("refs/heads/{}", assignment.project.default_branch)]).await;
     }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
-    command_ok(
+    command_ok_with_auth(
         Path::new("."),
         "git",
         &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &assignment.project.repo_url, path.to_str().context("non-utf8 workspace path")?],
+        git_auth,
     ).await?;
     let base = git_output(path, &["rev-parse", "HEAD"]).await?;
     command_ok(path, "git", &["checkout", "-b", &branch]).await?;
@@ -498,6 +594,15 @@ async fn git_output(path: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 async fn command_ok(path: &Path, program: &str, args: &[&str]) -> anyhow::Result<()> {
     let output = Command::new(program).args(args).current_dir(path).output().await?;
+    if !output.status.success() { bail!("{program} {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr)); }
+    Ok(())
+}
+
+async fn command_ok_with_auth(path: &Path, program: &str, args: &[&str], git_auth: &GitAuthContext) -> anyhow::Result<()> {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(path);
+    git_auth.apply(&mut command);
+    let output = command.output().await?;
     if !output.status.success() { bail!("{program} {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr)); }
     Ok(())
 }
@@ -573,5 +678,39 @@ mod tests {
         assert!(normalize_server("https://lazyteam.example.test").is_ok());
         assert!(normalize_server("https://lazyteam.example.test/mcp").is_err());
         assert!(normalize_server("https://user@lazyteam.example.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn https_git_auth_uses_environment_not_command_arguments() {
+        let root = std::env::temp_dir().join(format!("lazyteam-git-auth-{}", Uuid::new_v4()));
+        let credential = GitCredential::HttpsBasic {
+            username: "alice".into(),
+            secret: "example-value".into(),
+        };
+        let auth = GitAuthContext::prepare(&root, Uuid::new_v4(), Uuid::new_v4(), &credential).await.unwrap();
+        assert!(auth.key_path.is_none());
+        assert!(auth.env.iter().any(|(key, value)| key == "GIT_CONFIG_KEY_0" && value == "http.extraHeader"));
+        let header = auth.env.iter().find(|(key, _)| key == "GIT_CONFIG_VALUE_0").unwrap().1.clone();
+        assert!(header.starts_with("Authorization: Basic "));
+        assert!(!header.contains("example-value"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_git_auth_key_is_ephemeral_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("lazyteam-git-auth-{}", Uuid::new_v4()));
+        let credential = GitCredential::SshKey {
+            private_key: "test-private-key\n".into(),
+        };
+        let auth = GitAuthContext::prepare(&root, Uuid::new_v4(), Uuid::new_v4(), &credential).await.unwrap();
+        let key_path = auth.key_path.clone().unwrap();
+        assert_eq!(tokio::fs::read_to_string(&key_path).await.unwrap(), "test-private-key\n");
+        assert_eq!(tokio::fs::metadata(&key_path).await.unwrap().permissions().mode() & 0o777, 0o600);
+        auth.cleanup().await;
+        assert!(!key_path.exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

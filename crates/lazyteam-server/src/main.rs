@@ -17,6 +17,7 @@ use url::Url;
 
 mod api;
 mod cimd;
+mod git_credentials;
 mod mcp;
 mod oauth;
 mod review;
@@ -44,6 +45,10 @@ struct Args {
     admin_token: Option<String>,
     #[arg(long, env = "LAZYTEAM_WORKER_TOKEN")]
     worker_token: Option<String>,
+    /// Base64-encoded 32-byte master key used only to encrypt project Git credentials at rest.
+    /// It is optional while every project relies on credentials configured directly on workers.
+    #[arg(long, env = "LAZYTEAM_GIT_CREDENTIAL_KEY")]
+    git_credential_key: Option<String>,
     #[arg(long, env = "LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS", default_value = "")]
     allowed_oauth_client_hosts: String,
     #[arg(long, env = "LAZYTEAM_ALLOWED_REDIRECT_HOSTS", default_value = "")]
@@ -65,6 +70,14 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| s.trim_end_matches('/').to_string());
     let allowed_oauth_client_hosts = parse_hosts(&args.allowed_oauth_client_hosts);
     let allowed_redirect_hosts = parse_hosts(&args.allowed_redirect_hosts);
+    let git_credential_key = args
+        .git_credential_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(git_credentials::parse_master_key)
+        .transpose()
+        .context("parse LAZYTEAM_GIT_CREDENTIAL_KEY")?;
 
     if let Some(public) = public_url.as_deref() {
         validate_public_url(public)?;
@@ -131,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         public_url,
         oauth_password: args.oauth_password,
+        git_credential_key,
     });
 
     let mcp_state = state.clone();
@@ -246,6 +260,7 @@ mod tests {
             db,
             public_url: Some("https://lazyteam.example.test".to_string()),
             oauth_password: None,
+            git_credential_key: None,
         });
         let mcp_state = state.clone();
         let service = StreamableHttpService::new(

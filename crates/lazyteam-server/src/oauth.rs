@@ -745,6 +745,7 @@ mod tests {
             db,
             public_url: public_url.map(str::to_string),
             oauth_password: None,
+            git_credential_key: None,
         }
     }
 

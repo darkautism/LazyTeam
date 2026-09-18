@@ -11,7 +11,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use lazyteam_core::{
     worker_matches_task, AgentCapabilities, AgentConfig, Assignment, Execution, ExecutionResult,
-    ExecutionState, Project, ReviewerConfig, ReviewerMode, Tags, Task, TaskState, Worker, WorkerState,
+    ExecutionState, GitAuthConfig, GitAuthMode, GitCredential, Project, ReviewerConfig, ReviewerMode,
+    Tags, Task, TaskState, Worker, WorkerState,
     DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT,
 };
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,8 @@ use tokio::time::interval;
 use tracing::warn;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
+const MIN_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 
@@ -33,6 +35,7 @@ pub(crate) struct AppState {
     pub(crate) db: SqlitePool,
     pub(crate) public_url: Option<String>,
     pub(crate) oauth_password: Option<String>,
+    pub(crate) git_credential_key: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,9 +51,28 @@ pub(crate) struct CreateProject {
     pub(crate) default_task_tags: Tags,
     #[serde(default)]
     pub(crate) reviewer: ReviewerConfig,
+    #[serde(default)]
+    pub(crate) git_auth: ProjectGitAuthInput,
 }
 
 fn default_branch() -> String { "main".into() }
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct ProjectGitAuthInput {
+    #[serde(default)]
+    pub(crate) mode: GitAuthMode,
+    #[serde(default)]
+    pub(crate) username: Option<String>,
+    #[serde(default)]
+    pub(crate) secret: Option<String>,
+}
+
+#[derive(Debug)]
+struct StoredGitAuth {
+    mode: GitAuthMode,
+    username: Option<String>,
+    encrypted_secret: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct UpdateProject {
@@ -61,6 +83,7 @@ struct UpdateProject {
     required_worker_tags: Option<Tags>,
     default_task_tags: Option<Tags>,
     reviewer: Option<ReviewerConfig>,
+    git_auth: Option<ProjectGitAuthInput>,
     enabled: Option<bool>,
 }
 
@@ -101,6 +124,7 @@ struct WorkerCleanup {
     task_id: Uuid,
     project_slug: String,
     review_ref: String,
+    git_credential: GitCredential,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,16 +246,25 @@ pub(crate) async fn create_project(State(state): State<Arc<AppState>>, Json(inpu
     if input.slug.is_empty() || !input.slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
         return Err((StatusCode::BAD_REQUEST, "invalid project slug".into()));
     }
+    if input.name.trim().is_empty() || input.repo_url.trim().is_empty() || input.default_branch.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "project name, repository, and default branch are required".into()));
+    }
+    if input.reviewer.initial_prompt.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "reviewer initial prompt must not be empty".into()));
+    }
+    let stored_git_auth = resolve_new_git_auth(&state, input.git_auth)?;
     let now = Utc::now();
     let project = Project {
-        id: Uuid::new_v4(), slug: input.slug, name: input.name, repo_url: input.repo_url,
-        default_branch: input.default_branch, required_worker_tags: input.required_worker_tags,
-        default_task_tags: input.default_task_tags, reviewer: input.reviewer, enabled: true, created_at: now, updated_at: now,
+        id: Uuid::new_v4(), slug: input.slug, name: input.name.trim().into(), repo_url: input.repo_url.trim().into(),
+        default_branch: input.default_branch.trim().into(), required_worker_tags: input.required_worker_tags,
+        default_task_tags: input.default_task_tags, reviewer: input.reviewer,
+        git_auth: git_auth_summary(&stored_git_auth), enabled: true, created_at: now, updated_at: now,
     };
-    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,required_worker_tags,default_task_tags,reviewer_mode,reviewer_prompt,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,required_worker_tags,default_task_tags,reviewer_mode,reviewer_prompt,git_auth_mode,git_auth_username,git_auth_secret,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(project.id.to_string()).bind(&project.slug).bind(&project.name).bind(&project.repo_url)
         .bind(&project.default_branch).bind(json(&project.required_worker_tags)?).bind(json(&project.default_task_tags)?)
         .bind(reviewer_mode_str(&project.reviewer.mode)).bind(&project.reviewer.initial_prompt)
+        .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret)
         .bind(1_i64).bind(ts(project.created_at)).bind(ts(project.updated_at))
         .execute(&state.db).await.map_err(db_conflict)?;
     Ok(Json(project))
@@ -261,11 +294,13 @@ async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
     if reviewer.initial_prompt.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "reviewer initial prompt must not be empty".into()));
     }
-    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,required_worker_tags=?,default_task_tags=?,reviewer_mode=?,reviewer_prompt=?,enabled=?,updated_at=? WHERE id=?")
+    let stored_git_auth = resolve_updated_git_auth(&state, &row, input.git_auth)?;
+    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,required_worker_tags=?,default_task_tags=?,reviewer_mode=?,reviewer_prompt=?,git_auth_mode=?,git_auth_username=?,git_auth_secret=?,enabled=?,updated_at=? WHERE id=?")
         .bind(&slug).bind(name.trim()).bind(repo_url.trim()).bind(default_branch.trim())
         .bind(json(&input.required_worker_tags.unwrap_or(current.required_worker_tags))?)
         .bind(json(&input.default_task_tags.unwrap_or(current.default_task_tags))?)
         .bind(reviewer_mode_str(&reviewer.mode)).bind(reviewer.initial_prompt.trim())
+        .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret)
         .bind(if input.enabled.unwrap_or(current.enabled) { 1_i64 } else { 0_i64 })
         .bind(ts(Utc::now())).bind(id.to_string()).execute(&state.db).await.map_err(db_conflict)?;
     let row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
@@ -360,8 +395,8 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
 }
 
 async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<RegisterWorker>) -> Result<Response, ApiError> {
-    if input.protocol_version != PROTOCOL_VERSION {
-        return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol {}; expected {}", input.protocol_version, PROTOCOL_VERSION)));
+    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&input.protocol_version) {
+        return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol {}; supported {}..={}", input.protocol_version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION)));
     }
     let id = input.id.unwrap_or_else(Uuid::new_v4);
     let now = Utc::now();
@@ -455,16 +490,22 @@ async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState
 
 async fn worker_cleanup(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Vec<WorkerCleanup>> {
     require_worker(&state.db, id, &headers).await?;
-    let rows = sqlx::query("SELECT c.task_id,p.slug FROM task_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
+    let rows = sqlx::query("SELECT c.task_id,t.project_id,p.slug FROM task_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
         .bind(id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
-    rows.iter().map(|row| {
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
         let task_id = uuid(row.try_get("task_id").map_err(internal)?)?;
-        Ok(WorkerCleanup {
+        let project_id: String = row.try_get("project_id").map_err(internal)?;
+        let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
+            .bind(project_id).fetch_one(&state.db).await.map_err(db_error)?;
+        items.push(WorkerCleanup {
             task_id,
             project_slug: row.try_get("slug").map_err(internal)?,
             review_ref: format!("lazyteam/task-{}", task_id.simple()),
-        })
-    }).collect::<Result<Vec<_>, ApiError>>().map(Json)
+            git_credential: git_credential_from_row(&state, &project_row)?,
+        });
+    }
+    Ok(Json(items))
 }
 
 async fn worker_cleanup_ack(Path((id, task_id)): Path<(Uuid, Uuid)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
@@ -496,6 +537,8 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
         let Some(project_row) = project_row else { continue };
         let project = project_from_row(&project_row)?;
         if !worker_matches_task(&worker, &project, &task) { continue; }
+        if project.git_auth.mode != GitAuthMode::Worker && worker.protocol_version < 2 { continue; }
+        let git_credential = git_credential_from_row(&state, &project_row)?;
 
         let now = Utc::now();
         let lease_until = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
@@ -515,7 +558,7 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
             .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         let mut assigned_task = task; assigned_task.state = TaskState::Assigned; assigned_task.updated_at = now;
-        return Ok(Json(Assignment { project, task: assigned_task, execution }).into_response());
+        return Ok(Json(Assignment { project, task: assigned_task, execution, git_credential }).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -639,6 +682,173 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn git_auth_mode_str(mode: &GitAuthMode) -> &'static str {
+    match mode {
+        GitAuthMode::Worker => "worker",
+        GitAuthMode::SshKey => "ssh_key",
+        GitAuthMode::HttpsBasic => "https_basic",
+    }
+}
+
+fn git_auth_mode(value: &str) -> Result<GitAuthMode, ApiError> {
+    match value {
+        "worker" => Ok(GitAuthMode::Worker),
+        "ssh_key" => Ok(GitAuthMode::SshKey),
+        "https_basic" => Ok(GitAuthMode::HttpsBasic),
+        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid Git auth mode {value}"))),
+    }
+}
+
+fn stored_git_auth_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<StoredGitAuth, ApiError> {
+    let mode: String = row.try_get("git_auth_mode").map_err(internal)?;
+    Ok(StoredGitAuth {
+        mode: git_auth_mode(&mode)?,
+        username: row.try_get("git_auth_username").map_err(internal)?,
+        encrypted_secret: row.try_get("git_auth_secret").map_err(internal)?,
+    })
+}
+
+fn git_auth_summary(stored: &StoredGitAuth) -> GitAuthConfig {
+    GitAuthConfig {
+        mode: stored.mode.clone(),
+        credential_configured: stored.encrypted_secret.is_some(),
+        username: stored.username.clone(),
+    }
+}
+
+fn git_credential_key(state: &AppState) -> Result<&[u8; 32], ApiError> {
+    state.git_credential_key.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "LAZYTEAM_GIT_CREDENTIAL_KEY must be configured before storing or using server-managed Git credentials".into(),
+    ))
+}
+
+fn encrypt_git_secret(state: &AppState, secret: &str) -> Result<String, ApiError> {
+    crate::git_credentials::encrypt(git_credential_key(state)?, secret).map_err(internal)
+}
+
+fn decrypt_git_secret(state: &AppState, ciphertext: &str) -> Result<String, ApiError> {
+    crate::git_credentials::decrypt(git_credential_key(state)?, ciphertext).map_err(|error| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("stored project Git credential cannot be decrypted: {error}"),
+    ))
+}
+
+fn nonempty_secret(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn resolve_new_git_auth(state: &AppState, input: ProjectGitAuthInput) -> Result<StoredGitAuth, ApiError> {
+    match input.mode {
+        GitAuthMode::Worker => {
+            if nonempty_secret(input.secret).is_some() {
+                return Err((StatusCode::BAD_REQUEST, "worker-managed Git auth must not include a server-side secret".into()));
+            }
+            Ok(StoredGitAuth { mode: GitAuthMode::Worker, username: None, encrypted_secret: None })
+        }
+        GitAuthMode::SshKey => {
+            let secret = nonempty_secret(input.secret).ok_or((
+                StatusCode::BAD_REQUEST,
+                "SSH key mode requires a private key".into(),
+            ))?;
+            Ok(StoredGitAuth {
+                mode: GitAuthMode::SshKey,
+                username: None,
+                encrypted_secret: Some(encrypt_git_secret(state, &secret)?),
+            })
+        }
+        GitAuthMode::HttpsBasic => {
+            let username = input.username.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).ok_or((
+                StatusCode::BAD_REQUEST,
+                "HTTPS username + password/token mode requires a username".into(),
+            ))?;
+            let secret = nonempty_secret(input.secret).ok_or((
+                StatusCode::BAD_REQUEST,
+                "HTTPS username + password/token mode requires a password or token".into(),
+            ))?;
+            Ok(StoredGitAuth {
+                mode: GitAuthMode::HttpsBasic,
+                username: Some(username),
+                encrypted_secret: Some(encrypt_git_secret(state, &secret)?),
+            })
+        }
+    }
+}
+
+fn resolve_updated_git_auth(
+    state: &AppState,
+    row: &sqlx::sqlite::SqliteRow,
+    input: Option<ProjectGitAuthInput>,
+) -> Result<StoredGitAuth, ApiError> {
+    let current = stored_git_auth_from_row(row)?;
+    let Some(input) = input else { return Ok(current); };
+    match input.mode {
+        GitAuthMode::Worker => Ok(StoredGitAuth {
+            mode: GitAuthMode::Worker,
+            username: None,
+            encrypted_secret: None,
+        }),
+        GitAuthMode::SshKey => {
+            let encrypted_secret = match nonempty_secret(input.secret) {
+                Some(secret) => Some(encrypt_git_secret(state, &secret)?),
+                None if current.mode == GitAuthMode::SshKey && current.encrypted_secret.is_some() => current.encrypted_secret,
+                None => return Err((StatusCode::BAD_REQUEST, "switching to SSH key mode requires a private key".into())),
+            };
+            Ok(StoredGitAuth {
+                mode: GitAuthMode::SshKey,
+                username: None,
+                encrypted_secret,
+            })
+        }
+        GitAuthMode::HttpsBasic => {
+            let username = input
+                .username
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| (current.mode == GitAuthMode::HttpsBasic).then(|| current.username.clone()).flatten())
+                .ok_or((StatusCode::BAD_REQUEST, "HTTPS username + password/token mode requires a username".into()))?;
+            let encrypted_secret = match nonempty_secret(input.secret) {
+                Some(secret) => Some(encrypt_git_secret(state, &secret)?),
+                None if current.mode == GitAuthMode::HttpsBasic && current.encrypted_secret.is_some() => current.encrypted_secret,
+                None => return Err((StatusCode::BAD_REQUEST, "switching to HTTPS auth requires a password or token".into())),
+            };
+            Ok(StoredGitAuth {
+                mode: GitAuthMode::HttpsBasic,
+                username: Some(username),
+                encrypted_secret,
+            })
+        }
+    }
+}
+
+fn git_credential_from_row(state: &AppState, row: &sqlx::sqlite::SqliteRow) -> Result<GitCredential, ApiError> {
+    let stored = stored_git_auth_from_row(row)?;
+    match stored.mode {
+        GitAuthMode::Worker => Ok(GitCredential::Worker),
+        GitAuthMode::SshKey => {
+            let encrypted = stored.encrypted_secret.ok_or((
+                StatusCode::CONFLICT,
+                "project SSH credential is not configured".into(),
+            ))?;
+            Ok(GitCredential::SshKey { private_key: decrypt_git_secret(state, &encrypted)? })
+        }
+        GitAuthMode::HttpsBasic => {
+            let username = stored.username.ok_or((
+                StatusCode::CONFLICT,
+                "project HTTPS Git username is not configured".into(),
+            ))?;
+            let encrypted = stored.encrypted_secret.ok_or((
+                StatusCode::CONFLICT,
+                "project HTTPS Git password/token is not configured".into(),
+            ))?;
+            Ok(GitCredential::HttpsBasic {
+                username,
+                secret: decrypt_git_secret(state, &encrypted)?,
+            })
+        }
+    }
+}
+
 fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, ApiError> {
     Ok(Project {
         id: uuid(row.try_get("id").map_err(internal)?)?, slug: row.try_get("slug").map_err(internal)?, name: row.try_get("name").map_err(internal)?,
@@ -651,6 +861,7 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, ApiError> 
                 if value.trim().is_empty() { DEFAULT_REVIEWER_PROMPT.into() } else { value }
             },
         },
+        git_auth: git_auth_summary(&stored_git_auth_from_row(row)?),
         enabled: row.try_get::<i64,_>("enabled").map_err(internal)? != 0, created_at: datetime(row.try_get("created_at").map_err(internal)?)?,
         updated_at: datetime(row.try_get("updated_at").map_err(internal)?)?,
     })

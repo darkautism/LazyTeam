@@ -123,6 +123,7 @@ impl LazyTeamMcp {
                 required_worker_tags: input.required_worker_tags,
                 default_task_tags: input.default_task_tags,
                 reviewer: lazyteam_core::ReviewerConfig::default(),
+                git_auth: crate::api::ProjectGitAuthInput::default(),
             }),
         ).await.map_err(api_to_mcp)?;
         json_result(&project)
