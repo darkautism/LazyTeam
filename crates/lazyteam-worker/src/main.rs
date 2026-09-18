@@ -60,6 +60,13 @@ struct WorkerRuntimeConfig {
     agent: AgentConfig,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkerCleanup {
+    task_id: Uuid,
+    project_slug: String,
+    review_ref: String,
+}
+
 fn parse_join_code_server(raw: &str) -> anyhow::Result<String> {
     let mut parts = raw.split('.');
     if parts.next() != Some("ltj1") {
@@ -122,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     let pi_bin = args.pi_bin.clone();
     let legacy_provider = args.pi_provider.clone();
     let legacy_model = args.pi_model.clone();
-    let probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None };
+    let probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None, session_dir: None };
     let mut agent_capabilities = probe_runtime.capabilities().await;
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
     let projects: BTreeSet<String> = args.allowed_projects.into_iter().collect();
@@ -187,6 +194,9 @@ async fn main() -> anyhow::Result<()> {
             sleep(Duration::from_secs(5)).await;
             continue;
         }
+        if let Err(error) = process_cleanup(&client, &server, &worker_credential, worker_id, &args.workspace_dir, &args.state_dir).await {
+            warn!(%error, "post-merge cleanup poll failed");
+        }
         if Instant::now() >= next_capability_probe {
             agent_capabilities = probe_runtime.capabilities().await;
             if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
@@ -201,7 +211,8 @@ async fn main() -> anyhow::Result<()> {
         match claim(&client, &server, &worker_credential, worker_id).await {
             Ok(Some(assignment)) => {
                 info!(task = %assignment.task.id, execution = %assignment.execution.id, project = %assignment.project.slug, "claimed task");
-                let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref()) {
+                let session_dir = args.state_dir.join("sessions").join(assignment.task.id.to_string());
+                let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir) {
                     Ok(runtime) => runtime,
                     Err(error) => { error!(%error, "invalid agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
                 };
@@ -281,13 +292,34 @@ async fn fetch_runtime_config(client: &Client, server: &str, credential: &str, w
     Ok(ensure_success(response).await?.json().await?)
 }
 
-fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option<&str>, legacy_model: Option<&str>) -> anyhow::Result<Arc<dyn AgentRuntime>> {
+fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option<&str>, legacy_model: Option<&str>, session_dir: PathBuf) -> anyhow::Result<Arc<dyn AgentRuntime>> {
     if agent.agent_type != "pi" { bail!("unsupported agent type {}", agent.agent_type); }
     Ok(Arc::new(PiRuntime {
         binary: pi_bin.to_string(),
         provider: agent.provider.clone().or_else(|| legacy_provider.map(str::to_string)),
         model: agent.model.clone().or_else(|| legacy_model.map(str::to_string)),
+        session_dir: Some(session_dir),
     }))
+}
+
+async fn process_cleanup(client: &Client, server: &str, credential: &str, worker_id: Uuid, workspace_root: &Path, state_dir: &Path) -> anyhow::Result<()> {
+    let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/cleanup")), credential).send().await?;
+    let items: Vec<WorkerCleanup> = ensure_success(response).await?.json().await?;
+    for item in items {
+        let workspace = workspace_root.join(&item.project_slug).join(item.task_id.to_string());
+        if workspace.exists() {
+            if let Err(error) = command_ok(&workspace, "git", &["push", "origin", "--delete", &item.review_ref]).await {
+                warn!(%error, task = %item.task_id, "review branch cleanup skipped or already deleted");
+            }
+            tokio::fs::remove_dir_all(&workspace).await?;
+        }
+        let session_dir = state_dir.join("sessions").join(item.task_id.to_string());
+        if session_dir.exists() { tokio::fs::remove_dir_all(&session_dir).await?; }
+        let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/cleanup/{}", item.task_id)), credential).send().await?;
+        ensure_success(response).await?;
+        info!(task = %item.task_id, "merged task workspace and agent session cleaned up");
+    }
+    Ok(())
 }
 
 async fn heartbeat(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<()> {
@@ -344,6 +376,7 @@ async fn execute_assignment(
             patch: None,
             patch_truncated: false,
             workspace_clean: None,
+            review_ref: None,
             changed_files: vec![],
             validation: vec![],
             warnings: vec!["worker execution failed before successful completion".into()],
@@ -363,16 +396,15 @@ async fn execute_assignment(
 async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, assignment: &Assignment) -> anyhow::Result<ExecutionResult> {
     let workspace = workspace_root
         .join(&assignment.project.slug)
-        .join(assignment.execution.id.to_string());
+        .join(assignment.task.id.to_string());
     let base_sha = prepare_workspace(&workspace, assignment).await?;
     let prompt = build_prompt(initial_prompt, assignment);
-    let session_name = format!("lazyteam-{}-a{}", assignment.task.id, assignment.execution.attempt);
+    let session_name = assignment.task.id.to_string();
     let agent = runtime.run(&workspace, &prompt, &session_name).await?;
-    let mut warnings = vec![];
-    if let Err(error) = auto_commit(&workspace, assignment).await {
-        warnings.push(format!("auto-commit failed: {error}"));
-    }
-    let commit_sha = git_output(&workspace, &["rev-parse", "HEAD"]).await.ok();
+    auto_commit(&workspace, assignment).await?;
+    let commit_sha = Some(git_output(&workspace, &["rev-parse", "HEAD"]).await?);
+    let review_ref = task_branch(assignment);
+    command_ok(&workspace, "git", &["push", "origin", &format!("HEAD:refs/heads/{review_ref}")]).await?;
     let changed_files = git_output(&workspace, &["diff", "--name-only", &base_sha])
         .await.unwrap_or_default().lines().filter(|s| !s.is_empty()).map(str::to_string).collect();
     let raw_patch = git_output(&workspace, &["diff", "--no-ext-diff", "--unified=40", &base_sha]).await.unwrap_or_default();
@@ -386,9 +418,10 @@ async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial
         patch: if patch.is_empty() { None } else { Some(patch) },
         patch_truncated,
         workspace_clean,
+        review_ref: Some(review_ref),
         changed_files,
         validation: vec![],
-        warnings,
+        warnings: vec![],
         artifacts: vec![],
     })
 }
@@ -423,8 +456,18 @@ fn bounded_review_patch(mut patch: String, max_bytes: usize) -> (String, bool) {
     (patch, true)
 }
 
+fn task_branch(assignment: &Assignment) -> String {
+    format!("lazyteam/task-{}", assignment.task.id.simple())
+}
+
 async fn prepare_workspace(path: &Path, assignment: &Assignment) -> anyhow::Result<String> {
-    if path.exists() { tokio::fs::remove_dir_all(path).await?; }
+    let branch = task_branch(assignment);
+    if path.exists() {
+        let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]).await?;
+        if inside != "true" { bail!("existing task workspace is not a git repository"); }
+        command_ok(path, "git", &["checkout", &branch]).await?;
+        return git_output(path, &["rev-parse", &format!("refs/heads/{}", assignment.project.default_branch)]).await;
+    }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
     command_ok(
         Path::new("."),
@@ -432,7 +475,6 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment) -> anyhow::Resu
         &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &assignment.project.repo_url, path.to_str().context("non-utf8 workspace path")?],
     ).await?;
     let base = git_output(path, &["rev-parse", "HEAD"]).await?;
-    let branch = format!("lazyteam/task-{}-a{}", assignment.task.id.simple(), assignment.execution.attempt);
     command_ok(path, "git", &["checkout", "-b", &branch]).await?;
     Ok(base)
 }

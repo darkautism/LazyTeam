@@ -68,6 +68,12 @@ pub struct TaskRetryParams {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskMergedParams {
+    pub task_id: String,
+    pub merge_commit_sha: String,
+}
+
 #[tool_router]
 impl LazyTeamMcp {
     pub fn new(state: Arc<AppState>) -> Self {
@@ -181,7 +187,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "reviews_get",
         title = "Get review evidence",
-        description = "Get the latest execution evidence for a task in review, including reviewer policy, worker identity, result summary, commit/base SHA, changed files, validation, warnings, workspace cleanliness, and patch when available. Read this before approving or retrying.",
+        description = "Get the latest execution evidence for a task in review, including reviewer policy, the full worker execution environment, and a pullable repository/ref/commit checkout. Patch/summary data are supplemental; reviewers should fetch the review ref into an execution environment and validate the project when practical before approving or retrying.",
         annotations(
             title = "Get review evidence",
             read_only_hint = true,
@@ -202,7 +208,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "tasks_approve",
         title = "Approve task",
-        description = "Approve a task in review after reading reviews_get; only available when the project reviewer mode is ChatGPT / MCP. Marks it done and releases dependent tasks",
+        description = "Approve the review verdict after reading reviews_get and validating the pullable review ref. Moves the task to merge_pending; it is not done and dependencies are not released until the reviewed ref is actually merged and tasks_merged is called",
         annotations(
             title = "Approve task",
             read_only_hint = false,
@@ -221,6 +227,27 @@ impl LazyTeamMcp {
             return Err(McpError::internal_error("project reviewer mode is manual; approve from the admin UI or switch the project to ChatGPT / MCP reviewer", None));
         }
         let transition = review::approve_task(&self.state, task_id).await.map_err(api_to_mcp)?;
+        json_result(&transition)
+    }
+
+    #[tool(
+        name = "tasks_merged",
+        title = "Mark task merged",
+        description = "Confirm that an approved task's reviewed ref has actually been merged into the project's default branch. Marks the task done, releases dependencies, and queues cleanup of the original worker workspace and agent session. Never call this before the merge is complete.",
+        annotations(
+            title = "Mark task merged",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tasks_merged(
+        &self,
+        Parameters(input): Parameters<TaskMergedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let transition = review::merged_task(&self.state, task_id, &input.merge_commit_sha).await.map_err(api_to_mcp)?;
         json_result(&transition)
     }
 
@@ -278,7 +305,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, reviews, and a distributed AI worker pool. Use project-scoped tasks; workers are matched deterministically by project access and capability tags. For tasks in review, call reviews_get and evaluate the project reviewer prompt plus execution evidence before tasks_approve or tasks_retry. Never approve from tasks_list alone.".to_string(),
+                "LazyTeam controls projects, tasks, executions, reviews, merges, and a distributed AI worker pool. For review: call reviews_get, fetch the pullable checkout ref into an execution environment when practical, and validate the task contract. tasks_approve records only the review verdict and moves the task to merge_pending. Merge the reviewed ref into the default branch, then call tasks_merged; only that marks done and allows the original worker to delete its persistent workspace/session. On tasks_retry, give a concrete reason; review retries are pinned to the same worker so its workspace and agent session can be reused.".to_string(),
             )
     }
 }

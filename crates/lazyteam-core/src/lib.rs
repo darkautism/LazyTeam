@@ -17,7 +17,7 @@ pub enum ReviewerMode {
 }
 
 impl Default for ReviewerMode {
-    fn default() -> Self { Self::Manual }
+    fn default() -> Self { Self::Mcp }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,7 +32,7 @@ fn default_reviewer_prompt() -> String { DEFAULT_REVIEWER_PROMPT.into() }
 
 impl Default for ReviewerConfig {
     fn default() -> Self {
-        Self { mode: ReviewerMode::Manual, initial_prompt: DEFAULT_REVIEWER_PROMPT.into() }
+        Self { mode: ReviewerMode::Mcp, initial_prompt: DEFAULT_REVIEWER_PROMPT.into() }
     }
 }
 
@@ -145,6 +145,7 @@ pub enum TaskState {
     Assigned,
     Running,
     Review,
+    MergePending,
     Done,
     Blocked,
     Failed,
@@ -211,6 +212,8 @@ pub struct ExecutionResult {
     pub patch_truncated: bool,
     #[serde(default)]
     pub workspace_clean: Option<bool>,
+    #[serde(default)]
+    pub review_ref: Option<String>,
     #[serde(default)]
     pub changed_files: Vec<String>,
     #[serde(default)]

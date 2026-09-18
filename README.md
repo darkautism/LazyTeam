@@ -194,30 +194,35 @@ The default initial prompt is deliberately agent-independent:
 You are an autonomous LazyTeam coding worker. Execute only the assigned task in the provided repository workspace. Treat the task description and acceptance criteria as the contract. Inspect before editing, make the smallest correct change, preserve unrelated behavior, and follow repository instructions. Run relevant validation and never wait for interactive input. Do not broaden scope. If blocked, stop and report the concrete blocker. Do not expose secrets or modify external systems unless the task explicitly requires it. Finish with a concise summary of what changed, validation performed, and any remaining risks.
 ```
 
-Each execution gets a separate checkout and branch.
+A task keeps one stable worker workspace and one stable agent session across review retries. Pi sessions are keyed by task ID, and review retries are pinned to the same worker so the existing conversation/cache and repository state can be reused. The worker publishes a stable `lazyteam/task-<task-id>` review branch after every successful attempt. The workspace and agent session are retained through review and merge; they are deleted only after LazyTeam receives an explicit merged signal.
 
 ### Reviewer configuration
 
-Review policy is project-scoped because different repositories can require different standards. In **Projects → Edit**, choose **Manual** or **ChatGPT / MCP** and customize the independent reviewer prompt. Manual review keeps approve/retry in the private UI. ChatGPT / MCP review lets an OAuth-authorized MCP client act as the reviewer; LazyTeam itself does not claim it can choose or change the ChatGPT model/provider for that external reviewer.
+Review policy is project-scoped because different repositories can require different standards. The current UI exposes **ChatGPT / MCP** review only; there are intentionally no Approve/Retry buttons in the board and no temporary manual-review workflow. Projects still have an independent reviewer prompt.
 
-Before an MCP reviewer decides, it must call `reviews_get(task_id)`. That returns the project reviewer prompt, task contract, latest execution, worker identity, summary, base/commit SHA, changed files, validation, warnings, workspace cleanliness, and a bounded patch when the worker is new enough to provide one. MCP approve/retry is rejected when the project is configured for Manual review.
+Before deciding, an MCP reviewer calls `reviews_get(task_id)`. The response is designed for an actual review machine, not a patch-only judgment: it contains the project/task contract, full worker execution environment, latest execution, reviewer prompt, and a structured checkout bundle with repository URL, default branch, published review ref, commit SHA, and base SHA. The patch/summary/validation fields remain useful evidence, but the reviewer should fetch the review ref into an execution environment and run appropriate inspection/tests whenever practical.
 
-A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, requeues the task, and injects the feedback into the next worker attempt. This avoids a retry loop where the worker repeats the same implementation without knowing why it was rejected.
+A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, pins the task back to the worker that produced the reviewed attempt, and injects the feedback into the same persistent task session. The task workspace and Pi session are reused instead of being recreated, improving continuity and provider prompt-cache reuse.
 
-The worker captures up to 256 KiB of textual patch evidence for review and marks truncated patches explicitly. Older workers remain compatible but naturally provide less evidence until upgraded.
+Approval is only a review verdict: `tasks_approve` moves the task to `merge_pending`. It does **not** release dependencies or delete worker state. After the reviewed ref is actually merged into the default branch, the merger calls `tasks_merged(task_id, merge_commit_sha)`. Only then does the task become `done`, dependencies unlock, and the original worker receive a cleanup item. The worker then deletes the task workspace, Pi session directory, and best-effort deletes the temporary review branch.
+
+The worker also captures up to 256 KiB of textual patch evidence and marks truncated patches explicitly, but the pullable review ref is the primary path for full-context review.
 
 ## Task lifecycle
 
 ```text
-queued -> assigned -> running -> review -> done
-   ^                                 |
-   |---- lease loss / retry ---------|
+queued -> assigned -> running -> review -> merge_pending -> done
+   ^                         |                         |
+   |---- review retry -------|                         |
+   |                                                   |
+   +---- failed/blocked retry -------------------------+
 ```
 
-- Completed worker executions enter `review`.
-- Approval moves a task to `done` and releases dependent tasks.
-- Review tasks can be retried only with reviewer feedback; failed/blocked tasks remain directly retryable.
-- Every execution has its own UUID and attempt number; an old worker cannot finish over a newer attempt.
+- Completed worker executions enter `review` and publish a stable review ref.
+- Review retry requires feedback and is sticky to the same worker so workspace/session state is reused.
+- `tasks_approve` moves `review -> merge_pending`; dependencies remain blocked.
+- `tasks_merged` requires a merge commit SHA, moves `merge_pending -> done`, releases dependencies, and queues worker cleanup.
+- Every execution still gets its own UUID/attempt record, but attempts share the task workspace/session until merge.
 
 ## Connect ChatGPT through MCP
 
@@ -238,6 +243,7 @@ tasks_list
 tasks_create
 reviews_get
 tasks_approve
+tasks_merged
 tasks_retry
 workers_list
 ```
@@ -261,7 +267,7 @@ CI boots real LazyTeam servers and gates the public deployment on:
 - DCR, PKCE authorization-code exchange, and refresh-token rotation.
 - Authenticated MCP `server/discover` and `tools/list`.
 - Unauthenticated MCP challenge metadata.
-- Multi-project worker matching, lease renewal, review approval, and dependency release.
+- Multi-project worker matching, lease renewal, review retry affinity, explicit merge gating, and post-merge cleanup/dependency release.
 - Anonymous/admin/worker role separation.
 - Per-worker credential isolation and cross-worker execution rejection.
 - OAuth callback/client host policy and private CIMD rejection.

@@ -35,9 +35,10 @@ mod tests {
         assert!(INDEX.contains("Initial prompt"));
         assert!(INDEX.contains("worker-config-provider"));
         assert!(INDEX.contains("worker-config-model"));
-        assert!(INDEX.contains("project-reviewer-mode"));
         assert!(INDEX.contains("project-reviewer-prompt"));
         assert!(INDEX.contains("ChatGPT / MCP"));
-        assert!(INDEX.contains("A review retry requires a reason."));
+        assert!(INDEX.contains("merge_pending"));
+        assert!(!INDEX.contains(">Approve</button>"));
+        assert!(!INDEX.contains(">Retry</button>"));
     }
 }

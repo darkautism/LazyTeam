@@ -1,4 +1,4 @@
-use std::{path::Path, process::Stdio};
+use std::{path::{Path, PathBuf}, process::Stdio};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -26,6 +26,7 @@ pub struct PiRuntime {
     pub binary: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub session_dir: Option<PathBuf>,
 }
 
 impl PiRuntime {
@@ -96,7 +97,13 @@ impl AgentRuntime for PiRuntime {
 
     async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
         let mut command = Command::new(&self.binary);
-        command.arg("--mode").arg("rpc").arg("--no-session").arg("--name").arg(session_name);
+        command.arg("--mode").arg("rpc").arg("--name").arg(session_name);
+        if let Some(session_dir) = &self.session_dir {
+            tokio::fs::create_dir_all(session_dir).await?;
+            command.arg("--session-dir").arg(session_dir).arg("--session-id").arg(session_name);
+        } else {
+            command.arg("--no-session");
+        }
         if let Some(provider) = &self.provider { command.arg("--provider").arg(provider); }
         if let Some(model) = &self.model { command.arg("--model").arg(model); }
         command.current_dir(workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());

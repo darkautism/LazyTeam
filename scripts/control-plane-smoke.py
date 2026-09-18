@@ -117,10 +117,20 @@ def main():
     expect(blocked_claim.status == 204, "child ran before parent review approval or foreign project was assigned")
 
     approved = post_json(f"/api/tasks/{parent['id']}/approve", {}, expected=200)
-    expect(approved["state"] == "done", "parent approval did not mark done")
+    expect(approved["state"] == "merge_pending", "parent approval did not enter merge_pending")
+
+    still_blocked = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
+    expect(still_blocked.status == 204, "child unlocked before the approved parent was actually merged")
+
+    merged = post_json(f"/api/tasks/{parent['id']}/merged", {"merge_commit_sha": "merge-parent"}, expected=200)
+    expect(merged["state"] == "done", "merged parent did not mark done")
+    cleanup = read_json(request(f"/api/workers/{worker_id}/cleanup", headers=worker_headers))
+    expect(any(item["task_id"] == parent["id"] for item in cleanup), "merged parent did not queue cleanup on its worker")
+    ack = request(f"/api/workers/{worker_id}/cleanup/{parent['id']}", method="POST", headers=worker_headers)
+    expect(ack.status == 204, f"cleanup ack failed: {ack.status}")
 
     child_claim = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
-    expect(child_claim.status == 200, f"child did not unlock after approval: {child_claim.status}")
+    expect(child_claim.status == 200, f"child did not unlock after merge: {child_claim.status}")
     child_assignment = read_json(child_claim)
     expect(child_assignment["task"]["id"] == child["id"], "wrong child assignment")
 
@@ -132,7 +142,12 @@ def main():
         headers=worker_headers,
     )
     expect(finish_child.status == 204, f"child finish failed: {finish_child.status}")
-    post_json(f"/api/tasks/{child['id']}/approve", {}, expected=200)
+    child_approved = post_json(f"/api/tasks/{child['id']}/approve", {}, expected=200)
+    expect(child_approved["state"] == "merge_pending", "child approval did not enter merge_pending")
+    post_json(f"/api/tasks/{child['id']}/merged", {"merge_commit_sha": "merge-child"}, expected=200)
+    child_cleanup = read_json(request(f"/api/workers/{worker_id}/cleanup", headers=worker_headers))
+    expect(any(item["task_id"] == child["id"] for item in child_cleanup), "merged child did not queue cleanup")
+    request(f"/api/workers/{worker_id}/cleanup/{child['id']}", method="POST", headers=worker_headers).read()
 
     tasks = read_json(request("/api/tasks"))
     by_id = {task["id"]: task for task in tasks}

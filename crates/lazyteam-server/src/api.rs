@@ -78,11 +78,29 @@ struct TaskBoardItem {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct ReviewCheckout {
+    pub(crate) repo_url: String,
+    pub(crate) default_branch: String,
+    pub(crate) review_ref: Option<String>,
+    pub(crate) commit_sha: Option<String>,
+    pub(crate) base_sha: Option<String>,
+    pub(crate) pullable: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct ReviewEvidence {
     pub(crate) project: Project,
     pub(crate) task: Task,
     pub(crate) execution: Execution,
-    pub(crate) worker: WorkerRef,
+    pub(crate) worker: Worker,
+    pub(crate) checkout: ReviewCheckout,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerCleanup {
+    task_id: Uuid,
+    project_slug: String,
+    review_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +194,8 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/config", get(worker_runtime_config))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
+        .route("/api/workers/{id}/cleanup", get(worker_cleanup))
+        .route("/api/workers/{id}/cleanup/{task_id}", post(worker_cleanup_ack))
         .route("/api/workers/{id}/claim", post(claim_task))
         .route("/api/executions/{id}/renew", post(renew_execution))
         .route("/api/executions/{id}/finish", post(finish_execution))
@@ -299,8 +319,8 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
     let task_row = sqlx::query("SELECT * FROM tasks WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "task not found".into()))?;
     let task = task_from_row(&task_row)?;
-    if !matches!(task.state, TaskState::Review | TaskState::Done) {
-        return Err((StatusCode::CONFLICT, "review evidence is available only for review/done tasks".into()));
+    if !matches!(task.state, TaskState::Review | TaskState::MergePending | TaskState::Done) {
+        return Err((StatusCode::CONFLICT, "review evidence is available only for review/merge_pending/done tasks".into()));
     }
     let project_row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(task.project_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let project = project_from_row(&project_row)?;
@@ -310,7 +330,16 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
     let execution = execution_from_row(&execution_row)?;
     let worker_row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(execution.worker_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let worker = worker_from_row(&worker_row)?;
-    Ok(Json(ReviewEvidence { project, task, execution, worker: WorkerRef { id: worker.id, name: worker.name } }))
+    let result = execution.result.as_ref();
+    let checkout = ReviewCheckout {
+        repo_url: project.repo_url.clone(),
+        default_branch: project.default_branch.clone(),
+        review_ref: result.and_then(|value| value.review_ref.clone()),
+        commit_sha: result.and_then(|value| value.commit_sha.clone()),
+        base_sha: result.and_then(|value| value.base_sha.clone()),
+        pullable: result.is_some_and(|value| value.review_ref.is_some() && value.commit_sha.is_some()),
+    };
+    Ok(Json(ReviewEvidence { project, task, execution, worker, checkout }))
 }
 
 async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
@@ -424,6 +453,28 @@ async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn worker_cleanup(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Vec<WorkerCleanup>> {
+    require_worker(&state.db, id, &headers).await?;
+    let rows = sqlx::query("SELECT c.task_id,p.slug FROM task_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
+        .bind(id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
+    rows.iter().map(|row| {
+        let task_id = uuid(row.try_get("task_id").map_err(internal)?)?;
+        Ok(WorkerCleanup {
+            task_id,
+            project_slug: row.try_get("slug").map_err(internal)?,
+            review_ref: format!("lazyteam/task-{}", task_id.simple()),
+        })
+    }).collect::<Result<Vec<_>, ApiError>>().map(Json)
+}
+
+async fn worker_cleanup_ack(Path((id, task_id)): Path<(Uuid, Uuid)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let changed = sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
+        .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
+    if changed == 0 { return Err((StatusCode::NOT_FOUND, "cleanup item not found".into())); }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, ApiError> {
     require_worker(&state.db, id, &headers).await?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
@@ -434,7 +485,10 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
     }
     let rows = sqlx::query("SELECT * FROM tasks WHERE state='queued' ORDER BY priority DESC, created_at ASC LIMIT 100")
         .fetch_all(&state.db).await.map_err(db_error)?;
+    let worker_id_text = worker.id.to_string();
     for row in rows {
+        let sticky_worker_id: Option<String> = row.try_get("sticky_worker_id").map_err(internal)?;
+        if sticky_worker_id.as_deref().is_some_and(|sticky| sticky != worker_id_text) { continue; }
         let task = task_from_row(&row)?;
         if !dependencies_satisfied(&state.db, &task).await? { continue; }
         let project_row = sqlx::query("SELECT * FROM projects WHERE id=? AND enabled=1").bind(task.project_id.to_string())
@@ -652,7 +706,7 @@ fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
         title: row.try_get("title").map_err(internal)?, description: row.try_get("description").map_err(internal)?, expected_outcome: row.try_get("expected_outcome").map_err(internal)?,
         acceptance_criteria: dejson(row.try_get("acceptance_criteria").map_err(internal)?)?, required_tags: dejson(row.try_get("required_tags").map_err(internal)?)?,
         preferred_tags: dejson(row.try_get("preferred_tags").map_err(internal)?)?, dependencies: dejson(row.try_get("dependencies").map_err(internal)?)?, review_feedback: row.try_get("review_feedback").map_err(internal)?, priority: row.try_get("priority").map_err(internal)?,
-        state: match state.as_str() { "draft"=>TaskState::Draft,"assigned"=>TaskState::Assigned,"running"=>TaskState::Running,"review"=>TaskState::Review,"done"=>TaskState::Done,"blocked"=>TaskState::Blocked,"failed"=>TaskState::Failed,"cancelled"=>TaskState::Cancelled,_=>TaskState::Queued },
+        state: match state.as_str() { "draft"=>TaskState::Draft,"assigned"=>TaskState::Assigned,"running"=>TaskState::Running,"review"=>TaskState::Review,"merge_pending"=>TaskState::MergePending,"done"=>TaskState::Done,"blocked"=>TaskState::Blocked,"failed"=>TaskState::Failed,"cancelled"=>TaskState::Cancelled,_=>TaskState::Queued },
         created_at: datetime(row.try_get("created_at").map_err(internal)?)?, updated_at: datetime(row.try_get("updated_at").map_err(internal)?)? })
 }
 
