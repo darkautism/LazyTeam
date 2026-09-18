@@ -23,6 +23,37 @@ mkdir -p "$DATA_DIR" "$WORKSPACE_DIR"
 requested_uid="${LAZYTEAM_PUID:-${PUID:-}}"
 requested_gid="${LAZYTEAM_PGID:-${PGID:-}}"
 
+current_uid="$(id -u)"
+current_gid="$(id -g)"
+
+# Some platforms (including NAS app managers) force the container user.
+# If we are already non-root, do not try to change identity; just verify that
+# the supplied mounts are usable and run with the platform-selected UID/GID.
+if [ "$current_uid" -ne 0 ]; then
+  if [ -n "$requested_uid" ] || [ -n "$requested_gid" ]; then
+    [ -n "$requested_uid" ] && [ -n "$requested_gid" ] ||
+      die "set both PUID/PGID (or LAZYTEAM_PUID/LAZYTEAM_PGID), not only one"
+    [ "$requested_uid" = "$current_uid" ] && [ "$requested_gid" = "$current_gid" ] ||
+      die "container is already forced to $current_uid:$current_gid; PUID/PGID cannot request a different identity"
+  fi
+
+  HOME_DIR="${LAZYTEAM_HOME:-$DATA_DIR/home}"
+  mkdir -p "$HOME_DIR" ||
+    die "platform-selected identity $current_uid:$current_gid cannot create $HOME_DIR"
+
+  test -w "$DATA_DIR" && test -w "$WORKSPACE_DIR" ||
+    die "platform-selected identity $current_uid:$current_gid cannot write /app mounts"
+
+  probe="$DATA_DIR/.lazyteam-write-test.$"
+  : > "$probe" || die "platform-selected identity $current_uid:$current_gid cannot write $DATA_DIR"
+  rm -f "$probe"
+
+  export HOME="$HOME_DIR"
+  umask 027
+  echo "lazyteam-entrypoint: platform already selected non-root $current_uid:$current_gid"
+  exec "$@"
+fi
+
 if [ -n "$requested_uid" ] || [ -n "$requested_gid" ]; then
   [ -n "$requested_uid" ] && [ -n "$requested_gid" ] ||
     die "set both PUID/PGID (or LAZYTEAM_PUID/LAZYTEAM_PGID), not only one"
