@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
 
     security::init(security::SecurityConfig {
         production: args.production,
+        public_url: public_url.clone(),
         admin_token: args.admin_token.clone(),
         worker_token: args.worker_token.clone(),
         allowed_oauth_client_hosts,

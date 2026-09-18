@@ -13,7 +13,7 @@ use lazyteam_core::{
     worker_matches_task, Assignment, Execution, ExecutionResult, ExecutionState, Project, Tags, Task,
     TaskState, Worker, WorkerState,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use tokio::time::interval;
@@ -95,12 +95,20 @@ struct FinishExecution {
     result: ExecutionResult,
 }
 
+#[derive(Debug, Serialize)]
+struct WorkerJoinCode {
+    join_code: String,
+    server: String,
+    expires_at: DateTime<Utc>,
+}
+
 pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/workers", get(list_workers))
+        .route("/api/worker-join", post(create_worker_join_code))
         .route("/api/workers/register", post(register_worker))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
         .route("/api/workers/{id}/claim", post(claim_task))
@@ -109,6 +117,21 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
 }
 
 async fn health() -> &'static str { "ok" }
+
+async fn create_worker_join_code(State(state): State<Arc<AppState>>) -> ApiResult<WorkerJoinCode> {
+    let server = state.public_url.as_deref().ok_or((
+        StatusCode::CONFLICT,
+        "LAZYTEAM_PUBLIC_URL is required to generate a worker join code".into(),
+    ))?;
+    let (join_code, exp) = crate::security::issue_worker_join_code(server).map_err(internal)?;
+    let expires_at = DateTime::from_timestamp(exp, 0)
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "invalid worker join expiry".into()))?;
+    Ok(Json(WorkerJoinCode {
+        join_code,
+        server: server.to_string(),
+        expires_at,
+    }))
+}
 
 pub(crate) async fn create_project(State(state): State<Arc<AppState>>, Json(input): Json<CreateProject>) -> ApiResult<Project> {
     if input.slug.is_empty() || !input.slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {

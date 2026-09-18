@@ -154,21 +154,31 @@ The current Web UI is intentionally not part of the public Caddy route set. Open
 
 ## Run a worker
 
-The worker needs `git`, access to the project repositories it may execute, and Pi on `PATH` (or `LAZYTEAM_PI_BIN`). On first enrollment it also needs the shared enrollment secret:
+The worker needs `git`, access to the project repositories it may execute, and Pi on `PATH` (or `LAZYTEAM_PI_BIN`). The preferred bootstrap path does **not** require the remote machine to know `LAZYTEAM_PUBLIC_URL` or the shared enrollment secret in advance:
+
+1. Open the private `/ui`, enter the admin token, and click **Generate join code**.
+2. Copy the generated 10-minute `ltj1...` code to the worker machine.
+3. Start the worker with the join code:
+
+```sh
+cargo run -p lazyteam-worker -- \
+  --join-code '<ltj1...>' \
+  --name worker-01 \
+  --project '*' \
+  --tag rust=true \
+  --slots 1
+```
+
+The signed join code contains the canonical public LazyTeam endpoint and acts as a short-lived enrollment capability. The server verifies its signature, endpoint binding, and expiry before registration. After successful enrollment, the worker persists `server-url`, `worker-id`, and its independent `worker-credential` under `LAZYTEAM_WORKER_STATE_DIR` (default `.lazyteam-worker`); the credential file is mode `0600` on Unix. Subsequent starts discover the persisted endpoint and credential automatically, so neither the join code nor `LAZYTEAM_WORKER_TOKEN` is needed again.
+
+The legacy/manual bootstrap remains available when needed:
 
 ```sh
 export LAZYTEAM_WORKER_TOKEN='<enrollment secret>'
-
-cargo run -p lazyteam-worker -- \
-  --server https://lazyteam.example.com \
-  --name worker-01 \
-  --project '*' \
-  --tag os=linux \
-  --tag arch=x86_64 \
-  --tag rust=true
+cargo run -p lazyteam-worker -- --server https://lazyteam.example.com --name worker-01 --project '*'
 ```
 
-The worker persists its identity and worker-specific credential under `LAZYTEAM_WORKER_STATE_DIR` (default `.lazyteam-worker`). Subsequent starts can omit `LAZYTEAM_WORKER_TOKEN` as long as the persisted credential remains valid.
+There is intentionally no implicit `127.0.0.1:8787` fallback anymore: a fresh worker must receive either a join code or an explicit server URL, preventing accidental attempts to register against itself.
 
 Each execution gets a separate checkout and branch.
 

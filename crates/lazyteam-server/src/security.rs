@@ -12,7 +12,11 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use tokio::net::lookup_host;
 use url::Url;
 
@@ -23,6 +27,7 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug)]
 pub(crate) struct SecurityConfig {
     pub production: bool,
+    pub public_url: Option<String>,
     pub admin_token: Option<String>,
     pub worker_token: Option<String>,
     pub allowed_oauth_client_hosts: Vec<String>,
@@ -44,6 +49,97 @@ fn config() -> &'static SecurityConfig {
 
 pub(crate) fn production() -> bool {
     config().production
+}
+
+const WORKER_JOIN_TTL_SECONDS: i64 = 600;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkerJoinPayload {
+    v: u8,
+    server: String,
+    exp: i64,
+    nonce: String,
+}
+
+pub(crate) fn issue_worker_join_code(server: &str) -> anyhow::Result<(String, i64)> {
+    let secret = config()
+        .worker_token
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("LAZYTEAM_WORKER_TOKEN is required to issue worker join codes"))?;
+    Ok(issue_worker_join_code_with(secret, server, Utc::now().timestamp()))
+}
+
+fn issue_worker_join_code_with(secret: &str, server: &str, now: i64) -> (String, i64) {
+    let exp = now + WORKER_JOIN_TTL_SECONDS;
+    let payload = WorkerJoinPayload {
+        v: 1,
+        server: server.trim_end_matches('/').to_string(),
+        exp,
+        nonce: Uuid::new_v4().simple().to_string(),
+    };
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("join payload serializes"));
+    let signature = URL_SAFE_NO_PAD.encode(hmac_sha256(secret.as_bytes(), payload.as_bytes()));
+    (format!("ltj1.{payload}.{signature}"), exp)
+}
+
+fn worker_join_code_valid(raw: &str) -> bool {
+    let Some(secret) = config().worker_token.as_deref() else {
+        return false;
+    };
+    let Some(server) = config().public_url.as_deref() else {
+        return false;
+    };
+    worker_join_code_valid_with(raw, secret, server, Utc::now().timestamp())
+}
+
+fn worker_join_code_valid_with(raw: &str, secret: &str, expected_server: &str, now: i64) -> bool {
+    let mut parts = raw.split('.');
+    if parts.next() != Some("ltj1") {
+        return false;
+    }
+    let (Some(payload), Some(signature), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(signature) else {
+        return false;
+    };
+    let expected = hmac_sha256(secret.as_bytes(), payload.as_bytes());
+    if !secure_eq_bytes(&signature, &expected) {
+        return false;
+    }
+    let Ok(payload) = URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_slice::<WorkerJoinPayload>(&payload) else {
+        return false;
+    };
+    payload.v == 1
+        && payload.exp >= now
+        && payload.server.trim_end_matches('/') == expected_server.trim_end_matches('/')
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut normalized = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; BLOCK];
+    let mut outer_pad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        inner_pad[i] ^= normalized[i];
+        outer_pad[i] ^= normalized[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    outer.finalize().into()
 }
 
 pub(crate) fn client_host_allowed(host: &str) -> bool {
@@ -182,13 +278,10 @@ pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
     let path = request.uri().path();
     if path.starts_with("/api/") {
         if path == "/api/workers/register" {
-            // The shared worker secret is an enrollment credential only. Normal worker
-            // traffic is authenticated by the per-worker credential issued at enrollment.
-            // If a token is configured, enforce it even outside explicit production mode
-            // so a forgotten LAZYTEAM_PRODUCTION flag does not silently disable auth.
-            if (production() || config().worker_token.is_some())
-                && !bearer_matches(&request, config().worker_token.as_deref())
-            {
+            // Enrollment accepts either the legacy shared worker secret or a short-lived
+            // signed join code issued by the private admin API. Runtime traffic always
+            // uses the independent per-worker credential returned after registration.
+            if (production() || config().worker_token.is_some()) && !worker_enrollment_matches(&request) {
                 return unauthorized("worker-enrollment");
             }
         } else if (path.starts_with("/api/workers/") && path != "/api/workers")
@@ -319,6 +412,18 @@ fn rate_limit_for(request: &Request) -> Result<(), Response> {
     Ok(())
 }
 
+fn worker_enrollment_matches(request: &Request) -> bool {
+    let supplied = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    supplied.is_some_and(|value| {
+        config().worker_token.as_deref().is_some_and(|expected| secure_eq(value, expected))
+            || worker_join_code_valid(value)
+    })
+}
+
 fn bearer_matches(request: &Request, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return false;
@@ -334,6 +439,13 @@ fn bearer_matches(request: &Request, expected: Option<&str>) -> bool {
 fn secure_eq(a: &str, b: &str) -> bool {
     let a = Sha256::digest(a.as_bytes());
     let b = Sha256::digest(b.as_bytes());
+    secure_eq_bytes(&a, &b)
+}
+
+fn secure_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
@@ -402,5 +514,24 @@ mod tests {
         assert!(host_allowed("a.chatgpt.com", &["*.chatgpt.com".into()]));
         assert!(!host_allowed("chatgpt.com", &["*.chatgpt.com".into()]));
         assert!(!host_allowed("evilchatgpt.com", &["*.chatgpt.com".into()]));
+    }
+
+    #[test]
+    fn worker_join_code_is_signed_bound_to_server_and_expires() {
+        let (code, exp) = issue_worker_join_code_with("secret", "https://lazyteam.example.test/", 1_000);
+        assert_eq!(exp, 1_600);
+        assert!(worker_join_code_valid_with(&code, "secret", "https://lazyteam.example.test", 1_599));
+        assert!(!worker_join_code_valid_with(&code, "wrong", "https://lazyteam.example.test", 1_599));
+        assert!(!worker_join_code_valid_with(&code, "secret", "https://other.example.test", 1_599));
+        assert!(!worker_join_code_valid_with(&code, "secret", "https://lazyteam.example.test", 1_601));
+        let mut tampered = code.into_bytes();
+        let index = tampered.iter().position(|b| *b == b'.').unwrap() + 2;
+        tampered[index] = if tampered[index] == b'A' { b'B' } else { b'A' };
+        assert!(!worker_join_code_valid_with(
+            std::str::from_utf8(&tampered).unwrap(),
+            "secret",
+            "https://lazyteam.example.test",
+            1_100,
+        ));
     }
 }

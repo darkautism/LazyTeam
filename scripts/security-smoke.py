@@ -10,6 +10,7 @@ import uuid
 BASE = os.environ.get("LAZYTEAM_SECURITY_SMOKE_URL", "http://127.0.0.1:8788")
 ADMIN = os.environ.get("LAZYTEAM_ADMIN_TOKEN", "admin-security-smoke-token-0123456789abcdef")
 WORKER = os.environ.get("LAZYTEAM_WORKER_TOKEN", "worker-security-smoke-token-0123456789abcdef")
+PUBLIC = os.environ.get("LAZYTEAM_PUBLIC_URL", "https://lazyteam.example.test").rstrip("/")
 WORKER_CREDENTIAL_HEADER = "X-LazyTeam-Worker-Credential"
 
 
@@ -102,6 +103,38 @@ def main():
     admin_create = request("/api/projects", method="POST", obj=project_payload(slug), token=ADMIN)
     expect(admin_create.status == 200, f"admin token could not create project: HTTP {admin_create.status}")
     project = read_json(admin_create)
+
+    anonymous_join = request("/api/worker-join", method="POST", obj={})
+    expect(anonymous_join.status == 401, "anonymous client could issue a worker join code")
+    worker_join = request("/api/worker-join", method="POST", obj={}, token=WORKER)
+    expect(worker_join.status == 401, "worker enrollment secret could issue a worker join code")
+    join_response = request("/api/worker-join", method="POST", obj={}, token=ADMIN)
+    expect(join_response.status == 200, f"admin could not issue worker join code: HTTP {join_response.status}")
+    join = read_json(join_response)
+    join_code = join.get("join_code", "")
+    expect(join_code.startswith("ltj1."), "worker join code has wrong format")
+    expect(join.get("server") == PUBLIC, f"worker join code embedded wrong server: {join.get('server')}")
+    expect(bool(join.get("expires_at")), "worker join code omitted expiry")
+
+    join_worker_id = str(uuid.uuid4())
+    joined = request(
+        "/api/workers/register",
+        method="POST",
+        obj=worker_payload(join_worker_id, "join-code-worker"),
+        token=join_code,
+    )
+    expect(joined.status == 200, f"worker join-code enrollment failed: HTTP {joined.status}")
+    expect(bool(joined.headers.get(WORKER_CREDENTIAL_HEADER)), "join-code enrollment did not issue worker credential")
+    joined.read()
+
+    tampered = join_code[:-1] + ("A" if join_code[-1] != "A" else "B")
+    rejected_tampered = request(
+        "/api/workers/register",
+        method="POST",
+        obj=worker_payload(str(uuid.uuid4()), "tampered-join-worker"),
+        token=tampered,
+    )
+    expect(rejected_tampered.status == 401, "tampered worker join code was accepted")
 
     anonymous_tasks = request("/api/tasks")
     expect(anonymous_tasks.status == 401, "anonymous task listing was not rejected")

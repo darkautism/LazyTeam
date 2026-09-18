@@ -1,9 +1,11 @@
 use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
 use lazyteam_core::{Assignment, ExecutionResult};
 use reqwest::{Client, RequestBuilder, StatusCode};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::{process::Command, time::sleep};
 use tracing::{error, info, warn};
@@ -16,10 +18,15 @@ const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long, env = "LAZYTEAM_SERVER", default_value = "http://127.0.0.1:8787")]
-    server: String,
-    /// Shared enrollment secret. Required only for first enrollment or recovery when
-    /// the persisted worker-specific credential is no longer accepted by the server.
+    /// Explicit control-plane URL. Usually unnecessary when --join-code is used or
+    /// after the endpoint has been persisted from a successful enrollment.
+    #[arg(long, env = "LAZYTEAM_SERVER")]
+    server: Option<String>,
+    /// Short-lived signed bootstrap code issued by the LazyTeam admin UI. It contains
+    /// the remote control-plane endpoint and is also the first-enrollment credential.
+    #[arg(long, env = "LAZYTEAM_WORKER_JOIN_CODE")]
+    join_code: Option<String>,
+    /// Legacy shared enrollment secret. Use with --server when no join code is available.
     #[arg(long, env = "LAZYTEAM_WORKER_TOKEN")]
     worker_token: Option<String>,
     #[arg(long, env = "LAZYTEAM_WORKER_NAME", default_value = "worker")]
@@ -42,6 +49,41 @@ struct Args {
     pi_model: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkerJoinPayload {
+    server: String,
+}
+
+fn parse_join_code_server(raw: &str) -> anyhow::Result<String> {
+    let mut parts = raw.split('.');
+    if parts.next() != Some("ltj1") {
+        bail!("invalid worker join code prefix");
+    }
+    let payload = parts.next().context("worker join code payload is missing")?;
+    let signature = parts.next().context("worker join code signature is missing")?;
+    if signature.is_empty() || parts.next().is_some() {
+        bail!("invalid worker join code format");
+    }
+    let payload = URL_SAFE_NO_PAD.decode(payload).context("decode worker join code payload")?;
+    let payload: WorkerJoinPayload = serde_json::from_slice(&payload).context("parse worker join code payload")?;
+    normalize_server(&payload.server)
+}
+
+fn normalize_server(raw: &str) -> anyhow::Result<String> {
+    let raw = raw.trim().trim_end_matches('/');
+    let url = reqwest::Url::parse(raw).context("parse LazyTeam server URL")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("LazyTeam server URL must be an absolute http:// or https:// URL");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        bail!("LazyTeam server URL must not contain credentials, query, or fragment");
+    }
+    if url.path() != "/" && !url.path().is_empty() {
+        bail!("LazyTeam server URL must not contain a path");
+    }
+    Ok(raw.to_string())
+}
+
 fn parse_tag(raw: &str) -> Result<(String, String), String> {
     let (key, value) = raw.split_once('=').ok_or_else(|| "tag must be key=value".to_string())?;
     if key.is_empty() || value.is_empty() { return Err("tag key/value must not be empty".into()); }
@@ -57,7 +99,19 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&args.state_dir).await?;
     tokio::fs::create_dir_all(&args.workspace_dir).await?;
     let worker_id = load_or_create_worker_id(&args.state_dir).await?;
-    let server = args.server.trim_end_matches('/').to_string();
+    let join_server = args.join_code.as_deref().map(parse_join_code_server).transpose()?;
+    let explicit_server = args.server.as_deref().map(normalize_server).transpose()?;
+    if let (Some(join), Some(explicit)) = (&join_server, &explicit_server) {
+        if join != explicit {
+            bail!("--server does not match the endpoint embedded in --join-code");
+        }
+    }
+    let persisted_server = load_server_url(&args.state_dir).await?;
+    let server = join_server
+        .or(explicit_server)
+        .or(persisted_server)
+        .context("worker endpoint unknown; provide --join-code (recommended) or --server for first enrollment")?;
+    let enrollment_credential = args.join_code.as_deref().or(args.worker_token.as_deref());
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
     let projects: BTreeSet<String> = args.allowed_projects.into_iter().collect();
@@ -65,8 +119,8 @@ async fn main() -> anyhow::Result<()> {
     let mut worker_credential = match load_worker_credential(&args.state_dir).await? {
         Some(credential) => credential,
         None => {
-            let enrollment = args.worker_token.as_deref().context(
-                "LAZYTEAM_WORKER_TOKEN is required for first enrollment; after enrollment the worker credential is persisted",
+            let enrollment = enrollment_credential.context(
+                "first enrollment requires --join-code (recommended) or LAZYTEAM_WORKER_TOKEN with an explicit --server",
             )?;
             let credential = register(
                 &client,
@@ -79,16 +133,17 @@ async fn main() -> anyhow::Result<()> {
                 args.slots,
             ).await?;
             persist_worker_credential(&args.state_dir, &credential).await?;
-            info!(%worker_id, server = %server, "worker enrolled and credential persisted");
+            persist_server_url(&args.state_dir, &server).await?;
+            info!(%worker_id, server = %server, "worker enrolled; endpoint and credential persisted");
             credential
         }
     };
 
     // A server database restore/replacement may invalidate the persisted credential.
-    // Re-enroll only when an enrollment secret was intentionally supplied for recovery.
+    // Re-enroll only when a join code or legacy enrollment secret was intentionally supplied.
     if heartbeat(&client, &server, &worker_credential, worker_id).await.is_err() {
-        let enrollment = args.worker_token.as_deref().context(
-            "persisted worker credential was rejected and no enrollment secret was supplied for recovery",
+        let enrollment = enrollment_credential.context(
+            "persisted worker credential was rejected; provide a fresh --join-code or LAZYTEAM_WORKER_TOKEN for recovery",
         )?;
         worker_credential = register(
             &client,
@@ -101,7 +156,10 @@ async fn main() -> anyhow::Result<()> {
             args.slots,
         ).await?;
         persist_worker_credential(&args.state_dir, &worker_credential).await?;
-        info!(%worker_id, "worker re-enrolled after credential rejection");
+        persist_server_url(&args.state_dir, &server).await?;
+        info!(%worker_id, server = %server, "worker re-enrolled after credential rejection");
+    } else {
+        persist_server_url(&args.state_dir, &server).await?;
     }
 
     let runtime: Arc<dyn AgentRuntime> = Arc::new(PiRuntime {
@@ -337,6 +395,20 @@ async fn load_or_create_worker_id(dir: &Path) -> anyhow::Result<Uuid> {
     Ok(id)
 }
 
+async fn load_server_url(dir: &Path) -> anyhow::Result<Option<String>> {
+    let path = dir.join("server-url");
+    match tokio::fs::read_to_string(path).await {
+        Ok(raw) => Ok(Some(normalize_server(raw.trim())?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn persist_server_url(dir: &Path, server: &str) -> anyhow::Result<()> {
+    tokio::fs::write(dir.join("server-url"), normalize_server(server)?).await?;
+    Ok(())
+}
+
 async fn load_worker_credential(dir: &Path) -> anyhow::Result<Option<String>> {
     let path = dir.join("worker-credential");
     match tokio::fs::read_to_string(path).await {
@@ -358,4 +430,24 @@ async fn persist_worker_credential(dir: &Path, credential: &str) -> anyhow::Resu
         tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_code_supplies_remote_server_endpoint() {
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"server":"https://lazyteam.example.test"}"#);
+        let code = format!("ltj1.{payload}.signature");
+        assert_eq!(parse_join_code_server(&code).unwrap(), "https://lazyteam.example.test");
+        assert!(parse_join_code_server("bad.code").is_err());
+    }
+
+    #[test]
+    fn server_url_rejects_paths_and_credentials() {
+        assert!(normalize_server("https://lazyteam.example.test").is_ok());
+        assert!(normalize_server("https://lazyteam.example.test/mcp").is_err());
+        assert!(normalize_server("https://user@lazyteam.example.test").is_err());
+    }
 }
