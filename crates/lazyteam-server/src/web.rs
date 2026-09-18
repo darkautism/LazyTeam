@@ -5,7 +5,7 @@ use axum::{response::Html, routing::get, Router};
 use crate::AppState;
 
 pub(crate) fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/", get(index))
+    Router::new().route("/ui", get(index))
 }
 
 async fn index() -> Html<&'static str> {
