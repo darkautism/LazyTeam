@@ -363,6 +363,8 @@ async fn register(
 
 async fn report_capabilities(client: &Client, server: &str, credential: &str, worker_id: Uuid, capabilities: &AgentCapabilities) -> anyhow::Result<()> {
     let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capabilities")), credential)
+        .header("x-lazyteam-worker-protocol-version", "2")
+        .header("x-lazyteam-worker-version", env!("CARGO_PKG_VERSION"))
         .json(capabilities).send().await?;
     ensure_success(response).await?;
     Ok(())

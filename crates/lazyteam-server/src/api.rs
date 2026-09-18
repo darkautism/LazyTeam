@@ -474,8 +474,25 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
 
 async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(capabilities): Json<AgentCapabilities>) -> Result<StatusCode, ApiError> {
     require_worker(&state.db, id, &headers).await?;
-    let changed = sqlx::query("UPDATE workers SET agent_capabilities=? WHERE id=?")
-        .bind(json(&capabilities)?).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
+    let protocol_version = headers
+        .get("x-lazyteam-worker-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::parse::<u32>)
+        .transpose()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid worker protocol version header".into()))?;
+    if protocol_version.is_some_and(|version| !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)) {
+        return Err((StatusCode::BAD_REQUEST, "unsupported worker protocol version".into()));
+    }
+    let worker_version = headers
+        .get("x-lazyteam-worker-version")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty());
+    let changed = sqlx::query("UPDATE workers SET agent_capabilities=?, protocol_version=COALESCE(?,protocol_version), worker_version=COALESCE(?,worker_version) WHERE id=?")
+        .bind(json(&capabilities)?)
+        .bind(protocol_version.map(i64::from))
+        .bind(worker_version)
+        .bind(id.to_string())
+        .execute(&state.db).await.map_err(db_error)?.rows_affected();
     if changed == 0 { return Err((StatusCode::NOT_FOUND, "worker not found".into())); }
     Ok(StatusCode::NO_CONTENT)
 }

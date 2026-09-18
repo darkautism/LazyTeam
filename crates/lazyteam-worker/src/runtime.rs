@@ -2,7 +2,7 @@ use std::{path::{Path, PathBuf}, process::Stdio};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use lazyteam_core::{AgentCapabilities, AgentLoginMode, AgentModel};
+use lazyteam_core::{AgentCapabilities, AgentLoginMode, AgentModel, AgentModelCost};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -27,6 +27,23 @@ pub struct PiRuntime {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub session_dir: Option<PathBuf>,
+}
+
+fn agent_model_from_pi(model: &Value) -> Option<AgentModel> {
+    let cost = model.get("cost").and_then(Value::as_object).map(|cost| AgentModelCost {
+        input: cost.get("input").and_then(Value::as_f64).unwrap_or(0.0),
+        output: cost.get("output").and_then(Value::as_f64).unwrap_or(0.0),
+        cache_read: cost.get("cacheRead").and_then(Value::as_f64).unwrap_or(0.0),
+        cache_write: cost.get("cacheWrite").and_then(Value::as_f64).unwrap_or(0.0),
+    });
+    Some(AgentModel {
+        provider: model.get("provider")?.as_str()?.to_string(),
+        id: model.get("id")?.as_str()?.to_string(),
+        name: model.get("name").and_then(Value::as_str).map(str::to_string),
+        context_window: model.get("contextWindow").and_then(Value::as_u64),
+        reasoning: model.get("reasoning").and_then(Value::as_bool).unwrap_or(false),
+        cost,
+    })
 }
 
 impl PiRuntime {
@@ -55,14 +72,7 @@ impl PiRuntime {
                     }
                     let models = event.get("data").and_then(|v| v.get("models")).and_then(Value::as_array)
                         .context("Pi get_available_models response omitted data.models")?
-                        .iter().filter_map(|model| {
-                            Some(AgentModel {
-                                provider: model.get("provider")?.as_str()?.to_string(),
-                                id: model.get("id")?.as_str()?.to_string(),
-                                context_window: model.get("contextWindow").and_then(Value::as_u64),
-                                reasoning: model.get("reasoning").and_then(Value::as_bool).unwrap_or(false),
-                            })
-                        }).collect();
+                        .iter().filter_map(agent_model_from_pi).collect();
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     return Ok(models);
@@ -182,5 +192,38 @@ impl AgentRuntime for PiRuntime {
         let _ = child.kill().await;
         let _ = child.wait().await;
         Ok(AgentRunResult { summary })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_real_pi_model_name_and_cost_metadata() {
+        let value = json!({
+            "provider": "opencode-go",
+            "id": "cheap-real-model",
+            "name": "Cheap Real Model",
+            "reasoning": true,
+            "contextWindow": 1000000,
+            "cost": {
+                "input": 0.15,
+                "output": 0.47,
+                "cacheRead": 0.016,
+                "cacheWrite": 0.2
+            }
+        });
+        let model = agent_model_from_pi(&value).unwrap();
+        assert_eq!(model.provider, "opencode-go");
+        assert_eq!(model.id, "cheap-real-model");
+        assert_eq!(model.name.as_deref(), Some("Cheap Real Model"));
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert!(model.reasoning);
+        let cost = model.cost.unwrap();
+        assert_eq!(cost.input, 0.15);
+        assert_eq!(cost.output, 0.47);
+        assert_eq!(cost.cache_read, 0.016);
+        assert_eq!(cost.cache_write, 0.2);
     }
 }

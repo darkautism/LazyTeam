@@ -35,6 +35,11 @@ mod tests {
         assert!(INDEX.contains("Initial prompt"));
         assert!(INDEX.contains("worker-config-provider"));
         assert!(INDEX.contains("worker-config-model"));
+        assert!(INDEX.contains("Real Pi catalog from this worker"));
+        assert!(INDEX.contains("Pi-reported $/1M-token metadata"));
+        assert!(INDEX.contains("Agent default (may be expensive)"));
+        assert!(INDEX.contains("modelCostLabel"));
+        assert!(!INDEX.contains("STATIC_MODELS"));
         assert!(INDEX.contains("project-reviewer-prompt"));
         assert!(INDEX.contains("ChatGPT / MCP"));
         assert!(INDEX.contains("project-git-worker-managed"));

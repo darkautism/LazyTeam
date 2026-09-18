@@ -48,17 +48,33 @@ impl Default for AgentLoginMode {
     fn default() -> Self { Self::Unsupported }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AgentModelCost {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentModel {
     pub provider: String,
     pub id: String,
     #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub context_window: Option<u64>,
     #[serde(default)]
     pub reasoning: bool,
+    #[serde(default)]
+    pub cost: Option<AgentModelCost>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AgentCapabilities {
     #[serde(default)]
     pub model_discovery: bool,
