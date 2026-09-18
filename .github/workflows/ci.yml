@@ -81,10 +81,25 @@ jobs:
             exit 1
           fi
 
+      - name: Reject insecure non-loopback public URL without production flag
+        run: |
+          set +e
+          timeout 3s env \
+            LAZYTEAM_LISTEN=127.0.0.1:8791 \
+            LAZYTEAM_DATABASE_URL=sqlite:///tmp/lazyteam-insecure-nonprod.db?mode=rwc \
+            LAZYTEAM_PUBLIC_URL=http://lazyteam.example.test \
+            ./target/debug/lazyteam-server >/tmp/lazyteam-insecure-nonprod.log 2>&1
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ] || [ "$code" -eq 124 ]; then
+            cat /tmp/lazyteam-insecure-nonprod.log
+            echo "server accepted an insecure non-loopback public URL without production mode"
+            exit 1
+          fi
+
       - name: Docker production image and compose validation
         env:
           LAZYTEAM_PUBLIC_URL: https://lazyteam.example.test
-          LAZYTEAM_DOMAIN: lazyteam.example.test
           LAZYTEAM_OAUTH_PASSWORD: smoke-security-password-1234
           LAZYTEAM_ADMIN_TOKEN: admin-security-smoke-token-0123456789abcdef
           LAZYTEAM_WORKER_TOKEN: worker-security-smoke-token-0123456789abcdef
@@ -93,7 +108,7 @@ jobs:
           docker compose -f docker-compose.yml config >/dev/null
           docker compose -f docker-compose.public.yml config >/dev/null
           docker run --rm \
-            -e LAZYTEAM_DOMAIN=lazyteam.example.test \
+            -e LAZYTEAM_PUBLIC_URL=https://lazyteam.example.test \
             -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
             caddy:2.10-alpine caddy validate --config /etc/caddy/Caddyfile
 

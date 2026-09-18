@@ -10,7 +10,7 @@ services:
       LAZYTEAM_LISTEN: "0.0.0.0:8787"
       LAZYTEAM_DATABASE_URL: "sqlite:///app/data/lazyteam.db?mode=rwc"
       LAZYTEAM_PRODUCTION: "true"
-      LAZYTEAM_PUBLIC_URL: "https://${LAZYTEAM_DOMAIN:?set LAZYTEAM_DOMAIN}"
+      LAZYTEAM_PUBLIC_URL: "${LAZYTEAM_PUBLIC_URL:?set LAZYTEAM_PUBLIC_URL to your public https URL}"
       LAZYTEAM_OAUTH_PASSWORD: "${LAZYTEAM_OAUTH_PASSWORD:?set LAZYTEAM_OAUTH_PASSWORD}"
       LAZYTEAM_ADMIN_TOKEN: "${LAZYTEAM_ADMIN_TOKEN:?set LAZYTEAM_ADMIN_TOKEN}"
       LAZYTEAM_WORKER_TOKEN: "${LAZYTEAM_WORKER_TOKEN:?set LAZYTEAM_WORKER_TOKEN}"
@@ -50,7 +50,7 @@ services:
       - "443:443"
       - "443:443/udp"
     environment:
-      LAZYTEAM_DOMAIN: "${LAZYTEAM_DOMAIN:?set LAZYTEAM_DOMAIN}"
+      LAZYTEAM_PUBLIC_URL: "${LAZYTEAM_PUBLIC_URL:?set LAZYTEAM_PUBLIC_URL to your public https URL}"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

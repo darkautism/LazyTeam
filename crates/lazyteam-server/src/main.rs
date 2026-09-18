@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    sync::Arc,
+};
 
 use anyhow::{ensure, Context};
 use axum::{extract::DefaultBodyLimit, middleware, Router};
@@ -61,6 +65,10 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| s.trim_end_matches('/').to_string());
     let allowed_oauth_client_hosts = parse_hosts(&args.allowed_oauth_client_hosts);
     let allowed_redirect_hosts = parse_hosts(&args.allowed_redirect_hosts);
+
+    if let Some(public) = public_url.as_deref() {
+        validate_public_url(public)?;
+    }
 
     if args.production {
         let public = public_url
@@ -127,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
         move || Ok(mcp::LazyTeamMcp::new(mcp_state.clone())),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
+            .with_legacy_session_mode(true)
             .with_json_response(true),
     );
     let root_mcp_state = state.clone();
@@ -135,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         move || Ok(mcp::LazyTeamMcp::new(root_mcp_state.clone())),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
+            .with_legacy_session_mode(true)
             .with_json_response(true),
     );
     let mcp_router = Router::<Arc<AppState>>::new()
@@ -162,6 +170,27 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     info!(listen = %args.listen, production = args.production, "LazyTeam control plane listening");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn validate_public_url(public: &str) -> anyhow::Result<()> {
+    let parsed = Url::parse(public).context("parse LAZYTEAM_PUBLIC_URL")?;
+    let host = parsed
+        .host_str()
+        .context("LAZYTEAM_PUBLIC_URL must be an absolute URL with a host")?;
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if !is_loopback {
+        ensure!(
+            parsed.scheme() == "https",
+            "LAZYTEAM_PUBLIC_URL must use https:// for non-loopback hosts"
+        );
+    } else {
+        ensure!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "LAZYTEAM_PUBLIC_URL loopback development URLs must use http:// or https://"
+        );
+    }
     Ok(())
 }
 

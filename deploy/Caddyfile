@@ -1,4 +1,4 @@
-{$LAZYTEAM_DOMAIN} {
+{$LAZYTEAM_PUBLIC_URL} {
     encode zstd gzip
 
     @protocol path / /health /mcp /mcp/* /.well-known/*

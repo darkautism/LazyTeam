@@ -11,7 +11,8 @@ import urllib.request
 BASE = os.environ.get("LAZYTEAM_SMOKE_URL", "http://127.0.0.1:8787")
 PASSWORD = os.environ.get("LAZYTEAM_OAUTH_PASSWORD", "smoke-secret")
 REDIRECT = "http://127.0.0.1:9911/callback"
-MCP_VERSION = "2026-07-28"
+MCP_LEGACY_VERSION = "2025-11-25"
+MCP_MODERN_VERSION = "2026-07-28"
 
 
 def request(path, *, method="GET", data=None, headers=None, follow=True):
@@ -37,7 +38,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def read_json(resp):
-    return json.loads(resp.read().decode())
+    raw = resp.read().decode()
+    if "text/event-stream" in resp.headers.get("Content-Type", ""):
+        data_lines = [line[5:].lstrip() for line in raw.splitlines() if line.startswith("data:")]
+        expect(data_lines, "SSE response contained no data event")
+        raw = data_lines[-1]
+    return json.loads(raw)
 
 
 def expect(condition, message):
@@ -45,28 +51,57 @@ def expect(condition, message):
         raise AssertionError(message)
 
 
-def mcp_meta():
+def mcp_meta(version=MCP_MODERN_VERSION):
     return {
-        "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
+        "io.modelcontextprotocol/protocolVersion": version,
         "io.modelcontextprotocol/clientInfo": {"name": "lazyteam-smoke", "version": "1.0"},
         "io.modelcontextprotocol/clientCapabilities": {},
     }
 
 
-def mcp_call(token, method, params=None, path="/mcp"):
-    body = json.dumps({
+def mcp_call(
+    token,
+    method,
+    params=None,
+    path="/mcp",
+    *,
+    version=MCP_MODERN_VERSION,
+    session_id=None,
+    request_id=1,
+    notification=False,
+):
+    message = {
         "jsonrpc": "2.0",
-        "id": 1,
         "method": method,
         "params": params or {},
-    }).encode()
-    return request(path, method="POST", data=body, headers={
+    }
+    if not notification:
+        message["id"] = request_id
+    headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
-        "MCP-Protocol-Version": MCP_VERSION,
+        "MCP-Protocol-Version": version,
         "Mcp-Method": method,
-    })
+    }
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    return request(path, method="POST", data=json.dumps(message).encode(), headers=headers)
+
+
+def validate_tool_schemas(tools):
+    for tool in tools:
+        name = tool.get("name", "<unnamed>")
+        schema = tool.get("inputSchema")
+        expect(isinstance(schema, dict), f"{name} inputSchema is not an object")
+        expect(schema.get("type") == "object", f"{name} inputSchema type is not object")
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        expect(isinstance(properties, dict), f"{name} inputSchema properties is not an object")
+        expect(isinstance(required, list), f"{name} inputSchema required is not an array")
+        expect(all(isinstance(item, str) for item in required), f"{name} inputSchema required contains non-strings")
+        expect(set(required).issubset(properties), f"{name} inputSchema requires unknown properties")
+        json.dumps(schema)
 
 
 def main():
@@ -143,18 +178,72 @@ def main():
     expect(tokens["token_type"] == "Bearer", "wrong token type")
     expect(tokens.get("refresh_token"), "refresh token missing")
 
+    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_create", "tasks_approve", "tasks_retry", "workers_list"}
+
+    legacy_initialize = mcp_call(tokens["access_token"], "initialize", {
+        "protocolVersion": MCP_LEGACY_VERSION,
+        "capabilities": {},
+        "clientInfo": {"name": "lazyteam-smoke-legacy", "version": "1.0"},
+    }, version=MCP_LEGACY_VERSION, request_id=1)
+    expect(legacy_initialize.status == 200, f"legacy initialize failed with HTTP {legacy_initialize.status}")
+    legacy_session_id = legacy_initialize.headers.get("Mcp-Session-Id")
+    expect(legacy_session_id, "legacy initialize did not return Mcp-Session-Id")
+    legacy_initialized_body = read_json(legacy_initialize)
+    legacy_result = legacy_initialized_body.get("result", {})
+    expect(legacy_result.get("protocolVersion") == MCP_LEGACY_VERSION, "legacy initialize negotiated wrong protocolVersion")
+    expect("capabilities" in legacy_result, "legacy initialize omitted capabilities")
+    expect("serverInfo" in legacy_result, "legacy initialize omitted serverInfo")
+
+    legacy_initialized = mcp_call(
+        tokens["access_token"],
+        "notifications/initialized",
+        version=MCP_LEGACY_VERSION,
+        session_id=legacy_session_id,
+        notification=True,
+    )
+    expect(legacy_initialized.status == 202, f"legacy initialized notification failed with HTTP {legacy_initialized.status}")
+    legacy_initialized.read()
+
+    legacy_tools_resp = mcp_call(
+        tokens["access_token"],
+        "tools/list",
+        version=MCP_LEGACY_VERSION,
+        session_id=legacy_session_id,
+        request_id=2,
+    )
+    expect(legacy_tools_resp.status == 200, f"legacy tools/list failed with HTTP {legacy_tools_resp.status}")
+    legacy_tool_result = read_json(legacy_tools_resp)
+    legacy_tools = legacy_tool_result.get("result", {}).get("tools", [])
+    legacy_names = {tool.get("name") for tool in legacy_tools}
+    expect(required_tools.issubset(legacy_names), f"legacy tools/list missing tools: {sorted(required_tools - legacy_names)}")
+    validate_tool_schemas(legacy_tools)
+
+    legacy_call = mcp_call(
+        tokens["access_token"],
+        "tools/call",
+        {"name": "projects_list", "arguments": {}},
+        version=MCP_LEGACY_VERSION,
+        session_id=legacy_session_id,
+        request_id=3,
+    )
+    expect(legacy_call.status == 200, f"legacy tools/call projects_list failed with HTTP {legacy_call.status}")
+    legacy_call_result = read_json(legacy_call).get("result", {})
+    expect(legacy_call_result.get("isError") is not True, "legacy projects_list returned MCP error result")
+    expect(isinstance(legacy_call_result.get("content"), list), "legacy projects_list result omitted content")
+
     discover = mcp_call(tokens["access_token"], "server/discover", {"_meta": mcp_meta()})
     expect(discover.status == 200, f"authenticated server/discover failed with HTTP {discover.status}")
     discovered = read_json(discover)
     expect("tools" in discovered.get("result", {}).get("capabilities", {}), "server/discover did not advertise tools")
-    expect(MCP_VERSION in discovered.get("result", {}).get("supportedVersions", []), "server/discover omitted requested protocol version")
+    expect(MCP_MODERN_VERSION in discovered.get("result", {}).get("supportedVersions", []), "server/discover omitted requested protocol version")
 
     tools = mcp_call(tokens["access_token"], "tools/list", {"_meta": mcp_meta()})
     expect(tools.status == 200, f"authenticated tools/list failed with HTTP {tools.status}")
     tool_result = read_json(tools)
-    names = {tool.get("name") for tool in tool_result.get("result", {}).get("tools", [])}
-    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_create", "tasks_approve", "tasks_retry", "workers_list"}
+    modern_tools = tool_result.get("result", {}).get("tools", [])
+    names = {tool.get("name") for tool in modern_tools}
     expect(required_tools.issubset(names), f"tools/list missing tools: {sorted(required_tools - names)}")
+    validate_tool_schemas(modern_tools)
 
     refresh_resp = request("/mcp/oauth/token", method="POST", data={
         "grant_type": "refresh_token",

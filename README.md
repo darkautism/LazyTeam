@@ -21,7 +21,7 @@ Do not publish LazyTeam port `8787` directly to the Internet. The production pro
 Set a DNS name that points at the host, then generate strong secrets:
 
 ```sh
-export LAZYTEAM_DOMAIN=lazyteam.example.com
+export LAZYTEAM_PUBLIC_URL=https://lazyteam.example.com
 export LAZYTEAM_OAUTH_PASSWORD="$(openssl rand -base64 32)"
 export LAZYTEAM_ADMIN_TOKEN="$(openssl rand -hex 32)"
 export LAZYTEAM_WORKER_TOKEN="$(openssl rand -hex 32)"
@@ -81,7 +81,7 @@ LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS=chatgpt.com,*.chatgpt.com
 LAZYTEAM_ALLOWED_REDIRECT_HOSTS=chatgpt.com,*.chatgpt.com
 ```
 
-Production startup fails if `LAZYTEAM_PUBLIC_URL` is not an absolute HTTPS URL, required credentials are missing/too short, or OAuth host allowlists are empty.
+`LAZYTEAM_PUBLIC_URL` is the single public-origin setting used by both LazyTeam and the bundled Caddy profile. Loopback development may use `http://127.0.0.1:8787` or `http://localhost:8787`; any non-loopback hostname requires HTTPS even if `LAZYTEAM_PRODUCTION` was accidentally omitted. Production additionally requires the URL to be HTTPS and all required credentials/host allowlists to be present.
 
 The ChatGPT host values are defaults, not a universal trust rule. If the actual MCP client metadata or callback host changes, update the allowlists explicitly instead of opening them to `*`.
 
@@ -231,6 +231,6 @@ CI boots real LazyTeam servers and gates the public deployment on:
 - Per-worker credential isolation and cross-worker execution rejection.
 - OAuth callback/client host policy and private CIMD rejection.
 - OAuth rate limiting.
-- Production rejection of insecure HTTP public URLs.
+- Rejection of insecure HTTP public URLs for every non-loopback hostname, including when production mode is omitted.
 - Production Docker image build.
 - Local and public Docker Compose configuration validation.
