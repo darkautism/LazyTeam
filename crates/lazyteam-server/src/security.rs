@@ -184,7 +184,11 @@ pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
         if path == "/api/workers/register" {
             // The shared worker secret is an enrollment credential only. Normal worker
             // traffic is authenticated by the per-worker credential issued at enrollment.
-            if production() && !bearer_matches(&request, config().worker_token.as_deref()) {
+            // If a token is configured, enforce it even outside explicit production mode
+            // so a forgotten LAZYTEAM_PRODUCTION flag does not silently disable auth.
+            if (production() || config().worker_token.is_some())
+                && !bearer_matches(&request, config().worker_token.as_deref())
+            {
                 return unauthorized("worker-enrollment");
             }
         } else if (path.starts_with("/api/workers/") && path != "/api/workers")
@@ -192,7 +196,9 @@ pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
         {
             // Per-worker authentication and execution ownership are enforced in the
             // endpoint handlers where the worker/execution ID is available.
-        } else if production() && !bearer_matches(&request, config().admin_token.as_deref()) {
+        } else if (production() || config().admin_token.is_some())
+            && !bearer_matches(&request, config().admin_token.as_deref())
+        {
             return unauthorized("admin");
         }
     }
