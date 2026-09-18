@@ -704,7 +704,7 @@ fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
     let feedback = assignment.task.review_feedback.trim();
     if assignment.execution.attempt > 1 && !feedback.is_empty() {
         return format!(
-            "{}\n\nContinue the existing task session and repository workspace. Do not restart from a reconstructed task contract; rely on the conversation and working tree you already have.\n\nReview feedback from the previous attempt:\n{}\n",
+            "{}\n\nContinue the existing task session and repository workspace. Do not restart from a reconstructed task contract; rely on the conversation and working tree you already have. The task branch may already be published: preserve its existing commit history. Never amend, rebase, reset, rewrite, or force-push previously published task commits; apply review corrections as new commits on top.\n\nReview feedback from the previous attempt:\n{}\n",
             initial_prompt,
             feedback,
         );
