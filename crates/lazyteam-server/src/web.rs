@@ -58,6 +58,11 @@ mod tests {
         assert!(INDEX.contains("-webkit-line-clamp:3"));
         assert!(INDEX.contains("-webkit-box-orient:vertical"));
         assert!(INDEX.contains("text-overflow:ellipsis"));
+        assert!(INDEX.contains("overflow-wrap:anywhere"));
+        assert!(INDEX.contains(".lane{"));
+        assert!(INDEX.contains("min-width:0;overflow:hidden"));
+        assert!(INDEX.contains(".card{"));
+        assert!(INDEX.contains("max-width:100%;overflow:hidden"));
         assert!(INDEX.contains("card-title"));
         assert!(INDEX.contains("white-space:nowrap"));
         assert!(INDEX.contains("height:calc(1.35em * 3)"));
