@@ -57,7 +57,7 @@ sudo chown 0:0 "$root_data" "$root_workspaces"
 run_case lazyteam-perm-root 8877 "$root_data" "$root_workspaces"
 test "$(process_uid lazyteam-perm-root)" = "10001"
 test "$(process_caps lazyteam-perm-root)" = "0000000000000000"
-test "$(stat -c '%u' "$root_data/lazyteam.db")" = "10001"
+test "$(sudo stat -c '%u' "$root_data/lazyteam.db")" = "10001"
 docker rm -f lazyteam-perm-root >/dev/null
 
 nas_data="$(mktemp -d)"
@@ -65,7 +65,7 @@ nas_workspaces="$(mktemp -d)"
 sudo chown 568:568 "$nas_data" "$nas_workspaces"
 run_case lazyteam-perm-568 8878 "$nas_data" "$nas_workspaces"
 test "$(process_uid lazyteam-perm-568)" = "568"
-test "$(stat -c '%u' "$nas_data/lazyteam.db")" = "568"
+test "$(sudo stat -c '%u' "$nas_data/lazyteam.db")" = "568"
 docker rm -f lazyteam-perm-568 >/dev/null
 
 data_volume="lazyteam-perm-data-$$"
