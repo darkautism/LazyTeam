@@ -34,17 +34,25 @@ if [ -n "$requested_uid" ] || [ -n "$requested_gid" ]; then
 else
   # Existing state is authoritative. This makes TrueNAS (commonly 568:568),
   # Unraid, Synology and ordinary bind mounts work without a PUID/PGID setting.
+  dir_uid="$(stat -c '%u' "$DATA_DIR")"
+  dir_gid="$(stat -c '%g' "$DATA_DIR")"
+  db_uid=0
+  db_gid=0
   if [ -e "$DATA_DIR/lazyteam.db" ]; then
-    detected_uid="$(stat -c '%u' "$DATA_DIR/lazyteam.db")"
-    detected_gid="$(stat -c '%g' "$DATA_DIR/lazyteam.db")"
-  else
-    detected_uid="$(stat -c '%u' "$DATA_DIR")"
-    detected_gid="$(stat -c '%g' "$DATA_DIR")"
+    db_uid="$(stat -c '%u' "$DATA_DIR/lazyteam.db")"
+    db_gid="$(stat -c '%g' "$DATA_DIR/lazyteam.db")"
   fi
 
-  if [ "$detected_uid" -ne 0 ]; then
-    runtime_uid="$detected_uid"
-    runtime_gid="$detected_gid"
+  # Prefer an existing non-root database owner, otherwise a non-root mount
+  # owner (e.g. TrueNAS apps 568:568). A root-owned DB from an older image
+  # must not override a non-root dataset owner.
+  if [ "$db_uid" -ne 0 ]; then
+    runtime_uid="$db_uid"
+    runtime_gid="$db_gid"
+    source="database"
+  elif [ "$dir_uid" -ne 0 ]; then
+    runtime_uid="$dir_uid"
+    runtime_gid="$dir_gid"
     source="mount"
   else
     is_uint "$DEFAULT_UID" || die "invalid LAZYTEAM_DEFAULT_UID: $DEFAULT_UID"
@@ -60,18 +68,33 @@ mkdir -p "$HOME_DIR"
 
 fix_tree_if_needed() {
   path="$1"
+  important_child="${2:-}"
   owner_uid="$(stat -c '%u' "$path")"
   owner_gid="$(stat -c '%g' "$path")"
+  needs_fix=0
 
   if [ "$owner_uid" -ne "$runtime_uid" ] || [ "$owner_gid" -ne "$runtime_gid" ]; then
-    echo "lazyteam-entrypoint: adjusting $path ownership $owner_uid:$owner_gid -> $runtime_uid:$runtime_gid"
+    needs_fix=1
+  fi
+
+  if [ -n "$important_child" ] && [ -e "$important_child" ]; then
+    child_uid="$(stat -c '%u' "$important_child")"
+    child_gid="$(stat -c '%g' "$important_child")"
+    if [ "$child_uid" -ne "$runtime_uid" ] || [ "$child_gid" -ne "$runtime_gid" ]; then
+      needs_fix=1
+    fi
+  fi
+
+  if [ "$needs_fix" -eq 1 ]; then
+    echo "lazyteam-entrypoint: adjusting $path ownership -> $runtime_uid:$runtime_gid"
     chown -R "$runtime_uid:$runtime_gid" "$path" ||
       die "cannot adjust ownership of $path; check that the mount is writable and permits chown"
   fi
 }
 
 if [ "$runtime_uid" -ne 0 ]; then
-  fix_tree_if_needed "$DATA_DIR"
+  fix_tree_if_needed "$DATA_DIR" "$DATA_DIR/lazyteam.db"
+  fix_tree_if_needed "$HOME_DIR"
   fix_tree_if_needed "$WORKSPACE_DIR"
 
   # Verify effective access instead of assuming chown/ACL semantics.
