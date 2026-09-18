@@ -3,11 +3,11 @@ use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, t
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
-use lazyteam_core::{Assignment, ExecutionResult};
+use lazyteam_core::{AgentCapabilities, AgentConfig, Assignment, ExecutionResult};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::{process::Command, time::sleep};
+use tokio::{process::Command, time::{sleep, Instant}};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -52,6 +52,11 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct WorkerJoinPayload {
     server: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerRuntimeConfig {
+    agent: AgentConfig,
 }
 
 fn parse_join_code_server(raw: &str) -> anyhow::Result<String> {
@@ -113,6 +118,11 @@ async fn main() -> anyhow::Result<()> {
         .context("worker endpoint unknown; provide --join-code (recommended) or --server for first enrollment")?;
     let enrollment_credential = args.join_code.as_deref().or(args.worker_token.as_deref());
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let pi_bin = args.pi_bin.clone();
+    let legacy_provider = args.pi_provider.clone();
+    let legacy_model = args.pi_model.clone();
+    let probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None };
+    let mut agent_capabilities = probe_runtime.capabilities().await;
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
     let projects: BTreeSet<String> = args.allowed_projects.into_iter().collect();
 
@@ -131,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
                 tags.clone(),
                 projects.clone(),
                 args.slots,
+                agent_capabilities.clone(),
             ).await?;
             persist_worker_credential(&args.state_dir, &credential).await?;
             persist_server_url(&args.state_dir, &server).await?;
@@ -154,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
             tags,
             projects,
             args.slots,
+            agent_capabilities.clone(),
         ).await?;
         persist_worker_credential(&args.state_dir, &worker_credential).await?;
         persist_server_url(&args.state_dir, &server).await?;
@@ -162,11 +174,11 @@ async fn main() -> anyhow::Result<()> {
         persist_server_url(&args.state_dir, &server).await?;
     }
 
-    let runtime: Arc<dyn AgentRuntime> = Arc::new(PiRuntime {
-        binary: args.pi_bin,
-        provider: args.pi_provider,
-        model: args.pi_model,
-    });
+    if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
+        warn!(%error, "initial agent capability report failed");
+    }
+    let mut runtime_config = fetch_runtime_config(&client, &server, &worker_credential, worker_id).await?;
+    let mut next_capability_probe = Instant::now() + Duration::from_secs(60);
 
     loop {
         if let Err(error) = heartbeat(&client, &server, &worker_credential, worker_id).await {
@@ -174,15 +186,32 @@ async fn main() -> anyhow::Result<()> {
             sleep(Duration::from_secs(5)).await;
             continue;
         }
+        if Instant::now() >= next_capability_probe {
+            agent_capabilities = probe_runtime.capabilities().await;
+            if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
+                warn!(%error, "agent capability refresh failed");
+            }
+            next_capability_probe = Instant::now() + Duration::from_secs(60);
+        }
+        match fetch_runtime_config(&client, &server, &worker_credential, worker_id).await {
+            Ok(config) => runtime_config = config,
+            Err(error) => warn!(%error, "worker runtime config refresh failed; using last known config"),
+        }
         match claim(&client, &server, &worker_credential, worker_id).await {
             Ok(Some(assignment)) => {
                 info!(task = %assignment.task.id, execution = %assignment.execution.id, project = %assignment.project.slug, "claimed task");
+                let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref()) {
+                    Ok(runtime) => runtime,
+                    Err(error) => { error!(%error, "invalid agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
+                };
+                info!(agent = runtime.kind(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "starting agent runtime");
                 if let Err(error) = execute_assignment(
                     &client,
                     &server,
                     &worker_credential,
                     &args.workspace_dir,
-                    runtime.clone(),
+                    runtime,
+                    &runtime_config.agent.initial_prompt,
                     assignment,
                 ).await {
                     error!(%error, "assignment execution failed");
@@ -214,6 +243,7 @@ async fn register(
     tags: BTreeMap<String, String>,
     allowed_projects: BTreeSet<String>,
     slots: u32,
+    agent_capabilities: AgentCapabilities,
 ) -> anyhow::Result<String> {
     let response = enrollment_auth(client.post(format!("{server}/api/workers/register")), enrollment_token).json(&json!({
         "id": id,
@@ -224,7 +254,9 @@ async fn register(
         "allowed_projects": allowed_projects,
         "slots": slots,
         "worker_version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": 1
+        "protocol_version": 1,
+        "agent_type": "pi",
+        "agent_capabilities": agent_capabilities
     })).send().await?;
     let response = ensure_success(response).await?;
     let credential = response
@@ -234,6 +266,27 @@ async fn register(
         .context("server did not return a worker-specific credential")?
         .to_string();
     Ok(credential)
+}
+
+async fn report_capabilities(client: &Client, server: &str, credential: &str, worker_id: Uuid, capabilities: &AgentCapabilities) -> anyhow::Result<()> {
+    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capabilities")), credential)
+        .json(capabilities).send().await?;
+    ensure_success(response).await?;
+    Ok(())
+}
+
+async fn fetch_runtime_config(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<WorkerRuntimeConfig> {
+    let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/config")), credential).send().await?;
+    Ok(ensure_success(response).await?.json().await?)
+}
+
+fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option<&str>, legacy_model: Option<&str>) -> anyhow::Result<Arc<dyn AgentRuntime>> {
+    if agent.agent_type != "pi" { bail!("unsupported agent type {}", agent.agent_type); }
+    Ok(Arc::new(PiRuntime {
+        binary: pi_bin.to_string(),
+        provider: agent.provider.clone().or_else(|| legacy_provider.map(str::to_string)),
+        model: agent.model.clone().or_else(|| legacy_model.map(str::to_string)),
+    }))
 }
 
 async fn heartbeat(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<()> {
@@ -255,6 +308,7 @@ async fn execute_assignment(
     worker_credential: &str,
     workspace_root: &Path,
     runtime: Arc<dyn AgentRuntime>,
+    initial_prompt: &str,
     assignment: Assignment,
 ) -> anyhow::Result<()> {
     let execution_id = assignment.execution.id;
@@ -276,7 +330,7 @@ async fn execute_assignment(
         }
     });
 
-    let outcome = run_task(workspace_root, runtime, &assignment).await;
+    let outcome = run_task(workspace_root, runtime, initial_prompt, &assignment).await;
     renew.abort();
 
     let result = match outcome {
@@ -301,12 +355,12 @@ async fn execute_assignment(
     Ok(())
 }
 
-async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, assignment: &Assignment) -> anyhow::Result<ExecutionResult> {
+async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, assignment: &Assignment) -> anyhow::Result<ExecutionResult> {
     let workspace = workspace_root
         .join(&assignment.project.slug)
         .join(assignment.execution.id.to_string());
     let base_sha = prepare_workspace(&workspace, assignment).await?;
-    let prompt = build_prompt(assignment);
+    let prompt = build_prompt(initial_prompt, assignment);
     let session_name = format!("lazyteam-{}-a{}", assignment.task.id, assignment.execution.attempt);
     let agent = runtime.run(&workspace, &prompt, &session_name).await?;
     let mut warnings = vec![];
@@ -327,10 +381,11 @@ async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, assignm
     })
 }
 
-fn build_prompt(assignment: &Assignment) -> String {
+fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     format!(
-        "You are a LazyTeam worker executing one unattended coding task.\n\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nRules:\n- Work only in the current workspace.\n- Inspect the repository before editing.\n- Implement the requested task, run appropriate validation, and do not wait for human interaction.\n- Do not broaden the task beyond its contract.\n- Commit your changes if practical.\n- End with a concise summary of changes and validation.\n",
+        "{}\n\nTask contract:\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n",
+        initial_prompt,
         assignment.project.name,
         assignment.project.repo_url,
         assignment.project.default_branch,

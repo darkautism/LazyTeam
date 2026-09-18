@@ -2,6 +2,7 @@ use std::{path::Path, process::Stdio};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
+use lazyteam_core::{AgentCapabilities, AgentLoginMode, AgentModel};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -15,6 +16,8 @@ pub struct AgentRunResult {
 
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
+    fn kind(&self) -> &'static str;
+    async fn capabilities(&self) -> AgentCapabilities;
     async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult>;
 }
 
@@ -25,8 +28,72 @@ pub struct PiRuntime {
     pub model: Option<String>,
 }
 
+impl PiRuntime {
+    async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
+        let binary = self.binary.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            let mut child = Command::new(&binary)
+                .arg("--mode").arg("rpc").arg("--no-session")
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+                .spawn().with_context(|| format!("spawn {binary} for capability probe"))?;
+            let mut stdin = child.stdin.take().context("Pi capability probe stdin missing")?;
+            let stdout = child.stdout.take().context("Pi capability probe stdout missing")?;
+            let request = json!({"id":"lazyteam-models","type":"get_available_models"});
+            stdin.write_all(request.to_string().as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await?;
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next_line().await? {
+                let event: Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
+                if event.get("type").and_then(Value::as_str) == Some("response")
+                    && event.get("id").and_then(Value::as_str) == Some("lazyteam-models")
+                {
+                    if event.get("success").and_then(Value::as_bool) != Some(true) {
+                        let _ = child.kill().await;
+                        bail!("Pi get_available_models failed: {event}");
+                    }
+                    let models = event.get("data").and_then(|v| v.get("models")).and_then(Value::as_array)
+                        .context("Pi get_available_models response omitted data.models")?
+                        .iter().filter_map(|model| {
+                            Some(AgentModel {
+                                provider: model.get("provider")?.as_str()?.to_string(),
+                                id: model.get("id")?.as_str()?.to_string(),
+                                context_window: model.get("contextWindow").and_then(Value::as_u64),
+                                reasoning: model.get("reasoning").and_then(Value::as_bool).unwrap_or(false),
+                            })
+                        }).collect();
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Ok(models);
+                }
+            }
+            let _ = child.kill().await;
+            bail!("Pi exited before returning available models")
+        }).await.context("Pi capability probe timed out")?
+    }
+}
+
 #[async_trait]
 impl AgentRuntime for PiRuntime {
+    fn kind(&self) -> &'static str { "pi" }
+
+    async fn capabilities(&self) -> AgentCapabilities {
+        match self.probe_models().await {
+            Ok(models) => AgentCapabilities {
+                model_discovery: true,
+                login_mode: AgentLoginMode::LocalInteractive,
+                models,
+                probe_error: None,
+            },
+            Err(error) => AgentCapabilities {
+                model_discovery: true,
+                login_mode: AgentLoginMode::LocalInteractive,
+                models: vec![],
+                probe_error: Some(error.to_string()),
+            },
+        }
+    }
+
     async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
         let mut command = Command::new(&self.binary);
         command.arg("--mode").arg("rpc").arg("--no-session").arg("--name").arg(session_name);

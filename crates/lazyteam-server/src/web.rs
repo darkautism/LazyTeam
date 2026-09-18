@@ -31,5 +31,9 @@ mod tests {
         assert!(INDEX.contains("New project"));
         assert!(INDEX.contains("New worker"));
         assert!(INDEX.contains("Registration token"));
+        assert!(INDEX.contains("Configure worker"));
+        assert!(INDEX.contains("Initial prompt"));
+        assert!(INDEX.contains("worker-config-provider"));
+        assert!(INDEX.contains("worker-config-model"));
     }
 }

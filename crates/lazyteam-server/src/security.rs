@@ -284,7 +284,8 @@ pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
             if (production() || config().worker_token.is_some()) && !worker_enrollment_matches(&request) {
                 return unauthorized("worker-enrollment");
             }
-        } else if (path.starts_with("/api/workers/") && path != "/api/workers")
+        } else if (path.starts_with("/api/workers/")
+            && (path.ends_with("/heartbeat") || path.ends_with("/claim") || path.ends_with("/config") || path.ends_with("/capabilities")))
             || path.starts_with("/api/executions/")
         {
             // Per-worker authentication and execution ownership are enforced in the

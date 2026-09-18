@@ -5,6 +5,61 @@ use uuid::Uuid;
 
 pub type Tags = BTreeMap<String, String>;
 
+pub const DEFAULT_WORKER_PROMPT: &str = "You are an autonomous LazyTeam coding worker. Execute only the assigned task in the provided repository workspace. Treat the task description and acceptance criteria as the contract. Inspect before editing, make the smallest correct change, preserve unrelated behavior, and follow repository instructions. Run relevant validation and never wait for interactive input. Do not broaden scope. If blocked, stop and report the concrete blocker. Do not expose secrets or modify external systems unless the task explicitly requires it. Finish with a concise summary of what changed, validation performed, and any remaining risks.";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoginMode {
+    Unsupported,
+    LocalInteractive,
+    Remote,
+}
+
+impl Default for AgentLoginMode {
+    fn default() -> Self { Self::Unsupported }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentModel {
+    pub provider: String,
+    pub id: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub reasoning: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentCapabilities {
+    #[serde(default)]
+    pub model_discovery: bool,
+    #[serde(default)]
+    pub login_mode: AgentLoginMode,
+    #[serde(default)]
+    pub models: Vec<AgentModel>,
+    #[serde(default)]
+    pub probe_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentConfig {
+    pub agent_type: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub initial_prompt: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            agent_type: "pi".into(),
+            provider: None,
+            model: None,
+            initial_prompt: DEFAULT_WORKER_PROMPT.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: Uuid,
@@ -47,6 +102,8 @@ pub struct Worker {
     pub protocol_version: u32,
     pub worker_version: String,
     pub last_heartbeat_at: DateTime<Utc>,
+    pub agent: AgentConfig,
+    pub agent_capabilities: AgentCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,6 +253,8 @@ mod tests {
             protocol_version: 1,
             worker_version: "dev".into(),
             last_heartbeat_at: Utc::now(),
+            agent: AgentConfig::default(),
+            agent_capabilities: AgentCapabilities::default(),
         }
     }
 

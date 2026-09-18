@@ -150,7 +150,7 @@ curl -X POST http://127.0.0.1:8787/api/projects \
 
 A task stores a `project_id`. Workers remain a shared fleet and may allow all projects (`*`) or an explicit set of project slugs.
 
-The current Web UI is intentionally not part of the public Caddy route set. Open the loopback/private UI at `http://127.0.0.1:8787/ui`, paste `LAZYTEAM_ADMIN_TOKEN` into the **Admin token** field, and click **Use token**. The token is stored only in browser `sessionStorage` and is attached as a Bearer token to management API requests; **Clear** removes it immediately, and closing the browser session clears it as well. A future authenticated Pi-backed planner UI can be added without weakening the current management boundary.
+The Web UI is intentionally not part of the public Caddy route set. Open the loopback/private UI at `http://127.0.0.1:8787/ui`, click **Connect**, paste `LAZYTEAM_ADMIN_TOKEN`, and connect. The token is kept only in browser `sessionStorage`; the compact header shows only **Connected** while it is valid.
 
 ## Run a worker
 
@@ -179,6 +179,20 @@ cargo run -p lazyteam-worker -- --server https://lazyteam.example.com --name wor
 ```
 
 There is intentionally no implicit `127.0.0.1:8787` fallback anymore: a fresh worker must receive either a join code or an explicit server URL, preventing accidental attempts to register against itself.
+
+### Worker and agent configuration
+
+After a worker is enrolled, open **Workers → Configure** in the private UI. The server becomes the source of truth for the worker name, tags, allowed projects, slots, agent selection, provider/model selection, and initial prompt. A running worker fetches this configuration before claiming work, so changes apply to subsequent tasks without re-enrollment.
+
+Agent integrations are capability-driven instead of assuming every CLI exposes the same controls. Each worker reports whether its agent supports model discovery, what login mode it exposes (`unsupported`, `local_interactive`, or `remote`), and the provider/model catalog it can discover. The UI adapts to those capabilities.
+
+Pi is the only agent backend currently implemented. The worker probes Pi through RPC `get_available_models` and refreshes the catalog every 60 seconds. The provider/model dropdowns are populated only from models reported by that worker. Pi authentication is currently treated as **local interactive**: if the catalog cannot be loaded because Pi needs authentication, run Pi on that worker and use `/login`; the worker will discover the models after the next refresh. LazyTeam does not pretend a remote-login API exists when an agent backend does not expose one.
+
+The default initial prompt is deliberately agent-independent:
+
+```text
+You are an autonomous LazyTeam coding worker. Execute only the assigned task in the provided repository workspace. Treat the task description and acceptance criteria as the contract. Inspect before editing, make the smallest correct change, preserve unrelated behavior, and follow repository instructions. Run relevant validation and never wait for interactive input. Do not broaden scope. If blocked, stop and report the concrete blocker. Do not expose secrets or modify external systems unless the task explicitly requires it. Finish with a concise summary of what changed, validation performed, and any remaining risks.
+```
 
 Each execution gets a separate checkout and branch.
 

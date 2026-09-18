@@ -10,8 +10,8 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use lazyteam_core::{
-    worker_matches_task, Assignment, Execution, ExecutionResult, ExecutionState, Project, Tags, Task,
-    TaskState, Worker, WorkerState,
+    worker_matches_task, AgentCapabilities, AgentConfig, Assignment, Execution, ExecutionResult,
+    ExecutionState, Project, Tags, Task, TaskState, Worker, WorkerState, DEFAULT_WORKER_PROMPT,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -109,10 +109,33 @@ struct RegisterWorker {
     worker_version: String,
     #[serde(default = "default_protocol")]
     protocol_version: u32,
+    #[serde(default = "default_agent_type")]
+    agent_type: String,
+    #[serde(default)]
+    agent_capabilities: AgentCapabilities,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateWorker {
+    name: Option<String>,
+    tags: Option<Tags>,
+    allowed_projects: Option<BTreeSet<String>>,
+    slots: Option<u32>,
+    agent_type: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    clear_model: Option<bool>,
+    initial_prompt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerRuntimeConfig {
+    agent: AgentConfig,
 }
 
 fn default_slots() -> u32 { 1 }
 fn default_protocol() -> u32 { PROTOCOL_VERSION }
+fn default_agent_type() -> String { "pi".into() }
 
 #[derive(Debug, Deserialize)]
 struct FinishExecution {
@@ -134,8 +157,11 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/task-board", get(task_board))
         .route("/api/workers", get(list_workers))
+        .route("/api/workers/{id}", axum::routing::patch(update_worker))
         .route("/api/worker-join", post(create_worker_join_code))
         .route("/api/workers/register", post(register_worker))
+        .route("/api/workers/{id}/config", get(worker_runtime_config))
+        .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
         .route("/api/workers/{id}/claim", post(claim_task))
         .route("/api/executions/{id}/renew", post(renew_execution))
@@ -278,13 +304,15 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
     let mut tags = input.tags;
     tags.entry("os".into()).or_insert_with(|| input.os.clone());
     tags.entry("arch".into()).or_insert_with(|| input.arch.clone());
-    let worker = Worker { id, name: input.name, state: WorkerState::Idle, os: input.os, arch: input.arch, tags,
-        allowed_projects: input.allowed_projects, slots: input.slots.max(1), running_slots: 0,
-        protocol_version: input.protocol_version, worker_version: input.worker_version, last_heartbeat_at: now };
-    sqlx::query("INSERT INTO workers(id,name,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at,credential_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,state=CASE WHEN workers.running_slots>0 THEN 'busy' ELSE 'idle' END,os=excluded.os,arch=excluded.arch,tags=excluded.tags,allowed_projects=excluded.allowed_projects,slots=excluded.slots,protocol_version=excluded.protocol_version,worker_version=excluded.worker_version,last_heartbeat_at=excluded.last_heartbeat_at,credential_hash=excluded.credential_hash")
-        .bind(id.to_string()).bind(&worker.name).bind("idle").bind(&worker.os).bind(&worker.arch).bind(json(&worker.tags)?)
-        .bind(json(&worker.allowed_projects)?).bind(worker.slots as i64).bind(0_i64).bind(worker.protocol_version as i64)
-        .bind(&worker.worker_version).bind(ts(now)).bind(ts(now)).bind(credential_hash)
+    if input.agent_type != "pi" {
+        return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into()));
+    }
+    let agent_capabilities = json(&input.agent_capabilities)?;
+    sqlx::query("INSERT INTO workers(id,name,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at,credential_hash,agent_type,agent_provider,agent_model,initial_prompt,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,state=CASE WHEN workers.running_slots>0 THEN 'busy' ELSE 'idle' END,os=excluded.os,arch=excluded.arch,protocol_version=excluded.protocol_version,worker_version=excluded.worker_version,last_heartbeat_at=excluded.last_heartbeat_at,credential_hash=excluded.credential_hash,agent_capabilities=excluded.agent_capabilities")
+        .bind(id.to_string()).bind(&input.name).bind("idle").bind(&input.os).bind(&input.arch).bind(json(&tags)?)
+        .bind(json(&input.allowed_projects)?).bind(input.slots.max(1) as i64).bind(0_i64).bind(input.protocol_version as i64)
+        .bind(&input.worker_version).bind(ts(now)).bind(ts(now)).bind(credential_hash).bind(&input.agent_type)
+        .bind(Option::<String>::None).bind(Option::<String>::None).bind(DEFAULT_WORKER_PROMPT).bind(agent_capabilities)
         .execute(&state.db).await.map_err(db_error)?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let mut response = Json(worker_from_row(&row)?).into_response();
@@ -298,6 +326,57 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
 pub(crate) async fn list_workers(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Worker>> {
     let rows = sqlx::query("SELECT * FROM workers ORDER BY name").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(worker_from_row).collect::<Result<Vec<_>,_>>().map(Json)
+}
+
+async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, Json(input): Json<UpdateWorker>) -> ApiResult<Worker> {
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
+    let current = worker_from_row(&row)?;
+    let agent_type = input.agent_type.unwrap_or(current.agent.agent_type);
+    if agent_type != "pi" { return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into())); }
+    let (provider, model) = if input.clear_model.unwrap_or(false) {
+        (None, None)
+    } else {
+        (input.provider.or(current.agent.provider), input.model.or(current.agent.model))
+    };
+    if provider.is_some() != model.is_some() {
+        return Err((StatusCode::BAD_REQUEST, "provider and model must be set or cleared together".into()));
+    }
+    if let (Some(provider), Some(model)) = (&provider, &model) {
+        if !current.agent_capabilities.models.is_empty()
+            && !current.agent_capabilities.models.iter().any(|candidate| &candidate.provider == provider && &candidate.id == model)
+        {
+            return Err((StatusCode::BAD_REQUEST, "selected provider/model is not reported by this worker".into()));
+        }
+    }
+    let initial_prompt = input.initial_prompt.unwrap_or(current.agent.initial_prompt);
+    if initial_prompt.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, "initial prompt must not be empty".into())); }
+    let name = input.name.unwrap_or(current.name);
+    if name.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, "worker name must not be empty".into())); }
+    let tags = input.tags.unwrap_or(current.tags);
+    let allowed_projects = input.allowed_projects.unwrap_or(current.allowed_projects);
+    let slots = input.slots.unwrap_or(current.slots).max(1);
+    sqlx::query("UPDATE workers SET name=?,tags=?,allowed_projects=?,slots=?,agent_type=?,agent_provider=?,agent_model=?,initial_prompt=? WHERE id=?")
+        .bind(name.trim()).bind(json(&tags)?).bind(json(&allowed_projects)?).bind(slots as i64)
+        .bind(&agent_type).bind(&provider).bind(&model).bind(initial_prompt.trim()).bind(id.to_string())
+        .execute(&state.db).await.map_err(db_error)?;
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    Ok(Json(worker_from_row(&row)?))
+}
+
+async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<WorkerRuntimeConfig> {
+    require_worker(&state.db, id, &headers).await?;
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    let worker = worker_from_row(&row)?;
+    Ok(Json(WorkerRuntimeConfig { agent: worker.agent }))
+}
+
+async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(capabilities): Json<AgentCapabilities>) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let changed = sqlx::query("UPDATE workers SET agent_capabilities=? WHERE id=?")
+        .bind(json(&capabilities)?).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
+    if changed == 0 { return Err((StatusCode::NOT_FOUND, "worker not found".into())); }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
@@ -481,12 +560,22 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, ApiError> 
 
 fn worker_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Worker, ApiError> {
     let state: String = row.try_get("state").map_err(internal)?;
+    let initial_prompt: String = row.try_get("initial_prompt").map_err(internal)?;
+    let capabilities_raw: String = row.try_get("agent_capabilities").map_err(internal)?;
+    let capabilities = serde_json::from_str::<AgentCapabilities>(&capabilities_raw).unwrap_or_default();
     Ok(Worker { id: uuid(row.try_get("id").map_err(internal)?)?, name: row.try_get("name").map_err(internal)?,
         state: match state.as_str() { "busy" => WorkerState::Busy, "draining" => WorkerState::Draining, "degraded" => WorkerState::Degraded, "offline" => WorkerState::Offline, _ => WorkerState::Idle },
         os: row.try_get("os").map_err(internal)?, arch: row.try_get("arch").map_err(internal)?, tags: dejson(row.try_get("tags").map_err(internal)?)?,
         allowed_projects: dejson(row.try_get("allowed_projects").map_err(internal)?)?, slots: row.try_get::<i64,_>("slots").map_err(internal)? as u32,
         running_slots: row.try_get::<i64,_>("running_slots").map_err(internal)? as u32, protocol_version: row.try_get::<i64,_>("protocol_version").map_err(internal)? as u32,
-        worker_version: row.try_get("worker_version").map_err(internal)?, last_heartbeat_at: datetime(row.try_get("last_heartbeat_at").map_err(internal)?)? })
+        worker_version: row.try_get("worker_version").map_err(internal)?, last_heartbeat_at: datetime(row.try_get("last_heartbeat_at").map_err(internal)?)?,
+        agent: AgentConfig {
+            agent_type: row.try_get("agent_type").map_err(internal)?,
+            provider: row.try_get("agent_provider").map_err(internal)?,
+            model: row.try_get("agent_model").map_err(internal)?,
+            initial_prompt: if initial_prompt.trim().is_empty() { DEFAULT_WORKER_PROMPT.into() } else { initial_prompt },
+        },
+        agent_capabilities: capabilities })
 }
 
 fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
