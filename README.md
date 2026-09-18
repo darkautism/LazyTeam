@@ -150,7 +150,7 @@ curl -X POST http://127.0.0.1:8787/api/projects \
 
 A task stores a `project_id`. Workers remain a shared fleet and may allow all projects (`*`) or an explicit set of project slugs.
 
-The current Web UI is intentionally not part of the public Caddy route set. A future authenticated Pi-backed planner UI can be added without weakening the current management boundary.
+The current Web UI is intentionally not part of the public Caddy route set. Open the loopback/private UI at `http://127.0.0.1:8787/ui`, paste `LAZYTEAM_ADMIN_TOKEN` into the **Admin token** field, and click **Use token**. The token is stored only in browser `sessionStorage` and is attached as a Bearer token to management API requests; **Clear** removes it immediately, and closing the browser session clears it as well. A future authenticated Pi-backed planner UI can be added without weakening the current management boundary.
 
 ## Run a worker
 
