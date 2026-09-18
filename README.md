@@ -37,7 +37,19 @@ https://lazyteam.example.com/mcp
 
 Caddy obtains and renews the public TLS certificate. LazyTeam itself remains reachable on the host only through `127.0.0.1:8787` for local administration.
 
-Persistent server state is stored in the `lazyteam-data` Docker volume. The container runs as a non-root user with a read-only root filesystem, all Linux capabilities dropped, and `no-new-privileges` enabled.
+The container layout is intentionally rooted at `/app`:
+
+```text
+/app
+├── data/        # persistent control-plane state (SQLite; future Pi/session state)
+└── workspaces/  # project / planner / execution workspaces
+```
+
+The process working directory is `/app`. Persistent server state is stored in `/app/data` (the `lazyteam-data` Docker volume), and workspace storage is `/app/workspaces` (the `lazyteam-workspaces` volume). The default database is `/app/data/lazyteam.db`.
+
+For NAS deployments, bind-mount host datasets to `/app/data` and `/app/workspaces` if you prefer explicit host paths over Docker named volumes.
+
+The container runs as a non-root user with a read-only root filesystem, all Linux capabilities dropped, and `no-new-privileges` enabled.
 
 ### Required production settings
 
