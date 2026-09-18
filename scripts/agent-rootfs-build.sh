@@ -10,6 +10,8 @@ fi
 state_dir="$(cd "$1" && pwd)"
 shift
 ubuntu_version="${LAZYTEAM_UBUNTU_VERSION:-24.04.3}"
+preseed_archive="${LAZYTEAM_UBUNTU_BASE_ARCHIVE:-}"
+base_id="${LAZYTEAM_UBUNTU_BASE_ID:-$ubuntu_version}"
 root="$state_dir/agent-rootfs"
 cache="$root/cache"
 generations="$root/generations"
@@ -29,7 +31,7 @@ for capability in "$@"; do
 done
 
 mapfile -t capabilities < <(printf '%s\n' "${!requested[@]}" | sed '/^$/d' | sort)
-cap_key="$(printf '%s\n' "$ubuntu_version" "$ubuntu_arch" "${capabilities[@]}" | sha256sum | cut -c1-20)"
+cap_key="$(printf '%s\n' "$base_id" "$ubuntu_arch" "${capabilities[@]}" | sha256sum | cut -c1-20)"
 generation="$generations/$ubuntu_version-$ubuntu_arch-$cap_key"
 rootfs="$generation/rootfs"
 ready="$generation/.ready"
@@ -46,26 +48,35 @@ name="ubuntu-base-${ubuntu_version}-base-${ubuntu_arch}.tar.gz"
 release_base="https://cdimage.ubuntu.com/ubuntu-base/releases/${ubuntu_version%.*}/release"
 archive="$cache/$name"
 
-for cmd in curl tar sha256sum unshare mount chroot; do
+for cmd in tar sha256sum unshare mount chroot; do
   command -v "$cmd" >/dev/null || { echo "missing required host tool: $cmd" >&2; exit 2; }
 done
 
-if [[ ! -f "$archive" ]]; then
-  curl -fL "$release_base/$name" -o "$archive.tmp"
-  mv "$archive.tmp" "$archive"
+if [[ -n "$preseed_archive" ]]; then
+  [[ -r "$preseed_archive" ]] || { echo "preseeded Ubuntu rootfs archive is not readable: $preseed_archive" >&2; exit 2; }
+  archive="$preseed_archive"
+else
+  command -v curl >/dev/null || { echo "missing required host tool: curl" >&2; exit 2; }
+  if [[ ! -f "$archive" ]]; then
+    curl --retry 3 --retry-delay 2 --retry-all-errors -fL "$release_base/$name" -o "$archive.tmp"
+    mv "$archive.tmp" "$archive"
+  fi
+  curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL "$release_base/SHA256SUMS" -o "$cache/SHA256SUMS"
+  (
+    cd "$cache"
+    grep " \*$name\|  $name$" SHA256SUMS | sha256sum -c -
+  )
 fi
-curl -fsSL "$release_base/SHA256SUMS" -o "$cache/SHA256SUMS"
-(
-  cd "$cache"
-  grep " \*$name\|  $name$" SHA256SUMS | sha256sum -c -
-)
 
 staging="$generation.tmp-$$"
 rm -rf "$staging"
 mkdir -p "$staging/rootfs"
 tar --no-same-owner -xzf "$archive" -C "$staging/rootfs"
 
-packages=(ca-certificates)
+packages=()
+if [[ -z "$preseed_archive" ]]; then
+  packages+=(ca-certificates)
+fi
 for capability in "${capabilities[@]}"; do
   case "$capability" in
     rust) packages+=(cargo rustc build-essential pkg-config) ;;
@@ -81,7 +92,7 @@ for capability in "${capabilities[@]}"; do
     php) packages+=(php-cli php-mbstring php-xml) ;;
   esac
 done
-mapfile -t packages < <(printf '%s\n' "${packages[@]}" | sort -u)
+mapfile -t packages < <(printf '%s\n' "${packages[@]}" | sed '/^$/d' | sort -u)
 
 rootfs_stage="$staging/rootfs"
 mkdir -p "$rootfs_stage/proc" "$rootfs_stage/dev" "$rootfs_stage/etc"
@@ -92,23 +103,25 @@ for device in null zero full random urandom; do
   [[ -e "$rootfs_stage/dev/$device" ]] || touch "$rootfs_stage/dev/$device"
 done
 
-package_args="$(printf '%q ' "${packages[@]}")"
-export LAZYTEAM_BUILD_ROOTFS="$rootfs_stage"
-export LAZYTEAM_BUILD_PACKAGES="$package_args"
-unshare --user --map-root-user --mount --pid --fork /bin/bash -c '
-  set -euo pipefail
-  rootfs="$LAZYTEAM_BUILD_ROOTFS"
-  mount --make-rprivate /
-  mount --bind "$rootfs" "$rootfs"
-  mount -t proc proc "$rootfs/proc"
-  for device in null zero full random urandom; do
-    mount --bind "/dev/$device" "$rootfs/dev/$device"
-  done
-  chroot "$rootfs" /bin/bash -lc "set -euo pipefail; export DEBIAN_FRONTEND=noninteractive; apt-get -o APT::Sandbox::User=root update; apt-get -o APT::Sandbox::User=root install -y --no-install-recommends $LAZYTEAM_BUILD_PACKAGES; apt-get clean; rm -rf /var/lib/apt/lists/*"
-'
+if (( ${#packages[@]} > 0 )); then
+  package_args="$(printf '%q ' "${packages[@]}")"
+  export LAZYTEAM_BUILD_ROOTFS="$rootfs_stage"
+  export LAZYTEAM_BUILD_PACKAGES="$package_args"
+  unshare --user --map-root-user --mount --pid --fork /bin/bash -c '
+    set -euo pipefail
+    rootfs="$LAZYTEAM_BUILD_ROOTFS"
+    mount --make-rprivate /
+    mount --bind "$rootfs" "$rootfs"
+    mount -t proc proc "$rootfs/proc"
+    for device in null zero full random urandom; do
+      mount --bind "/dev/$device" "$rootfs/dev/$device"
+    done
+    chroot "$rootfs" /bin/bash -lc "set -euo pipefail; export DEBIAN_FRONTEND=noninteractive; apt-get -o APT::Sandbox::User=root update; apt-get -o APT::Sandbox::User=root install -y --no-install-recommends $LAZYTEAM_BUILD_PACKAGES; apt-get clean; rm -rf /var/lib/apt/lists/*"
+  '
+fi
 
 printf '%s\n' "${capabilities[@]}" > "$rootfs_stage/.lazyteam-capabilities"
-printf '%s\n' "$ubuntu_version" > "$rootfs_stage/.lazyteam-ubuntu-version"
+printf '%s\n' "$base_id" > "$rootfs_stage/.lazyteam-ubuntu-version"
 rm -rf "$generation"
 mv "$staging" "$generation"
 touch "$ready"

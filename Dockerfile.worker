@@ -1,3 +1,11 @@
+FROM ubuntu:24.04 AS agent-base
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates gzip tar \
+    && rm -rf /var/lib/apt/lists/* \
+    && tar --numeric-owner --one-file-system \
+        --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run --exclude=./tmp \
+        -C / -czf /tmp/lazyteam-ubuntu-rootfs.tar.gz .
+
 FROM rust:1-bookworm AS builder
 ARG LAZYTEAM_GIT_SHA
 ENV LAZYTEAM_GIT_SHA=${LAZYTEAM_GIT_SHA}
@@ -18,6 +26,7 @@ RUN apt-get update \
     && mkdir -p /app/state/home /app/workspaces \
     && chown -R lazyteam:lazyteam /app
 COPY --from=builder /src/target/release/lazyteam-worker /usr/local/bin/lazyteam-worker
+COPY --from=agent-base /tmp/lazyteam-ubuntu-rootfs.tar.gz /opt/lazyteam/ubuntu-rootfs.tar.gz
 COPY deploy/docker-entrypoint.sh /usr/local/bin/lazyteam-entrypoint
 RUN chmod 0755 /usr/local/bin/lazyteam-entrypoint
 WORKDIR /app
@@ -27,6 +36,8 @@ ENV LAZYTEAM_HOME=/app/state/home
 ENV LAZYTEAM_WORKER_STATE_DIR=/app/state
 ENV LAZYTEAM_WORKSPACE_DIR=/app/workspaces
 ENV LAZYTEAM_PI_BIN=pi
+ENV LAZYTEAM_UBUNTU_BASE_ARCHIVE=/opt/lazyteam/ubuntu-rootfs.tar.gz
+ENV LAZYTEAM_UBUNTU_BASE_ID=ubuntu-24.04-oci
 ENV RUST_LOG=lazyteam_worker=info
 VOLUME ["/app/state", "/app/workspaces"]
 ENTRYPOINT ["lazyteam-entrypoint"]

@@ -27,7 +27,7 @@ set -e
 printf '%s\n' "$output"
 
 if [ "$status" -ne 0 ]; then
-  compact="$(printf '%s' "$output" | tail -c 4000 | tr '\n' ' ')"
+  compact="$(printf '%s' "$output" | tail -c 4000 | tr '\r\n' '  ')"
   echo "::error title=Worker container sandbox failed::$compact"
   exit "$status"
 fi
@@ -35,7 +35,7 @@ fi
 case "$output" in
   *"LazyTeam agent sandbox ready"*) ;;
   *)
-    compact="$(printf '%s' "$output" | tail -c 4000 | tr '\n' ' ')"
+    compact="$(printf '%s' "$output" | tail -c 4000 | tr '\r\n' '  ')"
     echo "::error title=Worker container sandbox incomplete::$compact"
     exit 1
     ;;
