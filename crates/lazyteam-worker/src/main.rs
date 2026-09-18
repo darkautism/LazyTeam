@@ -535,14 +535,18 @@ async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial
 }
 
 fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
+    let feedback = assignment.task.review_feedback.trim();
+    if assignment.execution.attempt > 1 && !feedback.is_empty() {
+        return format!(
+            "{}\n\nContinue the existing task session and repository workspace. Do not restart from a reconstructed task contract; rely on the conversation and working tree you already have.\n\nReview feedback from the previous attempt:\n{}\n",
+            initial_prompt,
+            feedback,
+        );
+    }
+
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
-    let review_feedback = if assignment.task.review_feedback.trim().is_empty() {
-        String::new()
-    } else {
-        format!("\n\nReview feedback from the previous attempt:\n{}", assignment.task.review_feedback.trim())
-    };
     format!(
-        "{}\n\nTask contract:\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}{}\n",
+        "{}\n\nTask contract:\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n",
         initial_prompt,
         assignment.project.name,
         assignment.project.repo_url,
@@ -551,7 +555,6 @@ fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
         assignment.task.description,
         assignment.task.expected_outcome,
         criteria,
-        review_feedback,
     )
 }
 
