@@ -12,7 +12,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod runtime;
+mod sandbox;
 use runtime::{AgentRuntime, PiRuntime};
+use sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
 
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
@@ -48,6 +50,9 @@ struct Args {
     pi_provider: Option<String>,
     #[arg(long, env = "LAZYTEAM_PI_MODEL")]
     pi_model: Option<String>,
+    /// Verify the embedded Linux agent sandbox and exit without contacting the server.
+    #[arg(long)]
+    sandbox_diagnose: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +194,9 @@ fn parse_tag(raw: &str) -> Result<(String, String), String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(result) = sandbox::maybe_handle_entrypoint() {
+        return result;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -199,6 +207,12 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&args.state_dir).await?;
     clear_stale_git_auth(&args.state_dir).await?;
     tokio::fs::create_dir_all(&args.workspace_dir).await?;
+    let agent_sandbox = AgentSandbox::prepare(&args.state_dir, &args.pi_bin).await?;
+    info!("embedded agent sandbox ready: Landlock filesystem isolation + seccomp denylist");
+    if args.sandbox_diagnose {
+        println!("LazyTeam agent sandbox {}", agent_sandbox.diagnostic_summary());
+        return Ok(());
+    }
     let worker_id = load_or_create_worker_id(&args.state_dir).await?;
     let join_server = args.join_code.as_deref().map(parse_join_code_server).transpose()?;
     let explicit_server = args.server.as_deref().map(normalize_server).transpose()?;
@@ -217,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
     let pi_bin = args.pi_bin.clone();
     let legacy_provider = args.pi_provider.clone();
     let legacy_model = args.pi_model.clone();
-    let probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None, session_dir: None };
+    let probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None, session_dir: None, sandbox: agent_sandbox.clone() };
     let mut agent_capabilities = probe_runtime.capabilities().await;
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
     let projects: BTreeSet<String> = args.allowed_projects.into_iter().collect();
@@ -301,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Some(assignment)) => {
                     info!(task = %assignment.task.id, execution = %assignment.execution.id, project = %assignment.project.slug, "claimed implementation task");
                     let session_dir = args.state_dir.join("sessions").join(assignment.task.id.to_string());
-                    let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir) {
+                    let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir, agent_sandbox.clone()) {
                         Ok(runtime) => runtime,
                         Err(error) => { error!(%error, "invalid agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
                     };
@@ -312,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
                         &worker_credential,
                         &args.workspace_dir,
                         &args.state_dir,
+                        &agent_sandbox,
                         runtime,
                         &runtime_config.agent.initial_prompt,
                         assignment,
@@ -326,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Some(assignment)) => {
                     info!(task = %assignment.task.id, review = %assignment.review.id, project = %assignment.project.slug, "claimed review");
                     let session_dir = args.state_dir.join("review-sessions").join(assignment.review.id.to_string());
-                    let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir.clone()) {
+                    let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir.clone(), agent_sandbox.clone()) {
                         Ok(runtime) => runtime,
                         Err(error) => { error!(%error, "invalid reviewer agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
                     };
@@ -337,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
                         &worker_credential,
                         &args.workspace_dir,
                         &args.state_dir,
+                        &agent_sandbox,
                         runtime,
                         &runtime_config.agent.initial_prompt,
                         assignment,
@@ -408,13 +424,14 @@ async fn fetch_runtime_config(client: &Client, server: &str, credential: &str, w
     Ok(ensure_success(response).await?.json().await?)
 }
 
-fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option<&str>, legacy_model: Option<&str>, session_dir: PathBuf) -> anyhow::Result<Arc<dyn AgentRuntime>> {
+fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option<&str>, legacy_model: Option<&str>, session_dir: PathBuf, sandbox: AgentSandbox) -> anyhow::Result<Arc<dyn AgentRuntime>> {
     if agent.agent_type != "pi" { bail!("unsupported agent type {}", agent.agent_type); }
     Ok(Arc::new(PiRuntime {
         binary: pi_bin.to_string(),
         provider: agent.provider.clone().or_else(|| legacy_provider.map(str::to_string)),
         model: agent.model.clone().or_else(|| legacy_model.map(str::to_string)),
         session_dir: Some(session_dir),
+        sandbox,
     }))
 }
 
@@ -437,6 +454,8 @@ async fn process_cleanup(client: &Client, server: &str, credential: &str, worker
         }
         let session_dir = state_dir.join("sessions").join(item.task_id.to_string());
         if session_dir.exists() { tokio::fs::remove_dir_all(&session_dir).await?; }
+        let agent_workspace = state_dir.join("agent-workspaces").join(item.task_id.to_string());
+        if agent_workspace.exists() { tokio::fs::remove_dir_all(&agent_workspace).await?; }
         let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/cleanup/{}", item.task_id)), credential).send().await?;
         ensure_success(response).await?;
         info!(task = %item.task_id, "merged task workspace and agent session cleaned up");
@@ -470,6 +489,7 @@ async fn execute_review_assignment(
     worker_credential: &str,
     workspace_root: &Path,
     state_dir: &Path,
+    sandbox: &AgentSandbox,
     runtime: Arc<dyn AgentRuntime>,
     initial_prompt: &str,
     assignment: ReviewAssignment,
@@ -503,12 +523,16 @@ async fn execute_review_assignment(
             auth.cleanup().await;
             match prepared {
                 Ok(()) => {
+                    let agent_workspace = sandbox.reviewer_workspace(review_id);
+                    prepare_agent_workspace(&workspace, &agent_workspace).await?;
                     let prompt = build_review_prompt(initial_prompt, &assignment)?;
-                    match runtime.run(&workspace, &prompt, &review_id.to_string()).await {
+                    match runtime.run(&agent_workspace, &prompt, &review_id.to_string()).await {
                         Ok(agent) => {
-                            let dirty = git_output(&workspace, &["status", "--porcelain"]).await.unwrap_or_default();
+                            let dirty = git_status_external_worktree(&workspace, &agent_workspace)
+                                .await
+                                .unwrap_or_else(|error| format!("status-check-error: {error}"));
                             if !dirty.is_empty() {
-                                Err(anyhow::anyhow!("reviewer modified the pinned checkout; review discarded"))
+                                Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
                             } else {
                                 parse_review_verdict(&agent.summary)
                             }
@@ -533,6 +557,8 @@ async fn execute_review_assignment(
     ).json(&body).send().await?;
     ensure_success(response).await?;
     if workspace.exists() { let _ = tokio::fs::remove_dir_all(&workspace).await; }
+    let agent_workspace = sandbox.reviewer_workspace(review_id);
+    if agent_workspace.exists() { let _ = tokio::fs::remove_dir_all(&agent_workspace).await; }
     Ok(())
 }
 
@@ -603,6 +629,7 @@ async fn execute_assignment(
     worker_credential: &str,
     workspace_root: &Path,
     state_dir: &Path,
+    sandbox: &AgentSandbox,
     runtime: Arc<dyn AgentRuntime>,
     initial_prompt: &str,
     assignment: Assignment,
@@ -628,7 +655,7 @@ async fn execute_assignment(
 
     let outcome = match GitAuthContext::prepare(state_dir, assignment.task.id, assignment.execution.id, &assignment.git_credential).await {
         Ok(auth) => {
-            let result = run_task(workspace_root, runtime, initial_prompt, &assignment, &auth).await;
+            let result = run_task(workspace_root, sandbox, runtime, initial_prompt, &assignment, &auth).await;
             auth.cleanup().await;
             result
         }
@@ -663,14 +690,17 @@ async fn execute_assignment(
     Ok(())
 }
 
-async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
+async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
     let workspace = workspace_root
         .join(&assignment.project.slug)
         .join(assignment.task.id.to_string());
     let base_sha = prepare_workspace(&workspace, assignment, git_auth).await?;
+    let agent_workspace = sandbox.agent_workspace(assignment.task.id);
+    prepare_agent_workspace(&workspace, &agent_workspace).await?;
     let prompt = build_prompt(initial_prompt, assignment);
     let session_name = assignment.task.id.to_string();
-    let agent = runtime.run(&workspace, &prompt, &session_name).await?;
+    let agent = runtime.run(&agent_workspace, &prompt, &session_name).await?;
+    sync_agent_workspace(&agent_workspace, &workspace).await?;
     auto_commit(&workspace, assignment).await?;
     let head_sha = git_output(&workspace, &["rev-parse", "HEAD"]).await?;
     if head_sha == base_sha {
@@ -785,6 +815,20 @@ async fn auto_commit(path: &Path, assignment: &Assignment) -> anyhow::Result<()>
         "-c", "user.email=lazyteam@local",
         "commit", "-m", &format!("lazyteam: {}", assignment.task.title),
     ]).await
+}
+
+async fn git_status_external_worktree(repo: &Path, worktree: &Path) -> anyhow::Result<String> {
+    let git_dir = git_output(repo, &["rev-parse", "--git-dir"]).await?;
+    let git_dir = if Path::new(&git_dir).is_absolute() { PathBuf::from(git_dir) } else { repo.join(git_dir) };
+    let output = Command::new("git")
+        .arg("--git-dir").arg(&git_dir)
+        .arg("--work-tree").arg(worktree)
+        .args(["status", "--porcelain"])
+        .output().await?;
+    if !output.status.success() {
+        bail!("git external worktree status failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 async fn git_output(path: &Path, args: &[&str]) -> anyhow::Result<String> {

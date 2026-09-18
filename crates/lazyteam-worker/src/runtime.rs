@@ -4,10 +4,9 @@ use anyhow::{bail, Context};
 use async_trait::async_trait;
 use lazyteam_core::{AgentCapabilities, AgentLoginMode, AgentModel, AgentModelCost};
 use serde_json::{json, Value};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Command,
-};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use crate::sandbox::AgentSandbox;
 
 #[derive(Debug)]
 pub struct AgentRunResult {
@@ -27,6 +26,7 @@ pub struct PiRuntime {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub session_dir: Option<PathBuf>,
+    pub sandbox: AgentSandbox,
 }
 
 fn agent_model_from_pi(model: &Value) -> Option<AgentModel> {
@@ -49,11 +49,12 @@ fn agent_model_from_pi(model: &Value) -> Option<AgentModel> {
 impl PiRuntime {
     async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
         let binary = self.binary.clone();
+        let sandbox = self.sandbox.clone();
         tokio::time::timeout(std::time::Duration::from_secs(10), async move {
-            let mut child = Command::new(&binary)
-                .arg("--mode").arg("rpc").arg("--no-session")
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-                .spawn().with_context(|| format!("spawn {binary} for capability probe"))?;
+            let mut command = sandbox.command(&binary, sandbox.probe_workspace(), None)?;
+            command.arg("--mode").arg("rpc").arg("--no-session");
+            command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+            let mut child = command.spawn().with_context(|| format!("spawn sandboxed {binary} for capability probe"))?;
             let mut stdin = child.stdin.take().context("Pi capability probe stdin missing")?;
             let stdout = child.stdout.take().context("Pi capability probe stdout missing")?;
             let request = json!({"id":"lazyteam-models","type":"get_available_models"});
@@ -106,10 +107,12 @@ impl AgentRuntime for PiRuntime {
     }
 
     async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
-        let mut command = Command::new(&self.binary);
-        command.arg("--mode").arg("rpc").arg("--name").arg(session_name);
         if let Some(session_dir) = &self.session_dir {
             tokio::fs::create_dir_all(session_dir).await?;
+        }
+        let mut command = self.sandbox.command(&self.binary, workspace, self.session_dir.as_deref())?;
+        command.arg("--mode").arg("rpc").arg("--name").arg(session_name);
+        if let Some(session_dir) = &self.session_dir {
             command.arg("--session-dir").arg(session_dir).arg("--session-id").arg(session_name);
         } else {
             command.arg("--no-session");

@@ -196,6 +196,18 @@ cargo run -p lazyteam-worker -- --server https://lazyteam.example.com --name wor
 
 There is intentionally no implicit `127.0.0.1:8787` fallback anymore: a fresh worker must receive either a join code or an explicit server URL, preventing accidental attempts to register against itself.
 
+### Embedded agent sandbox
+
+On Linux, `lazyteam-worker` runs Pi inside an embedded sandbox implemented in the same Rust executable; Docker and a separate sandbox binary are not required. Startup is **fail-closed**: if the kernel cannot fully enforce the requested Landlock filesystem policy or install the seccomp filter, the worker refuses to run agents instead of falling back to an unsandboxed process. Check a machine without contacting the control plane with:
+
+```sh
+lazyteam-worker --sandbox-diagnose
+```
+
+The trusted worker daemon keeps the real Git checkout and `.git` metadata outside the agent view. Before each implementation/review turn it materializes a source-only mirror with no `.git`; implementation changes are synchronized back by the daemon and committed/pushed by the daemon. An agent-created `.git` entry is always discarded during synchronization. Pi gets an isolated `PI_CODING_AGENT_DIR`, HOME, Cargo cache/target directory, temp directory, and persistent task session. On first use, LazyTeam copies only Pi's `auth.json`, `settings.json`, and `models-store.json` into the isolated Pi directory. The worker credential, ephemeral Git credentials, worker state root, host `~/.ssh`, and trusted Git metadata are not included in the Landlock allowlist or inherited agent environment.
+
+The initial seccomp policy deliberately stays small to preserve normal Node/Pi/Cargo behavior while denying mount/namespace escape and process-inspection primitives such as `mount`, `pivot_root`, `chroot`, `setns`, `unshare`, `ptrace`, `bpf`, and `perf_event_open`. Network access remains available because Pi and package managers need outbound access.
+
 ### Worker and agent configuration
 
 LazyTeam separates three responsibilities:
