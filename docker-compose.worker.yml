@@ -1,0 +1,30 @@
+services:
+  lazyteam-worker:
+    image: ghcr.io/darkautism/lazyteam-worker:latest
+    restart: unless-stopped
+    environment:
+      LAZYTEAM_WORKER_JOIN_CODE: "${LAZYTEAM_WORKER_JOIN_CODE:-}"
+      LAZYTEAM_WORKER_NAME: "${LAZYTEAM_WORKER_NAME:-worker-01}"
+      RUST_LOG: "${RUST_LOG:-lazyteam_worker=info}"
+    command: ["lazyteam-worker", "--project", "*", "--slots", "${LAZYTEAM_WORKER_SLOTS:-1}"]
+    volumes:
+      - lazyteam-worker-state:/app/state
+      - lazyteam-worker-workspaces:/app/workspaces
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+      - apparmor=unconfined
+
+volumes:
+  lazyteam-worker-state:
+  lazyteam-worker-workspaces:

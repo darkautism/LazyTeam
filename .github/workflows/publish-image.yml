@@ -37,7 +37,7 @@ jobs:
             echo "Skipping stale validated commit $VALIDATED_SHA; main is $current_sha"
           fi
 
-      - name: Build release-candidate image
+      - name: Build server release-candidate image
         if: steps.current.outputs.publish == 'true'
         env:
           VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -46,6 +46,22 @@ jobs:
       - name: Verify automatic Docker UID/GID adaptation
         if: steps.current.outputs.publish == 'true'
         run: sh scripts/docker-permission-smoke.sh lazyteam:release-candidate
+
+      - name: Build worker release-candidate image
+        if: steps.current.outputs.publish == 'true'
+        env:
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: docker build -f Dockerfile.worker --build-arg LAZYTEAM_GIT_SHA="$VALIDATED_SHA" -t lazyteam-worker:release-candidate .
+
+      - name: Verify worker container sandbox
+        if: steps.current.outputs.publish == 'true'
+        run: sh scripts/worker-container-smoke.sh lazyteam-worker:release-candidate
+
+      - name: Set up QEMU
+        if: steps.current.outputs.publish == 'true'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64
 
       - name: Set up Docker Buildx
         if: steps.current.outputs.publish == 'true'
@@ -59,12 +75,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build and push validated image
+      - name: Build and push validated server image
         if: steps.current.outputs.publish == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           build-args: |
             LAZYTEAM_GIT_SHA=${{ github.event.workflow_run.head_sha }}
           tags: |
@@ -73,5 +90,47 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/darkautism/LazyTeam
             org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+          cache-from: type=gha,scope=lazyteam-server
+          cache-to: type=gha,mode=max,scope=lazyteam-server
           provenance: mode=max
           sbom: true
+
+      - name: Build and push validated worker image
+        if: steps.current.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            LAZYTEAM_GIT_SHA=${{ github.event.workflow_run.head_sha }}
+          tags: |
+            ghcr.io/darkautism/lazyteam-worker:latest
+            ghcr.io/darkautism/lazyteam-worker:sha-${{ github.event.workflow_run.head_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/darkautism/LazyTeam
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+          cache-from: type=gha,scope=lazyteam-worker
+          cache-to: type=gha,mode=max,scope=lazyteam-worker
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify published multi-arch manifests
+        if: steps.current.outputs.publish == 'true'
+        env:
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -eu
+          for image in \
+            "ghcr.io/darkautism/lazyteam:sha-$VALIDATED_SHA" \
+            "ghcr.io/darkautism/lazyteam-worker:sha-$VALIDATED_SHA"
+          do
+            raw="$(docker buildx imagetools inspect --raw "$image")"
+            printf '%s' "$raw" | jq -e '
+              [.manifests[].platform | select(.os == "linux") | .architecture] as $arches
+              | ($arches | index("amd64")) != null
+                and ($arches | index("arm64")) != null
+            ' >/dev/null
+            echo "verified amd64+arm64: $image"
+          done

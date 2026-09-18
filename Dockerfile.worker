@@ -1,0 +1,33 @@
+FROM rust:1-bookworm AS builder
+ARG LAZYTEAM_GIT_SHA
+ENV LAZYTEAM_GIT_SHA=${LAZYTEAM_GIT_SHA}
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p lazyteam-worker
+
+FROM node:22-bookworm-slim
+ARG PI_CODING_AGENT_VERSION=0.85.1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates coreutils curl findutils git gosu grep gzip openssh-client procps sed tar util-linux \
+    && npm install --global "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 lazyteam \
+    && useradd --system --uid 10001 --gid 10001 --home-dir /app/state/home --shell /usr/sbin/nologin lazyteam \
+    && mkdir -p /app/state/home /app/workspaces \
+    && chown -R lazyteam:lazyteam /app
+COPY --from=builder /src/target/release/lazyteam-worker /usr/local/bin/lazyteam-worker
+COPY deploy/docker-entrypoint.sh /usr/local/bin/lazyteam-entrypoint
+RUN chmod 0755 /usr/local/bin/lazyteam-entrypoint
+WORKDIR /app
+ENV HOME=/app/state/home
+ENV LAZYTEAM_DATA_DIR=/app/state
+ENV LAZYTEAM_HOME=/app/state/home
+ENV LAZYTEAM_WORKER_STATE_DIR=/app/state
+ENV LAZYTEAM_WORKSPACE_DIR=/app/workspaces
+ENV LAZYTEAM_PI_BIN=pi
+ENV RUST_LOG=lazyteam_worker=info
+VOLUME ["/app/state", "/app/workspaces"]
+ENTRYPOINT ["lazyteam-entrypoint"]
+CMD ["lazyteam-worker", "--project", "*", "--slots", "1"]

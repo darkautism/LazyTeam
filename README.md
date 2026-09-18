@@ -170,7 +170,27 @@ Keep this master key stable and outside the database/backups. Without it, worker
 
 ## Run a worker
 
-The worker needs `git`, access to the project repositories it may execute, and Pi on `PATH` (or `LAZYTEAM_PI_BIN`). The preferred bootstrap path does **not** require the remote machine to know `LAZYTEAM_PUBLIC_URL` or the shared enrollment secret in advance:
+Published releases include two multi-architecture container images. Both publish `linux/amd64` and `linux/arm64` manifests:
+
+```text
+ghcr.io/darkautism/lazyteam:latest         # control-plane server
+ghcr.io/darkautism/lazyteam-worker:latest  # worker daemon + Git + Node/Pi + rootfs tooling
+```
+
+The worker image pins the same Pi distribution used by LazyTeam's live worker (`@earendil-works/pi-coding-agent@0.85.1`) and contains the host tools needed to build the per-capability Ubuntu agent rootfs. It does not contain project credentials; worker identity, Pi credentials, agent rootfs generations, and sessions live under `/app/state`, while trusted Git workspaces live under `/app/workspaces`.
+
+For a containerized worker, generate a join code in the private UI and run:
+
+```sh
+export LAZYTEAM_WORKER_JOIN_CODE='<ltj1...>'
+export LAZYTEAM_WORKER_NAME='worker-01'
+export LAZYTEAM_WORKER_SLOTS=1
+docker compose -f docker-compose.worker.yml up -d
+```
+
+The worker container is outbound-only and exposes no port. Its embedded agent sandbox needs Linux user/mount namespaces; the supplied Compose profile keeps the daemon non-root after volume initialization and relaxes the outer Docker seccomp/AppArmor filters so the worker can create its **inner** rootless namespace sandbox. LazyTeam still fails closed if that inner filesystem/seccomp sandbox cannot be established. Hosts that disable unprivileged user namespaces must enable them before using the worker container.
+
+For a native worker, `git`, Pi, and the rootfs-builder host tools must be installed on the machine. The preferred bootstrap path does **not** require the remote machine to know `LAZYTEAM_PUBLIC_URL` or the shared enrollment secret in advance:
 
 1. Open the private `/ui`, enter the admin token, and click **Generate join code**.
 2. Copy the generated 10-minute `ltj1...` code to the worker machine.
