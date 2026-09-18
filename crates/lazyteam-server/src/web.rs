@@ -98,6 +98,8 @@ mod tests {
         assert!(INDEX.contains("worker-capability-status"));
         assert!(INDEX.contains("/api/worker-capabilities"));
         assert!(INDEX.contains("selectedManagedCapabilities"));
+        assert!(INDEX.contains("managedCapabilitiesDirty"));
+        assert!(INDEX.contains("onchange=\"managedCapabilitiesDirty=true\""));
         assert!(INDEX.contains("Adding tools rebuilds the agent container"));
         assert!(INDEX.contains("pending and will not claim tasks or reviews"));
         assert!(INDEX.contains("worker-config-agent"));
@@ -124,6 +126,10 @@ mod tests {
         assert!(!INDEX.contains("STATIC_MODELS"));
         assert!(!INDEX.contains("STATIC_PROVIDERS"));
         assert!(INDEX.contains("project-reviewer-prompt"));
+        assert!(INDEX.contains("Advanced review"));
+        assert!(INDEX.contains("Reviewer workers are configured separately"));
+        assert!(!INDEX.contains("· contributor "));
+        assert!(!INDEX.contains("review ChatGPT / MCP ·"));
         assert!(INDEX.contains("project-contributor-name"));
         assert!(INDEX.contains("project-contributor-email"));
         assert!(INDEX.contains("contributor:{name:"));
