@@ -400,7 +400,7 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
                 std::io::Error::last_os_error()
             );
         }
-        if read_only {
+        if read_only && metadata.is_dir() {
             if unsafe {
                 libc::mount(
                     std::ptr::null(),
@@ -412,6 +412,15 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
             } != 0
             {
                 bail!("remount {} read-only failed: {}", destination.display(), std::io::Error::last_os_error());
+            }
+        } else if read_only {
+            // Some vendor kernels reject MS_REMOUNT|MS_RDONLY on a bind-mounted file even
+            // inside a user-owned mount namespace.  These explicit file rules are system
+            // resolver/host config targets owned by host root; namespace uid 0 maps to the
+            // unprivileged worker uid, so normal inode permissions keep them non-writable.
+            let writable = unsafe { libc::access(source_c.as_ptr(), libc::W_OK) } == 0;
+            if writable {
+                bail!("read-only sandbox file is writable by the worker: {}", source.display());
             }
         }
         Ok(())
