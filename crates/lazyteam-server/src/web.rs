@@ -63,6 +63,41 @@ mod tests {
         assert!(INDEX.contains("min-width:0;overflow:hidden"));
         assert!(INDEX.contains(".card{"));
         assert!(INDEX.contains("max-width:100%;overflow:hidden"));
+        // Plain-text summary cleanup: strip Markdown markers and collapse whitespace
+        // at render time only; stored result data is untouched.
+        assert!(INDEX.contains("plainSummary"));
+        assert!(INDEX.contains("esc(plainSummary(summary))"));
+        assert!(INDEX.contains("/\\s+/g"));
+        // Configure worker: compact sectioned layout with preserved field IDs/behavior.
+        assert!(INDEX.contains("config-section"));
+        assert!(INDEX.contains("config-section-title"));
+        assert!(INDEX.contains("aria-label=\"Identity\""));
+        assert!(INDEX.contains("aria-label=\"Scope\""));
+        assert!(INDEX.contains("aria-label=\"Agent runtime\""));
+        assert!(INDEX.contains("aria-label=\"Prompt\""));
+        assert!(INDEX.contains(">Identity<"));
+        assert!(INDEX.contains(">Scope<"));
+        assert!(INDEX.contains(">Agent runtime<"));
+        assert!(INDEX.contains(">Prompt<"));
+        assert!(INDEX.contains("identity-grid"));
+        assert!(INDEX.contains("scope-grid"));
+        assert!(INDEX.contains("runtime-grid"));
+        assert!(INDEX.contains("worker-config-prompt-details"));
+        assert!(INDEX.contains("config-prompt"));
+        assert!(INDEX.contains("worker-config-name"));
+        assert!(INDEX.contains("worker-config-role"));
+        assert!(INDEX.contains("worker-config-slots"));
+        assert!(INDEX.contains("worker-config-projects"));
+        assert!(INDEX.contains("worker-config-tags"));
+        assert!(INDEX.contains("worker-config-agent"));
+        assert!(INDEX.contains("worker-agent-status"));
+        assert!(INDEX.contains("worker-config-prompt"));
+        assert!(INDEX.contains("worker-provider-auth"));
+        assert!(INDEX.contains("renderProviderAuth"));
+        assert!(INDEX.contains("onWorkerRoleChange"));
+        assert!(INDEX.contains("renderWorkerModels"));
+        assert!(INDEX.contains("renderAgentCatalog"));
+        assert!(INDEX.contains("saveWorkerConfig"));
         assert!(INDEX.contains("card-title"));
         assert!(INDEX.contains("white-space:nowrap"));
         assert!(INDEX.contains("height:calc(1.35em * 3)"));
