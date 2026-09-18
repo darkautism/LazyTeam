@@ -7,7 +7,7 @@ use lazyteam_core::{AgentCapabilities, AgentConfig, AgentRole, Assignment, Execu
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::{process::Command, time::{sleep, Instant}};
+use tokio::{process::Command, task::JoinSet, time::{sleep, Instant}};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -55,6 +55,9 @@ struct Args {
     /// Verify the embedded Linux agent sandbox and exit without contacting the server.
     #[arg(long)]
     sandbox_diagnose: bool,
+    /// Probe Pi providers/models through the real Ubuntu container + inner sandbox and exit.
+    #[arg(long)]
+    capabilities_diagnose: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,11 +69,15 @@ struct WorkerJoinPayload {
 struct WorkerRuntimeConfig {
     role: AgentRole,
     agent: AgentConfig,
+    #[serde(default = "default_runtime_slots")]
+    slots: u32,
     #[serde(default)]
     managed_capabilities: BTreeSet<String>,
     #[serde(default)]
     installed_capabilities: BTreeSet<String>,
 }
+
+fn default_runtime_slots() -> u32 { 1 }
 
 #[derive(Deserialize)]
 struct AgentAuthDelivery {
@@ -236,6 +243,21 @@ async fn async_main() -> anyhow::Result<()> {
         println!("LazyTeam agent sandbox {}", agent_sandbox.diagnostic_summary());
         return Ok(());
     }
+    if args.capabilities_diagnose {
+        let runtime = PiRuntime {
+            binary: args.pi_bin.clone(),
+            provider: None,
+            model: None,
+            session_dir: None,
+            sandbox: agent_sandbox.clone(),
+        };
+        let capabilities = runtime.capabilities().await;
+        println!("{}", serde_json::to_string_pretty(&capabilities)?);
+        if let Some(error) = capabilities.probe_error {
+            bail!("Pi capability diagnostic failed: {error}");
+        }
+        return Ok(());
+    }
     let worker_id = load_or_create_worker_id(&args.state_dir).await?;
     let join_server = args.join_code.as_deref().map(parse_join_code_server).transpose()?;
     let explicit_server = args.server.as_deref().map(normalize_server).transpose()?;
@@ -321,8 +343,16 @@ async fn async_main() -> anyhow::Result<()> {
         warn!(%error, "agent capability refresh after rootfs reconciliation failed");
     }
     let mut next_capability_probe = Instant::now() + Duration::from_secs(60);
+    let mut active_jobs = JoinSet::<anyhow::Result<()>>::new();
 
     loop {
+        while let Some(result) = active_jobs.try_join_next() {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => error!(%error, "slot execution failed"),
+                Err(error) => error!(%error, "slot task panicked or was cancelled"),
+            }
+        }
         if let Err(error) = heartbeat(&client, &server, &worker_credential, worker_id).await {
             warn!(%error, "heartbeat failed");
             sleep(Duration::from_secs(5)).await;
@@ -370,65 +400,121 @@ async fn async_main() -> anyhow::Result<()> {
             continue;
         }
         if agent_capabilities.models.is_empty() {
-            tracing::debug!("worker has no usable Pi models yet; waiting for explicit provider credentials");
-            sleep(Duration::from_secs(3)).await;
+            tracing::debug!(active = active_jobs.len(), "worker has no usable Pi models yet; not claiming new work");
+            sleep(Duration::from_secs(if active_jobs.is_empty() { 3 } else { 1 })).await;
             continue;
         }
-        match runtime_config.role {
-            AgentRole::Worker => match claim(&client, &server, &worker_credential, worker_id).await {
-                Ok(Some(assignment)) => {
-                    info!(task = %assignment.task.id, execution = %assignment.execution.id, project = %assignment.project.slug, "claimed implementation task");
-                    let session_dir = args.state_dir.join("sessions").join(assignment.task.id.to_string());
-                    let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir, agent_sandbox.clone()) {
-                        Ok(runtime) => runtime,
-                        Err(error) => { error!(%error, "invalid agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
-                    };
-                    info!(role = "worker", agent = runtime.kind(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "starting agent runtime");
-                    if let Err(error) = execute_assignment(
-                        &client,
-                        &server,
-                        &worker_credential,
-                        &args.workspace_dir,
-                        &args.state_dir,
-                        &agent_sandbox,
-                        runtime,
-                        &runtime_config.agent.initial_prompt,
-                        assignment,
-                    ).await {
-                        error!(%error, "assignment execution failed");
+
+        let max_slots = runtime_config.slots.max(1) as usize;
+        while active_jobs.len() < max_slots {
+            let claimed = match runtime_config.role {
+                AgentRole::Worker => match claim(&client, &server, &worker_credential, worker_id).await {
+                    Ok(Some(assignment)) => {
+                        let task_id = assignment.task.id;
+                        let execution_id = assignment.execution.id;
+                        let project_slug = assignment.project.slug.clone();
+                        info!(task = %task_id, execution = %execution_id, project = %project_slug, active = active_jobs.len() + 1, slots = max_slots, "claimed implementation slot");
+                        let session_dir = args.state_dir.join("sessions").join(task_id.to_string());
+                        let runtime = match runtime_for_config(
+                            &runtime_config.agent,
+                            &pi_bin,
+                            legacy_provider.as_deref(),
+                            legacy_model.as_deref(),
+                            session_dir,
+                            agent_sandbox.clone(),
+                        ) {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                error!(%error, %execution_id, "invalid agent configuration for claimed slot");
+                                break;
+                            }
+                        };
+                        info!(role = "worker", agent = runtime.kind(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, %execution_id, "starting isolated slot runtime");
+                        let slot_client = client.clone();
+                        let slot_server = server.clone();
+                        let slot_credential = worker_credential.clone();
+                        let slot_workspace_root = args.workspace_dir.clone();
+                        let slot_state_dir = args.state_dir.clone();
+                        let slot_sandbox = agent_sandbox.clone();
+                        let slot_prompt = runtime_config.agent.initial_prompt.clone();
+                        active_jobs.spawn(async move {
+                            execute_assignment(
+                                &slot_client,
+                                &slot_server,
+                                &slot_credential,
+                                &slot_workspace_root,
+                                &slot_state_dir,
+                                &slot_sandbox,
+                                runtime,
+                                &slot_prompt,
+                                assignment,
+                            ).await.with_context(|| format!("execution {execution_id} task {task_id} project {project_slug}"))
+                        });
+                        true
                     }
-                }
-                Ok(None) => sleep(Duration::from_secs(3)).await,
-                Err(error) => { warn!(%error, "implementation claim failed"); sleep(Duration::from_secs(5)).await; }
-            },
-            AgentRole::Reviewer => match claim_review(&client, &server, &worker_credential, worker_id).await {
-                Ok(Some(assignment)) => {
-                    info!(task = %assignment.task.id, review = %assignment.review.id, project = %assignment.project.slug, "claimed review");
-                    let session_dir = args.state_dir.join("review-sessions").join(assignment.review.id.to_string());
-                    let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir.clone(), agent_sandbox.clone()) {
-                        Ok(runtime) => runtime,
-                        Err(error) => { error!(%error, "invalid reviewer agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
-                    };
-                    info!(role = "reviewer", agent = runtime.kind(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "starting reviewer runtime");
-                    if let Err(error) = execute_review_assignment(
-                        &client,
-                        &server,
-                        &worker_credential,
-                        &args.workspace_dir,
-                        &args.state_dir,
-                        &agent_sandbox,
-                        runtime,
-                        &runtime_config.agent.initial_prompt,
-                        assignment,
-                    ).await {
-                        error!(%error, "review execution failed");
+                    Ok(None) => false,
+                    Err(error) => {
+                        warn!(%error, "implementation claim failed");
+                        false
                     }
-                    if session_dir.exists() { let _ = tokio::fs::remove_dir_all(session_dir).await; }
-                }
-                Ok(None) => sleep(Duration::from_secs(3)).await,
-                Err(error) => { warn!(%error, "review claim failed"); sleep(Duration::from_secs(5)).await; }
-            },
+                },
+                AgentRole::Reviewer => match claim_review(&client, &server, &worker_credential, worker_id).await {
+                    Ok(Some(assignment)) => {
+                        let task_id = assignment.task.id;
+                        let review_id = assignment.review.id;
+                        let project_slug = assignment.project.slug.clone();
+                        info!(task = %task_id, review = %review_id, project = %project_slug, active = active_jobs.len() + 1, slots = max_slots, "claimed review slot");
+                        let session_dir = args.state_dir.join("review-sessions").join(review_id.to_string());
+                        let runtime = match runtime_for_config(
+                            &runtime_config.agent,
+                            &pi_bin,
+                            legacy_provider.as_deref(),
+                            legacy_model.as_deref(),
+                            session_dir.clone(),
+                            agent_sandbox.clone(),
+                        ) {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                error!(%error, %review_id, "invalid reviewer agent configuration for claimed slot");
+                                break;
+                            }
+                        };
+                        info!(role = "reviewer", agent = runtime.kind(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, %review_id, "starting isolated slot runtime");
+                        let slot_client = client.clone();
+                        let slot_server = server.clone();
+                        let slot_credential = worker_credential.clone();
+                        let slot_workspace_root = args.workspace_dir.clone();
+                        let slot_state_dir = args.state_dir.clone();
+                        let slot_sandbox = agent_sandbox.clone();
+                        let slot_prompt = runtime_config.agent.initial_prompt.clone();
+                        active_jobs.spawn(async move {
+                            let result = execute_review_assignment(
+                                &slot_client,
+                                &slot_server,
+                                &slot_credential,
+                                &slot_workspace_root,
+                                &slot_state_dir,
+                                &slot_sandbox,
+                                runtime,
+                                &slot_prompt,
+                                assignment,
+                            ).await.with_context(|| format!("review {review_id} task {task_id} project {project_slug}"));
+                            if session_dir.exists() { let _ = tokio::fs::remove_dir_all(session_dir).await; }
+                            result
+                        });
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        warn!(%error, "review claim failed");
+                        false
+                    }
+                },
+            };
+            if !claimed { break; }
         }
+
+        sleep(Duration::from_secs(if active_jobs.is_empty() { 3 } else { 1 })).await;
     }
 }
 
@@ -901,9 +987,7 @@ async fn execute_assignment(
 }
 
 async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
-    let workspace = workspace_root
-        .join(&assignment.project.slug)
-        .join(assignment.task.id.to_string());
+    let workspace = trusted_task_workspace(workspace_root, &assignment.project.slug, assignment.task.id);
     let base_sha = prepare_workspace(&workspace, assignment, git_auth).await?;
     let agent_workspace = sandbox.agent_workspace(assignment.task.id);
     prepare_agent_workspace(&workspace, &agent_workspace).await?;
@@ -971,6 +1055,10 @@ fn bounded_review_patch(mut patch: String, max_bytes: usize) -> (String, bool) {
     patch.truncate(end);
     patch.push_str("\n\n[LazyTeam review patch truncated]\n");
     (patch, true)
+}
+
+fn trusted_task_workspace(workspace_root: &Path, project_slug: &str, task_id: Uuid) -> PathBuf {
+    workspace_root.join(project_slug).join(task_id.to_string())
 }
 
 fn task_branch(assignment: &Assignment) -> String {
@@ -1126,6 +1214,30 @@ async fn persist_worker_credential(dir: &Path, credential: &str) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_config_defaults_legacy_server_to_one_slot() {
+        let config: WorkerRuntimeConfig = serde_json::from_value(json!({
+            "role": "worker",
+            "agent": {"agent_type":"pi","provider":null,"model":null,"initial_prompt":"prompt"},
+            "managed_capabilities": [],
+            "installed_capabilities": []
+        })).unwrap();
+        assert_eq!(config.slots, 1);
+    }
+
+    #[test]
+    fn trusted_slot_paths_are_project_and_task_isolated() {
+        let root = Path::new("/tmp/lazyteam-workspaces");
+        let task_a = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+        let workspace_a = trusted_task_workspace(root, "project-a", task_a);
+        let workspace_b = trusted_task_workspace(root, "project-b", task_b);
+        assert_ne!(workspace_a, workspace_b);
+        assert!(workspace_a.ends_with(Path::new("project-a").join(task_a.to_string())));
+        assert!(workspace_b.ends_with(Path::new("project-b").join(task_b.to_string())));
+        assert_ne!(format!("lazyteam/task-{}", task_a.simple()), format!("lazyteam/task-{}", task_b.simple()));
+    }
 
     #[test]
     fn join_code_supplies_remote_server_endpoint() {

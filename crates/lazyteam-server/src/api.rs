@@ -211,6 +211,7 @@ struct UpdateWorker {
 struct WorkerRuntimeConfig {
     role: AgentRole,
     agent: AgentConfig,
+    slots: u32,
     managed_capabilities: BTreeSet<String>,
     installed_capabilities: BTreeSet<String>,
 }
@@ -704,6 +705,7 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
     Ok(Json(WorkerRuntimeConfig {
         role: worker.role,
         agent: worker.agent,
+        slots: worker.slots.max(1),
         managed_capabilities: worker.managed_capabilities,
         installed_capabilities: worker.installed_capabilities,
     }))

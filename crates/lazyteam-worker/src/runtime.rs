@@ -163,11 +163,11 @@ impl AgentRuntime for PiRuntime {
                 let mut errors = Vec::new();
                 let providers = match providers {
                     Ok(value) => value,
-                    Err(error) => { errors.push(format!("provider catalog: {error}")); vec![] }
+                    Err(error) => { errors.push(format!("provider catalog: {error:#}")); vec![] }
                 };
                 let models = match models {
                     Ok(value) => value,
-                    Err(error) => { errors.push(format!("model catalog: {error}")); vec![] }
+                    Err(error) => { errors.push(format!("model catalog: {error:#}")); vec![] }
                 };
                 AgentCapabilities {
                     model_discovery: true,

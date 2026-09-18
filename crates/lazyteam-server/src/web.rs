@@ -87,6 +87,10 @@ mod tests {
         assert!(INDEX.contains("worker-config-name"));
         assert!(INDEX.contains("worker-config-role"));
         assert!(INDEX.contains("worker-config-slots"));
+        assert!(INDEX.contains("identity-help"));
+        assert!(INDEX.contains("align-items:start"));
+        assert!(INDEX.contains("Slots are concurrent isolated assignments on this worker"));
+        assert!(INDEX.contains("each slot gets its own container, workspace, execution ID, and task branch"));
         assert!(INDEX.contains("worker-config-projects"));
         assert!(INDEX.contains("worker-config-tags"));
         assert!(INDEX.contains("worker-system-tags"));
