@@ -56,6 +56,39 @@ mod tests {
         assert!(INDEX.contains("-webkit-line-clamp:3"));
         assert!(INDEX.contains("-webkit-box-orient:vertical"));
         assert!(INDEX.contains("text-overflow:ellipsis"));
+        // Plain-text summary cleanup: strip Markdown markers and collapse whitespace
+        // at render time only; stored result data is untouched.
+        assert!(INDEX.contains("plainSummary"));
+        assert!(INDEX.contains("esc(plainSummary(summary))"));
+        assert!(INDEX.contains("/\\s+/g"));
+        // Configure worker: compact sectioned layout with preserved field IDs/behavior.
+        assert!(INDEX.contains("config-section"));
+        assert!(INDEX.contains("config-section-title"));
+        assert!(INDEX.contains("aria-label=\"Identity\""));
+        assert!(INDEX.contains("aria-label=\"Scope\""));
+        assert!(INDEX.contains("aria-label=\"Agent runtime\""));
+        assert!(INDEX.contains("aria-label=\"Prompt\""));
+        assert!(INDEX.contains(">Identity<"));
+        assert!(INDEX.contains(">Scope<"));
+        assert!(INDEX.contains(">Agent runtime<"));
+        assert!(INDEX.contains(">Prompt<"));
+        assert!(INDEX.contains("identity-grid"));
+        assert!(INDEX.contains("scope-grid"));
+        assert!(INDEX.contains("runtime-grid"));
+        assert!(INDEX.contains("worker-config-prompt-details"));
+        assert!(INDEX.contains("config-prompt"));
+        assert!(INDEX.contains("worker-config-name"));
+        assert!(INDEX.contains("worker-config-role"));
+        assert!(INDEX.contains("worker-config-slots"));
+        assert!(INDEX.contains("worker-config-projects"));
+        assert!(INDEX.contains("worker-config-tags"));
+        assert!(INDEX.contains("worker-config-agent"));
+        assert!(INDEX.contains("worker-agent-status"));
+        assert!(INDEX.contains("worker-config-prompt"));
+        assert!(INDEX.contains("onWorkerRoleChange"));
+        assert!(INDEX.contains("renderWorkerModels"));
+        assert!(INDEX.contains("renderAgentCatalog"));
+        assert!(INDEX.contains("saveWorkerConfig"));
         assert!(INDEX.contains("card-title"));
         assert!(INDEX.contains("card-actions"));
         assert!(!INDEX.contains("worker-pill"));
