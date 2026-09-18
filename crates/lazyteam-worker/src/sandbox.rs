@@ -347,6 +347,7 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
     for source in &spec.read_write {
         bind_into_root(&root, source, false)?;
     }
+    mirror_root_symlinks(&root)?;
 
     let old_root = root.join(".oldroot");
     fs::create_dir_all(&old_root)?;
@@ -365,6 +366,27 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
     std::env::set_current_dir(&spec.working_dir)
         .with_context(|| format!("enter sandbox workspace {}", spec.working_dir.display()))?;
     return Ok(());
+
+    fn mirror_root_symlinks(root: &Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+        for name in ["bin", "sbin", "lib", "lib64"] {
+            let host = Path::new("/").join(name);
+            let metadata = match fs::symlink_metadata(&host) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).with_context(|| format!("stat root alias {}", host.display())),
+            };
+            if !metadata.file_type().is_symlink() { continue; }
+            let target = fs::read_link(&host).with_context(|| format!("read root alias {}", host.display()))?;
+            let destination = root.join(name);
+            if destination.exists() || fs::symlink_metadata(&destination).is_ok() {
+                fs::remove_file(&destination).with_context(|| format!("replace root alias {}", destination.display()))?;
+            }
+            symlink(&target, &destination)
+                .with_context(|| format!("mirror root alias {} -> {}", destination.display(), target.display()))?;
+        }
+        Ok(())
+    }
 
     fn c_path(path: &Path) -> anyhow::Result<CString> {
         CString::new(path.as_os_str().as_bytes()).context("sandbox path contains NUL")
