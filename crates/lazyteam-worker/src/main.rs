@@ -552,6 +552,7 @@ async fn prepare_review_workspace(path: &Path, assignment: &ReviewAssignment, gi
         bail!("review ref moved: expected {}, fetched {}", assignment.checkout.commit_sha, fetched);
     }
     command_ok(path, "git", &["checkout", "--detach", &assignment.checkout.commit_sha]).await?;
+    install_workspace_excludes(path).await?;
     command_ok(path, "git", &["remote", "set-url", "--push", "origin", "disabled://lazyteam-reviewer"]).await?;
     Ok(())
 }
@@ -741,6 +742,7 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
     if path.exists() {
         let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]).await?;
         if inside != "true" { bail!("existing task workspace is not a git repository"); }
+        install_workspace_excludes(path).await?;
         command_ok(path, "git", &["checkout", &branch]).await?;
         return git_output(path, &["rev-parse", &format!("refs/heads/{}", assignment.project.default_branch)]).await;
     }
@@ -752,11 +754,29 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
         git_auth,
     ).await?;
     let base = git_output(path, &["rev-parse", "HEAD"]).await?;
+    install_workspace_excludes(path).await?;
     command_ok(path, "git", &["checkout", "-b", &branch]).await?;
     Ok(base)
 }
 
+async fn install_workspace_excludes(path: &Path) -> anyhow::Result<()> {
+    let git_dir = git_output(path, &["rev-parse", "--git-dir"]).await?;
+    let git_dir = if Path::new(&git_dir).is_absolute() { PathBuf::from(git_dir) } else { path.join(git_dir) };
+    let exclude = git_dir.join("info").join("exclude");
+    if let Some(parent) = exclude.parent() { tokio::fs::create_dir_all(parent).await?; }
+    let mut current = tokio::fs::read_to_string(&exclude).await.unwrap_or_default();
+    const MARKER: &str = "# LazyTeam local generated artifacts";
+    if !current.contains(MARKER) {
+        if !current.is_empty() && !current.ends_with('\n') { current.push('\n'); }
+        current.push_str(MARKER);
+        current.push_str("\ntarget/\nnode_modules/\n__pycache__/\n.pytest_cache/\n.venv/\n*.pyc\n");
+        tokio::fs::write(exclude, current).await?;
+    }
+    Ok(())
+}
+
 async fn auto_commit(path: &Path, assignment: &Assignment) -> anyhow::Result<()> {
+    command_ok(path, "git", &["reset"]).await?;
     command_ok(path, "git", &["add", "-A"]).await?;
     let status = Command::new("git").args(["diff", "--cached", "--quiet"]).current_dir(path).status().await?;
     if status.success() { return Ok(()); }
