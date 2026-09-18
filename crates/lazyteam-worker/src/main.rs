@@ -505,7 +505,9 @@ async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial
     let prompt = build_prompt(initial_prompt, assignment);
     let session_name = assignment.task.id.to_string();
     let agent = runtime.run(&workspace, &prompt, &session_name).await?;
-    auto_commit(&workspace, assignment).await?;
+    if !auto_commit(&workspace, assignment).await? {
+        bail!("agent completed without producing any tracked change");
+    }
     let commit_sha = Some(git_output(&workspace, &["rev-parse", "HEAD"]).await?);
     let review_ref = task_branch(assignment);
     command_ok_with_auth(&workspace, "git", &["push", "origin", &format!("HEAD:refs/heads/{review_ref}")], git_auth).await?;
@@ -584,15 +586,16 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
     Ok(base)
 }
 
-async fn auto_commit(path: &Path, assignment: &Assignment) -> anyhow::Result<()> {
+async fn auto_commit(path: &Path, assignment: &Assignment) -> anyhow::Result<bool> {
     command_ok(path, "git", &["add", "-A"]).await?;
     let status = Command::new("git").args(["diff", "--cached", "--quiet"]).current_dir(path).status().await?;
-    if status.success() { return Ok(()); }
+    if status.success() { return Ok(false); }
     command_ok(path, "git", &[
         "-c", "user.name=LazyTeam Worker",
         "-c", "user.email=lazyteam@local",
         "commit", "-m", &format!("lazyteam: {}", assignment.task.title),
-    ]).await
+    ]).await?;
+    Ok(true)
 }
 
 async fn git_output(path: &Path, args: &[&str]) -> anyhow::Result<String> {
