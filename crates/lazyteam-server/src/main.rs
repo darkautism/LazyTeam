@@ -145,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         public_url,
         oauth_password: args.oauth_password,
         git_credential_key,
+        agent_auth_updates: Default::default(),
     });
 
     let mcp_state = state.clone();
@@ -261,6 +262,7 @@ mod tests {
             public_url: Some("https://lazyteam.example.test".to_string()),
             oauth_password: None,
             git_credential_key: None,
+            agent_auth_updates: Default::default(),
         });
         let mcp_state = state.clone();
         let service = StreamableHttpService::new(

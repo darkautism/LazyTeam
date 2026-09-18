@@ -107,8 +107,16 @@ def main():
     expect(re.search(r"main agent.*merge|merge.*main agent", ui, re.I),
            "MergePending must indicate the main-agent merge handoff")
 
-    # 9. Backend review scheduling/runtime files must be untouched by UI work
-    #    (guarded by task contract; informational only here).
+    # 9. Fresh-worker provider auth uses Pi-reported capability data and a write-only API-key handoff.
+    expect('id="worker-provider-api-key"' in ui, "provider API-key input missing")
+    expect("caps.providers||[]" in ui, "provider picker must use worker/Pi-reported provider metadata")
+    expect("/provider-key" in ui, "provider API key must be sent through the dedicated write-only endpoint")
+    expect("API keys are write-only" in ui, "UI must explain provider key write-only semantics")
+    expect("STATIC_PROVIDERS" not in ui and "STATIC_MODELS" not in ui,
+           "UI must not contain mock/static provider or model catalogs")
+
+    # 10. Backend review scheduling/runtime files must be untouched by UI work
+    #     (guarded by task contract; informational only here).
     print("Management UI regression test passed")
 
 

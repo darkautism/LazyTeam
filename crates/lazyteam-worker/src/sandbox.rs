@@ -53,8 +53,6 @@ impl AgentSandbox {
             tokio::fs::create_dir_all(dir).await?;
             set_private_dir(dir).await?;
         }
-        import_pi_config_if_needed(&pi_config_dir).await?;
-
         let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
         let mut read_only = BTreeSet::new();
         for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
@@ -136,6 +134,29 @@ impl AgentSandbox {
 
     pub fn diagnostic_summary(&self) -> &'static str {
         "ready: filesystem isolation (Landlock or rootless user/mount namespace) + seccomp denylist"
+    }
+
+    pub async fn store_pi_api_key(&self, provider: &str, api_key: &str) -> anyhow::Result<()> {
+        let provider = provider.trim();
+        if provider.is_empty() || api_key.trim().is_empty() {
+            bail!("provider and API key are required");
+        }
+        let auth_path = self.pi_config_dir.join("auth.json");
+        let mut root = match tokio::fs::read(&auth_path).await {
+            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .context("parse isolated Pi auth.json")?,
+            Ok(_) => serde_json::json!({}),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(error) => return Err(error).context("read isolated Pi auth.json"),
+        };
+        let object = root.as_object_mut().context("isolated Pi auth.json must contain a JSON object")?;
+        object.insert(provider.to_string(), serde_json::json!({"type":"api_key","key":api_key}));
+        let tmp_path = self.pi_config_dir.join(format!("auth.json.tmp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&tmp_path, serde_json::to_vec_pretty(&root)?).await?;
+        set_private_file(&tmp_path).await?;
+        tokio::fs::rename(&tmp_path, &auth_path).await?;
+        set_private_file(&auth_path).await?;
+        Ok(())
     }
 
     pub fn command(&self, program: &str, workspace: &Path, session_dir: Option<&Path>) -> anyhow::Result<Command> {
@@ -580,22 +601,6 @@ fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
 
 fn canonical_dir(path: &Path) -> anyhow::Result<PathBuf> {
     std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))
-}
-
-async fn import_pi_config_if_needed(destination: &Path) -> anyhow::Result<()> {
-    let source = std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi").join("agent")));
-    let Some(source) = source.filter(|path| path != destination && path.is_dir()) else { return Ok(()); };
-    for name in ["auth.json", "settings.json", "models-store.json"] {
-        let from = source.join(name);
-        let to = destination.join(name);
-        if !to.exists() && from.is_file() {
-            tokio::fs::copy(&from, &to).await?;
-            set_private_file(&to).await?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(unix)]

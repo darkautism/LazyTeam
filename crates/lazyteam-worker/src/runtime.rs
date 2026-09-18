@@ -2,7 +2,7 @@ use std::{path::{Path, PathBuf}, process::Stdio};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use lazyteam_core::{AgentCapabilities, AgentLoginMode, AgentModel, AgentModelCost};
+use lazyteam_core::{AgentCapabilities, AgentLoginMode, AgentModel, AgentModelCost, AgentProvider};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -47,6 +47,64 @@ fn agent_model_from_pi(model: &Value) -> Option<AgentModel> {
 }
 
 impl PiRuntime {
+    fn pi_module_index(&self) -> anyhow::Result<PathBuf> {
+        let binary = if Path::new(&self.binary).components().count() > 1 {
+            PathBuf::from(&self.binary)
+        } else {
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join(&self.binary))
+                .find(|candidate| candidate.is_file())
+                .context("locate Pi executable on PATH")?
+        };
+        let target = std::fs::canonicalize(&binary)
+            .with_context(|| format!("canonicalize Pi executable {}", binary.display()))?;
+        let package_root = target.ancestors().nth(3)
+            .context("Pi executable layout does not expose package root")?;
+        let index = package_root.join("dist").join("index.js");
+        if !index.is_file() {
+            bail!("Pi public module not found at {}", index.display());
+        }
+        Ok(index)
+    }
+
+    async fn probe_providers(&self) -> anyhow::Result<Vec<AgentProvider>> {
+        let index = self.pi_module_index()?;
+        let import_url = format!("file://{}", index.display());
+        let import_url = serde_json::to_string(&import_url)?;
+        let script = format!(
+            r#"import {{ ModelRuntime }} from {import_url};
+const dir=process.env.PI_CODING_AGENT_DIR;
+const rt=await ModelRuntime.create({{
+  authPath:dir+"/auth.json",
+  modelsPath:dir+"/models.json",
+  modelsStorePath:dir+"/models-store.json",
+  allowModelNetwork:false,
+  refreshOnCreate:false
+}});
+const providers=rt.getProviders().map(p=>({{
+  id:p.id,
+  name:p.name,
+  configured:!!rt.getProviderAuthStatus(p.id)?.configured,
+  api_key_label:p.auth?.apiKey?.name??null,
+  oauth_label:p.auth?.oauth?.name??null
+}}));
+console.log(JSON.stringify(providers));"#
+        );
+        let sandbox = self.sandbox.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
+            command.arg("--input-type=module").arg("--eval").arg(script);
+            command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = command.output().await.context("run Pi ModelRuntime provider probe")?;
+            if !output.status.success() {
+                bail!("Pi provider probe failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+            }
+            let providers = serde_json::from_slice::<Vec<AgentProvider>>(&output.stdout)
+                .context("parse Pi provider probe output")?;
+            Ok(providers)
+        }).await.context("Pi provider probe timed out")?
+    }
+
     async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
         let binary = self.binary.clone();
         let sandbox = self.sandbox.clone();
@@ -90,19 +148,34 @@ impl AgentRuntime for PiRuntime {
     fn kind(&self) -> &'static str { "pi" }
 
     async fn capabilities(&self) -> AgentCapabilities {
-        match self.probe_models().await {
-            Ok(models) => AgentCapabilities {
+        let providers = self.probe_providers().await;
+        let models = self.probe_models().await;
+        match (providers, models) {
+            (Ok(providers), Ok(models)) => AgentCapabilities {
                 model_discovery: true,
-                login_mode: AgentLoginMode::LocalInteractive,
+                login_mode: AgentLoginMode::Remote,
+                providers,
                 models,
                 probe_error: None,
             },
-            Err(error) => AgentCapabilities {
-                model_discovery: true,
-                login_mode: AgentLoginMode::LocalInteractive,
-                models: vec![],
-                probe_error: Some(error.to_string()),
-            },
+            (providers, models) => {
+                let mut errors = Vec::new();
+                let providers = match providers {
+                    Ok(value) => value,
+                    Err(error) => { errors.push(format!("provider catalog: {error}")); vec![] }
+                };
+                let models = match models {
+                    Ok(value) => value,
+                    Err(error) => { errors.push(format!("model catalog: {error}")); vec![] }
+                };
+                AgentCapabilities {
+                    model_discovery: true,
+                    login_mode: AgentLoginMode::Remote,
+                    providers,
+                    models,
+                    probe_error: (!errors.is_empty()).then(|| errors.join("; ")),
+                }
+            }
         }
     }
 

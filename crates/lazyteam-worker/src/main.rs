@@ -66,6 +66,13 @@ struct WorkerRuntimeConfig {
     agent: AgentConfig,
 }
 
+#[derive(Deserialize)]
+struct AgentAuthDelivery {
+    id: Uuid,
+    provider: String,
+    api_key: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkerCleanup {
     task_id: Uuid,
@@ -307,6 +314,23 @@ async fn async_main() -> anyhow::Result<()> {
         if let Err(error) = process_cleanup(&client, &server, &worker_credential, worker_id, &args.workspace_dir, &args.state_dir).await {
             warn!(%error, "post-merge cleanup poll failed");
         }
+        match poll_agent_auth(&client, &server, &worker_credential, worker_id).await {
+            Ok(Some(update)) => {
+                let provider = update.provider.clone();
+                if let Err(error) = agent_sandbox.store_pi_api_key(&update.provider, &update.api_key).await {
+                    error!(%error, provider = %provider, credential_update = %update.id, "failed to store provider API key");
+                } else {
+                    info!(provider = %provider, credential_update = %update.id, "provider API key stored in isolated Pi config");
+                    agent_capabilities = probe_runtime.capabilities().await;
+                    if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
+                        warn!(%error, "agent capability refresh after provider credential update failed");
+                    }
+                    next_capability_probe = Instant::now() + Duration::from_secs(60);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "provider credential poll failed"),
+        }
         if Instant::now() >= next_capability_probe {
             agent_capabilities = probe_runtime.capabilities().await;
             if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
@@ -317,6 +341,11 @@ async fn async_main() -> anyhow::Result<()> {
         match fetch_runtime_config(&client, &server, &worker_credential, worker_id).await {
             Ok(config) => runtime_config = config,
             Err(error) => warn!(%error, "worker runtime config refresh failed; using last known config"),
+        }
+        if agent_capabilities.models.is_empty() {
+            tracing::debug!("worker has no usable Pi models yet; waiting for explicit provider credentials");
+            sleep(Duration::from_secs(3)).await;
+            continue;
         }
         match runtime_config.role {
             AgentRole::Worker => match claim(&client, &server, &worker_credential, worker_id).await {
@@ -404,7 +433,7 @@ async fn register(
         "allowed_projects": allowed_projects,
         "slots": slots,
         "worker_version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": 3,
+        "protocol_version": 4,
         "agent_type": "pi",
         "agent_capabilities": agent_capabilities
     })).send().await?;
@@ -420,7 +449,7 @@ async fn register(
 
 async fn report_capabilities(client: &Client, server: &str, credential: &str, worker_id: Uuid, capabilities: &AgentCapabilities) -> anyhow::Result<()> {
     let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capabilities")), credential)
-        .header("x-lazyteam-worker-protocol-version", "3")
+        .header("x-lazyteam-worker-protocol-version", "4")
         .header("x-lazyteam-worker-version", env!("CARGO_PKG_VERSION"))
         .json(capabilities).send().await?;
     ensure_success(response).await?;
@@ -430,6 +459,12 @@ async fn report_capabilities(client: &Client, server: &str, credential: &str, wo
 async fn fetch_runtime_config(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<WorkerRuntimeConfig> {
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/config")), credential).send().await?;
     Ok(ensure_success(response).await?.json().await?)
+}
+
+async fn poll_agent_auth(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<Option<AgentAuthDelivery>> {
+    let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/agent-auth")), credential).send().await?;
+    if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
+    Ok(Some(ensure_success(response).await?.json().await?))
 }
 
 fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option<&str>, legacy_model: Option<&str>, session_dir: PathBuf, sandbox: AgentSandbox) -> anyhow::Result<Arc<dyn AgentRuntime>> {

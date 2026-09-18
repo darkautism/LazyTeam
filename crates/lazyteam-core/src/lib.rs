@@ -60,6 +60,18 @@ pub struct AgentModelCost {
     pub cache_write: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentProvider {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_label: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentModel {
     pub provider: String,
@@ -80,6 +92,8 @@ pub struct AgentCapabilities {
     pub model_discovery: bool,
     #[serde(default)]
     pub login_mode: AgentLoginMode,
+    #[serde(default)]
+    pub providers: Vec<AgentProvider>,
     #[serde(default)]
     pub models: Vec<AgentModel>,
     #[serde(default)]

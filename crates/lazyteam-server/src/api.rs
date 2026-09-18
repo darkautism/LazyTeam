@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::{BTreeSet, HashMap}, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -19,11 +19,11 @@ use lazyteam_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
-use tokio::time::interval;
+use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
 const MIN_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
@@ -37,6 +37,13 @@ pub(crate) struct AppState {
     pub(crate) public_url: Option<String>,
     pub(crate) oauth_password: Option<String>,
     pub(crate) git_credential_key: Option<[u8; 32]>,
+    pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, PendingAgentAuth>>>,
+}
+
+pub(crate) struct PendingAgentAuth {
+    id: Uuid,
+    provider: String,
+    api_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +199,26 @@ struct WorkerRuntimeConfig {
     agent: AgentConfig,
 }
 
+#[derive(Deserialize)]
+struct AgentApiKeyInput {
+    provider: String,
+    api_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentAuthQueued {
+    id: Uuid,
+    provider: String,
+    queued: bool,
+}
+
+#[derive(Serialize)]
+struct AgentAuthDelivery {
+    id: Uuid,
+    provider: String,
+    api_key: String,
+}
+
 fn default_slots() -> u32 { 1 }
 fn default_protocol() -> u32 { PROTOCOL_VERSION }
 fn default_agent_type() -> String { "pi".into() }
@@ -234,6 +261,8 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/worker-join", post(create_worker_join_code))
         .route("/api/workers/register", post(register_worker))
         .route("/api/workers/{id}/config", get(worker_runtime_config))
+        .route("/api/workers/{id}/provider-key", post(queue_worker_provider_key))
+        .route("/api/workers/{id}/agent-auth", get(worker_agent_auth))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
         .route("/api/workers/{id}/cleanup", get(worker_cleanup))
@@ -540,6 +569,55 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let worker = worker_from_row(&row)?;
     Ok(Json(WorkerRuntimeConfig { role: worker.role, agent: worker.agent }))
+}
+
+async fn queue_worker_provider_key(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<AgentApiKeyInput>,
+) -> ApiResult<AgentAuthQueued> {
+    let provider = input.provider.trim();
+    if provider.is_empty() || input.api_key.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "provider and API key are required".into()));
+    }
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
+    let worker = worker_from_row(&row)?;
+    if worker.protocol_version < 4 {
+        return Err((StatusCode::CONFLICT, "update/restart this worker with protocol 4 before configuring provider credentials".into()));
+    }
+    let candidate = worker.agent_capabilities.providers.iter()
+        .find(|candidate| candidate.id == provider)
+        .ok_or((StatusCode::BAD_REQUEST, "provider is not reported by this worker's Pi runtime".into()))?;
+    if candidate.api_key_label.is_none() {
+        return Err((StatusCode::BAD_REQUEST, "this provider does not expose API-key authentication in Pi".into()));
+    }
+    let update = PendingAgentAuth {
+        id: Uuid::new_v4(),
+        provider: provider.to_string(),
+        api_key: input.api_key,
+    };
+    let response = AgentAuthQueued { id: update.id, provider: update.provider.clone(), queued: true };
+    state.agent_auth_updates.lock().await.insert(id, update);
+    Ok(Json(response))
+}
+
+async fn worker_agent_auth(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let update = state.agent_auth_updates.lock().await.remove(&id);
+    match update {
+        Some(update) => Ok(Json(AgentAuthDelivery {
+            id: update.id,
+            provider: update.provider,
+            api_key: update.api_key,
+        }).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
 }
 
 async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(capabilities): Json<AgentCapabilities>) -> Result<StatusCode, ApiError> {
