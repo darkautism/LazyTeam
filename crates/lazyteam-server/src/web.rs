@@ -102,8 +102,12 @@ mod tests {
         assert!(INDEX.contains("white-space:nowrap"));
         assert!(INDEX.contains("height:calc(1.35em * 3)"));
         assert!(!INDEX.contains("card-actions"));
-        assert!(!INDEX.contains("worker-pill"));
-        assert!(!INDEX.contains("ChatGPT / MCP review"));
+        assert!(INDEX.contains("worker-pill"));
+        assert!(INDEX.contains("reviewer-pill"));
+        assert!(INDEX.contains("Working · "));
+        assert!(INDEX.contains("Review · "));
+        assert!(INDEX.contains("x.reviewer?.name"));
+        assert!(INDEX.contains("p?.reviewer?.mode==='mcp'"));
         assert!(!INDEX.contains("'unclaimed'"));
         assert!(!INDEX.contains("merge_pending</span>"));
         assert!(!INDEX.contains("STATIC_MODELS"));

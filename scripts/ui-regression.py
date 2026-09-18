@@ -101,11 +101,15 @@ def main():
     expect(">Approve<" not in ui and ">Retry<" not in ui,
            "board must not contain manual Approve/Retry buttons")
     expect(re.search(r"onclick=\"[^\"]*[Aa]pprove", ui) is None, "board must not wire Approve actions")
-    m = re.search(r"function mergeCard\(\s*x\s*\)\{([^}]*)\}", ui, re.S)
+    m = re.search(r"function mergeCard\(\s*x\s*,\s*pm\s*\)\{([^}]*)\}", ui, re.S)
     expect(m, "mergeCard renderer missing")
     expect("<button" not in m.group(1), "MergePending cards must have no action buttons")
     expect(re.search(r"main agent.*merge|merge.*main agent", ui, re.I),
            "MergePending must indicate the main-agent merge handoff")
+    expect("Working · " in ui and "worker-pill" in ui,
+           "Working cards must identify the assigned worker")
+    expect("Review · " in ui and "reviewer-pill" in ui,
+           "Review cards must identify the configured or active reviewer")
 
     # 9. Fresh-worker provider auth uses Pi-reported capability data and a write-only API-key handoff.
     expect('id="worker-provider-api-key"' in ui, "provider API-key input missing")

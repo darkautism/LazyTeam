@@ -105,6 +105,7 @@ pub(crate) struct WorkerRef {
 struct TaskBoardItem {
     task: Task,
     worker: Option<WorkerRef>,
+    reviewer: Option<WorkerRef>,
     result: Option<ExecutionResult>,
 }
 
@@ -466,7 +467,7 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
 }
 
 async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
-    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
+    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
         .fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(|row| {
         let task = task_from_row(row)?;
@@ -481,9 +482,25 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
         } else {
             None
         };
+        let reviewer_id: Option<String> = row.try_get("board_reviewer_id").map_err(internal)?;
+        let reviewer_name: Option<String> = row.try_get("board_reviewer_name").map_err(internal)?;
+        let review_state: Option<String> = row.try_get("board_review_state").map_err(internal)?;
+        let show_reviewer = match task.state {
+            TaskState::Review => matches!(review_state.as_deref(), Some("assigned") | Some("running")),
+            TaskState::MergePending => matches!(review_state.as_deref(), Some("completed")),
+            _ => false,
+        };
+        let reviewer = if show_reviewer {
+            match (reviewer_id, reviewer_name) {
+                (Some(id), Some(name)) => Some(WorkerRef { id: uuid(id)?, name }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let result: Option<String> = row.try_get("board_result").map_err(internal)?;
         let result = result.map(dejson).transpose()?;
-        Ok(TaskBoardItem { task, worker, result })
+        Ok(TaskBoardItem { task, worker, reviewer, result })
     }).collect::<Result<Vec<_>, ApiError>>().map(Json)
 }
 
