@@ -50,11 +50,46 @@ fn issuer(state: &AppState, headers: &HeaderMap) -> String {
     if let Some(url) = &state.public_url {
         return url.clone();
     }
+
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("127.0.0.1:8787");
-    format!("http://{host}")
+
+    // Reverse proxies and tunnels terminate TLS before forwarding to LazyTeam.
+    // Keep LAZYTEAM_PUBLIC_URL authoritative when configured, but when it is
+    // absent infer only the scheme from standard proxy headers while preserving
+    // the actual Host header seen by the request.
+    let forwarded_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("https"))
+        || headers
+            .get(header::FORWARDED)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';')
+                    .chain(v.split(','))
+                    .any(|part| part.trim().eq_ignore_ascii_case("proto=https"))
+            })
+        || headers
+            .get("x-forwarded-port")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim() == "443");
+
+    let authority_host = host
+        .parse::<axum::http::uri::Authority>()
+        .ok()
+        .map(|a| a.host().to_ascii_lowercase())
+        .unwrap_or_else(|| host.to_ascii_lowercase());
+    let local = matches!(
+        authority_host.as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    );
+
+    let scheme = if forwarded_https || !local { "https" } else { "http" };
+    format!("{scheme}://{host}")
 }
 
 fn resource_url(state: &AppState, headers: &HeaderMap) -> String {
