@@ -851,7 +851,7 @@ async fn install_workspace_excludes(path: &Path) -> anyhow::Result<()> {
 async fn auto_commit(path: &Path, assignment: &Assignment) -> anyhow::Result<()> {
     command_ok(path, "git", &["reset"]).await?;
     command_ok(path, "git", &["add", "-A"]).await?;
-    let status = Command::new("git").args(["diff", "--cached", "--quiet"]).current_dir(path).status().await?;
+    let status = trusted_git_command().args(["diff", "--cached", "--quiet"]).current_dir(path).status().await?;
     if status.success() { return Ok(()); }
     command_ok(path, "git", &[
         "-c", "user.name=LazyTeam Worker",
@@ -863,7 +863,7 @@ async fn auto_commit(path: &Path, assignment: &Assignment) -> anyhow::Result<()>
 async fn git_status_external_worktree(repo: &Path, worktree: &Path) -> anyhow::Result<String> {
     let git_dir = git_output(repo, &["rev-parse", "--git-dir"]).await?;
     let git_dir = if Path::new(&git_dir).is_absolute() { PathBuf::from(git_dir) } else { repo.join(git_dir) };
-    let output = Command::new("git")
+    let output = trusted_git_command()
         .arg("--git-dir").arg(&git_dir)
         .arg("--work-tree").arg(worktree)
         .args(["status", "--porcelain"])
@@ -874,20 +874,27 @@ async fn git_status_external_worktree(repo: &Path, worktree: &Path) -> anyhow::R
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+fn trusted_git_command() -> Command {
+    let mut command = Command::new("git");
+    command.args(["-c", "core.hooksPath=/dev/null"]);
+    command
+}
+
 async fn git_output(path: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = Command::new("git").args(args).current_dir(path).output().await?;
+    let output = trusted_git_command().args(args).current_dir(path).output().await?;
     if !output.status.success() { bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr)); }
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 async fn command_ok(path: &Path, program: &str, args: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new(program).args(args).current_dir(path).output().await?;
+    let mut command = if program == "git" { trusted_git_command() } else { Command::new(program) };
+    let output = command.args(args).current_dir(path).output().await?;
     if !output.status.success() { bail!("{program} {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr)); }
     Ok(())
 }
 
 async fn command_ok_with_auth(path: &Path, program: &str, args: &[&str], git_auth: &GitAuthContext) -> anyhow::Result<()> {
-    let mut command = Command::new(program);
+    let mut command = if program == "git" { trusted_git_command() } else { Command::new(program) };
     command.args(args).current_dir(path);
     git_auth.apply(&mut command);
     let output = command.output().await?;
@@ -1008,6 +1015,30 @@ mod tests {
         let header = auth.env.iter().find(|(key, _)| key == "GIT_CONFIG_VALUE_0").unwrap().1.clone();
         assert!(header.starts_with("Authorization: Basic "));
         assert!(!header.contains("example-value"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_git_commands_disable_repository_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("lazyteam-git-hooks-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        command_ok(&root, "git", &["init"]).await.unwrap();
+        command_ok(&root, "git", &["config", "user.name", "LazyTeam Test"]).await.unwrap();
+        command_ok(&root, "git", &["config", "user.email", "lazyteam-test@local"]).await.unwrap();
+        tokio::fs::write(root.join("tracked.txt"), b"safe\n").await.unwrap();
+        command_ok(&root, "git", &["add", "tracked.txt"]).await.unwrap();
+
+        let hook = root.join(".git").join("hooks").join("pre-commit");
+        tokio::fs::write(&hook, b"#!/bin/sh\ntouch \"$PWD/hook-ran\"\nexit 73\n").await.unwrap();
+        let mut permissions = tokio::fs::metadata(&hook).await.unwrap().permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&hook, permissions).await.unwrap();
+
+        command_ok(&root, "git", &["commit", "-m", "hook must stay disabled"]).await.unwrap();
+        assert!(!root.join("hook-ran").exists());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

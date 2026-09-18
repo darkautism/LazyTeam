@@ -220,6 +220,14 @@ impl AgentSandbox {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+
+        let mut command = self.command("/bin/sh", &self.probe_dir, None)?;
+        command.arg("-c").arg("if kill -0 \"$PPID\" 2>/dev/null; then exit 91; else exit 0; fi");
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let output = command.output().await.context("probe sandbox process isolation")?;
+        if !output.status.success() {
+            bail!("agent sandbox can signal its parent daemon; refusing to start");
+        }
         Ok(())
     }
 }
@@ -483,6 +491,14 @@ fn install_seccomp_denylist() -> anyhow::Result<()> {
         libc::SYS_setns,
         libc::SYS_unshare,
         libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_kill,
+        libc::SYS_tkill,
+        libc::SYS_tgkill,
+        libc::SYS_rt_sigqueueinfo,
+        libc::SYS_rt_tgsigqueueinfo,
+        libc::SYS_pidfd_send_signal,
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
     ];
