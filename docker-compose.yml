@@ -6,7 +6,7 @@ services:
       - "127.0.0.1:8787:8787"
     environment:
       LAZYTEAM_LISTEN: "0.0.0.0:8787"
-      LAZYTEAM_DATABASE_URL: "sqlite:///data/lazyteam.db?mode=rwc"
+      LAZYTEAM_DATABASE_URL: "sqlite:///app/data/lazyteam.db?mode=rwc"
       LAZYTEAM_PRODUCTION: "true"
       LAZYTEAM_PUBLIC_URL: "${LAZYTEAM_PUBLIC_URL:?set LAZYTEAM_PUBLIC_URL to your public https URL}"
       LAZYTEAM_OAUTH_PASSWORD: "${LAZYTEAM_OAUTH_PASSWORD:?set LAZYTEAM_OAUTH_PASSWORD}"
@@ -16,7 +16,8 @@ services:
       LAZYTEAM_ALLOWED_REDIRECT_HOSTS: "${LAZYTEAM_ALLOWED_REDIRECT_HOSTS:-chatgpt.com,*.chatgpt.com}"
       RUST_LOG: "${RUST_LOG:-lazyteam_server=info,tower_http=info}"
     volumes:
-      - lazyteam-data:/data
+      - lazyteam-data:/app/data
+      - lazyteam-workspaces:/app/workspaces
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -33,3 +34,4 @@ services:
 
 volumes:
   lazyteam-data:
+  lazyteam-workspaces:
