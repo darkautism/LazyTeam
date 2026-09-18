@@ -315,27 +315,39 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
     fs::create_dir_all(&root).with_context(|| format!("create namespace root {}", root.display()))?;
 
     // Some vendor kernels reject creating user+mount namespaces in one unshare(2)
-    // call even though util-linux `unshare --user --map-root-user --mount` works.  Match
-    // that safe ordering explicitly: create USER first, install uid/gid maps, become root
-    // only inside that user namespace, then create the MOUNT namespace.
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-        bail!("unshare user namespace failed: {}", std::io::Error::last_os_error());
+    // call even though util-linux `unshare --user --map-root-user --mount` works. Match
+    // that safe ordering explicitly. When the worker itself already runs as uid 0 inside
+    // a rootless user namespace (for example our Ubuntu container smoke), creating a
+    // nested user namespace may be forbidden. In that case reuse the existing rootless
+    // user namespace and create only a fresh mount namespace for the agent.
+    let created_user_namespace = if unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0 {
+        true
+    } else {
+        let error = std::io::Error::last_os_error();
+        if root_in_noninitial_user_namespace()? {
+            false
+        } else {
+            bail!("unshare user namespace failed: {error}");
+        }
+    };
+
+    if created_user_namespace {
+        // Map namespace uid/gid 0 to the unprivileged host worker user. This gives enough
+        // capability inside the new namespace to construct mounts, but no host-root identity.
+        let setgroups = Path::new("/proc/self/setgroups");
+        if setgroups.exists() {
+            fs::write(setgroups, b"deny\n").context("disable setgroups for user namespace")?;
+        }
+        fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write user namespace uid_map")?;
+        fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write user namespace gid_map")?;
+        if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+            bail!("setresgid inside user namespace failed: {}", std::io::Error::last_os_error());
+        }
+        if unsafe { libc::setresuid(0, 0, 0) } != 0 {
+            bail!("setresuid inside user namespace failed: {}", std::io::Error::last_os_error());
+        }
     }
 
-    // Map namespace uid/gid 0 to the unprivileged host worker user.  This gives enough
-    // capability inside the new namespace to construct mounts, but no host-root identity.
-    let setgroups = Path::new("/proc/self/setgroups");
-    if setgroups.exists() {
-        fs::write(setgroups, b"deny\n").context("disable setgroups for user namespace")?;
-    }
-    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write user namespace uid_map")?;
-    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write user namespace gid_map")?;
-    if unsafe { libc::setresgid(0, 0, 0) } != 0 {
-        bail!("setresgid inside user namespace failed: {}", std::io::Error::last_os_error());
-    }
-    if unsafe { libc::setresuid(0, 0, 0) } != 0 {
-        bail!("setresuid inside user namespace failed: {}", std::io::Error::last_os_error());
-    }
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         bail!("unshare mount namespace failed: {}", std::io::Error::last_os_error());
     }
@@ -395,6 +407,22 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
     std::env::set_current_dir(&spec.working_dir)
         .with_context(|| format!("enter sandbox workspace {}", spec.working_dir.display()))?;
     return Ok(());
+
+    fn root_in_noninitial_user_namespace() -> anyhow::Result<bool> {
+        if unsafe { libc::geteuid() } != 0 {
+            return Ok(false);
+        }
+        let uid_map = fs::read_to_string("/proc/self/uid_map").context("read current user namespace uid_map")?;
+        let mut fields = uid_map
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace();
+        let inside = fields.next().and_then(|value| value.parse::<u64>().ok());
+        let outside = fields.next().and_then(|value| value.parse::<u64>().ok());
+        let length = fields.next().and_then(|value| value.parse::<u64>().ok());
+        Ok(matches!((inside, outside, length), (Some(0), Some(host), Some(span)) if host != 0 || span != u32::MAX as u64))
+    }
 
     fn mirror_root_symlinks(root: &Path) -> anyhow::Result<()> {
         use std::os::unix::fs::symlink;
@@ -465,13 +493,24 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
                 bail!("remount {} read-only failed: {}", destination.display(), std::io::Error::last_os_error());
             }
         } else if read_only {
-            // Some vendor kernels reject MS_REMOUNT|MS_RDONLY on a bind-mounted file even
-            // inside a user-owned mount namespace.  These explicit file rules are system
-            // resolver/host config targets owned by host root; namespace uid 0 maps to the
-            // unprivileged worker uid, so normal inode permissions keep them non-writable.
-            let writable = unsafe { libc::access(source_c.as_ptr(), libc::W_OK) } == 0;
-            if writable {
-                bail!("read-only sandbox file is writable by the worker: {}", source.display());
+            // Prefer an actual read-only bind remount. Some vendor kernels reject this for
+            // individual files, so retain the permission-based fallback used by the host
+            // worker. The fallback is only accepted when the source inode is already
+            // non-writable to the worker; otherwise fail closed.
+            let remount_read_only = unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    destination_c.as_ptr(),
+                    std::ptr::null(),
+                    (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
+                    std::ptr::null(),
+                )
+            } == 0;
+            if !remount_read_only {
+                let writable = unsafe { libc::access(source_c.as_ptr(), libc::W_OK) } == 0;
+                if writable {
+                    bail!("read-only sandbox file is writable by the worker: {}", source.display());
+                }
             }
         }
         Ok(())
