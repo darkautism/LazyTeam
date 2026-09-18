@@ -15,6 +15,7 @@ mod runtime;
 use runtime::{AgentRuntime, PiRuntime};
 
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
+const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -339,6 +340,10 @@ async fn execute_assignment(
             status: "failed".into(),
             summary: error.to_string(),
             commit_sha: None,
+            base_sha: None,
+            patch: None,
+            patch_truncated: false,
+            workspace_clean: None,
             changed_files: vec![],
             validation: vec![],
             warnings: vec!["worker execution failed before successful completion".into()],
@@ -368,12 +373,19 @@ async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial
         warnings.push(format!("auto-commit failed: {error}"));
     }
     let commit_sha = git_output(&workspace, &["rev-parse", "HEAD"]).await.ok();
-    let changed_files = git_output(&workspace, &["diff", "--name-only", &format!("{base_sha}..HEAD")])
+    let changed_files = git_output(&workspace, &["diff", "--name-only", &base_sha])
         .await.unwrap_or_default().lines().filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let raw_patch = git_output(&workspace, &["diff", "--no-ext-diff", "--unified=40", &base_sha]).await.unwrap_or_default();
+    let (patch, patch_truncated) = bounded_review_patch(raw_patch, MAX_REVIEW_PATCH_BYTES);
+    let workspace_clean = git_output(&workspace, &["status", "--porcelain"]).await.map(|v| v.is_empty()).ok();
     Ok(ExecutionResult {
         status: "completed".into(),
         summary: agent.summary,
         commit_sha,
+        base_sha: Some(base_sha),
+        patch: if patch.is_empty() { None } else { Some(patch) },
+        patch_truncated,
+        workspace_clean,
         changed_files,
         validation: vec![],
         warnings,
@@ -383,8 +395,13 @@ async fn run_task(workspace_root: &Path, runtime: Arc<dyn AgentRuntime>, initial
 
 fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
+    let review_feedback = if assignment.task.review_feedback.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nReview feedback from the previous attempt:\n{}", assignment.task.review_feedback.trim())
+    };
     format!(
-        "{}\n\nTask contract:\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n",
+        "{}\n\nTask contract:\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}{}\n",
         initial_prompt,
         assignment.project.name,
         assignment.project.repo_url,
@@ -393,7 +410,17 @@ fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
         assignment.task.description,
         assignment.task.expected_outcome,
         criteria,
+        review_feedback,
     )
+}
+
+fn bounded_review_patch(mut patch: String, max_bytes: usize) -> (String, bool) {
+    if patch.len() <= max_bytes { return (patch, false); }
+    let mut end = max_bytes.min(patch.len());
+    while !patch.is_char_boundary(end) { end -= 1; }
+    patch.truncate(end);
+    patch.push_str("\n\n[LazyTeam review patch truncated]\n");
+    (patch, true)
 }
 
 async fn prepare_workspace(path: &Path, assignment: &Assignment) -> anyhow::Result<String> {

@@ -7,6 +7,35 @@ pub type Tags = BTreeMap<String, String>;
 
 pub const DEFAULT_WORKER_PROMPT: &str = "You are an autonomous LazyTeam coding worker. Execute only the assigned task in the provided repository workspace. Treat the task description and acceptance criteria as the contract. Inspect before editing, make the smallest correct change, preserve unrelated behavior, and follow repository instructions. Run relevant validation and never wait for interactive input. Do not broaden scope. If blocked, stop and report the concrete blocker. Do not expose secrets or modify external systems unless the task explicitly requires it. Finish with a concise summary of what changed, validation performed, and any remaining risks.";
 
+pub const DEFAULT_REVIEWER_PROMPT: &str = "You are an independent LazyTeam reviewer. Verify the completed execution against the task description and every acceptance criterion. Inspect the execution summary, changed files, validation evidence, warnings, commit/base identifiers, and patch when available. Do not approve merely because the worker says it succeeded. Approve only when the available evidence supports the contract. If evidence is missing, contradictory, or the implementation is incorrect, retry the task with a concise reason describing what must be fixed or what evidence is required.";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerMode {
+    Manual,
+    Mcp,
+}
+
+impl Default for ReviewerMode {
+    fn default() -> Self { Self::Manual }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewerConfig {
+    #[serde(default)]
+    pub mode: ReviewerMode,
+    #[serde(default = "default_reviewer_prompt")]
+    pub initial_prompt: String,
+}
+
+fn default_reviewer_prompt() -> String { DEFAULT_REVIEWER_PROMPT.into() }
+
+impl Default for ReviewerConfig {
+    fn default() -> Self {
+        Self { mode: ReviewerMode::Manual, initial_prompt: DEFAULT_REVIEWER_PROMPT.into() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentLoginMode {
@@ -71,6 +100,8 @@ pub struct Project {
     pub required_worker_tags: Tags,
     #[serde(default)]
     pub default_task_tags: Tags,
+    #[serde(default)]
+    pub reviewer: ReviewerConfig,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -135,6 +166,8 @@ pub struct Task {
     pub preferred_tags: Tags,
     #[serde(default)]
     pub dependencies: Vec<Uuid>,
+    #[serde(default)]
+    pub review_feedback: String,
     pub priority: i32,
     pub state: TaskState,
     pub created_at: DateTime<Utc>,
@@ -170,6 +203,14 @@ pub struct ExecutionResult {
     pub status: String,
     pub summary: String,
     pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub base_sha: Option<String>,
+    #[serde(default)]
+    pub patch: Option<String>,
+    #[serde(default)]
+    pub patch_truncated: bool,
+    #[serde(default)]
+    pub workspace_clean: Option<bool>,
     #[serde(default)]
     pub changed_files: Vec<String>,
     #[serde(default)]
@@ -268,6 +309,7 @@ mod tests {
             default_branch: "main".into(),
             required_worker_tags: BTreeMap::from([("cpu".into(), "rk3588".into())]),
             default_task_tags: BTreeMap::new(),
+            reviewer: ReviewerConfig::default(),
             enabled: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -282,6 +324,7 @@ mod tests {
             required_tags: BTreeMap::from([("os".into(), "linux".into())]),
             preferred_tags: BTreeMap::new(),
             dependencies: vec![],
+            review_feedback: String::new(),
             priority: 0,
             state: TaskState::Queued,
             created_at: Utc::now(),

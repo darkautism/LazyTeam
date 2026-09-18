@@ -196,6 +196,16 @@ You are an autonomous LazyTeam coding worker. Execute only the assigned task in 
 
 Each execution gets a separate checkout and branch.
 
+### Reviewer configuration
+
+Review policy is project-scoped because different repositories can require different standards. In **Projects → Edit**, choose **Manual** or **ChatGPT / MCP** and customize the independent reviewer prompt. Manual review keeps approve/retry in the private UI. ChatGPT / MCP review lets an OAuth-authorized MCP client act as the reviewer; LazyTeam itself does not claim it can choose or change the ChatGPT model/provider for that external reviewer.
+
+Before an MCP reviewer decides, it must call `reviews_get(task_id)`. That returns the project reviewer prompt, task contract, latest execution, worker identity, summary, base/commit SHA, changed files, validation, warnings, workspace cleanliness, and a bounded patch when the worker is new enough to provide one. MCP approve/retry is rejected when the project is configured for Manual review.
+
+A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, requeues the task, and injects the feedback into the next worker attempt. This avoids a retry loop where the worker repeats the same implementation without knowing why it was rejected.
+
+The worker captures up to 256 KiB of textual patch evidence for review and marks truncated patches explicitly. Older workers remain compatible but naturally provide less evidence until upgraded.
+
 ## Task lifecycle
 
 ```text
@@ -206,7 +216,7 @@ queued -> assigned -> running -> review -> done
 
 - Completed worker executions enter `review`.
 - Approval moves a task to `done` and releases dependent tasks.
-- Review/failed/blocked tasks can be retried.
+- Review tasks can be retried only with reviewer feedback; failed/blocked tasks remain directly retryable.
 - Every execution has its own UUID and attempt number; an old worker cannot finish over a newer attempt.
 
 ## Connect ChatGPT through MCP
@@ -226,6 +236,7 @@ projects_list
 projects_create
 tasks_list
 tasks_create
+reviews_get
 tasks_approve
 tasks_retry
 workers_list

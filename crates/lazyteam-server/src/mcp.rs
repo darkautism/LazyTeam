@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use axum::{extract::State, Json};
+use axum::{extract::{Path, State}, http::StatusCode, Json};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    create_project, create_task, list_projects, list_tasks, list_workers, review, AppState,
+    create_project, create_task, list_projects, list_tasks, list_workers, review, review_evidence, AppState,
     CreateProject, CreateTask,
 };
 
@@ -59,6 +59,13 @@ pub struct TaskCreateParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskIdParams {
     pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskRetryParams {
+    pub task_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[tool_router]
@@ -109,6 +116,7 @@ impl LazyTeamMcp {
                 default_branch: input.default_branch,
                 required_worker_tags: input.required_worker_tags,
                 default_task_tags: input.default_task_tags,
+                reviewer: lazyteam_core::ReviewerConfig::default(),
             }),
         ).await.map_err(api_to_mcp)?;
         json_result(&project)
@@ -171,9 +179,30 @@ impl LazyTeamMcp {
     }
 
     #[tool(
+        name = "reviews_get",
+        title = "Get review evidence",
+        description = "Get the latest execution evidence for a task in review, including reviewer policy, worker identity, result summary, commit/base SHA, changed files, validation, warnings, workspace cleanliness, and patch when available. Read this before approving or retrying.",
+        annotations(
+            title = "Get review evidence",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reviews_get(
+        &self,
+        Parameters(input): Parameters<TaskIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        json_result(&evidence)
+    }
+
+    #[tool(
         name = "tasks_approve",
         title = "Approve task",
-        description = "Approve a task in review, mark it done, and release dependent tasks",
+        description = "Approve a task in review after reading reviews_get; only available when the project reviewer mode is ChatGPT / MCP. Marks it done and releases dependent tasks",
         annotations(
             title = "Approve task",
             read_only_hint = false,
@@ -187,6 +216,10 @@ impl LazyTeamMcp {
         Parameters(input): Parameters<TaskIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
+        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        if evidence.project.reviewer.mode != lazyteam_core::ReviewerMode::Mcp {
+            return Err(McpError::internal_error("project reviewer mode is manual; approve from the admin UI or switch the project to ChatGPT / MCP reviewer", None));
+        }
         let transition = review::approve_task(&self.state, task_id).await.map_err(api_to_mcp)?;
         json_result(&transition)
     }
@@ -194,7 +227,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "tasks_retry",
         title = "Retry task",
-        description = "Requeue a task from review, failed, or blocked",
+        description = "Requeue a task from review, failed, or blocked. A review retry requires a concise reason, which is delivered to the next worker attempt",
         annotations(
             title = "Retry task",
             read_only_hint = false,
@@ -205,10 +238,19 @@ impl LazyTeamMcp {
     )]
     async fn tasks_retry(
         &self,
-        Parameters(input): Parameters<TaskIdParams>,
+        Parameters(input): Parameters<TaskRetryParams>,
     ) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
-        let transition = review::retry_task(&self.state, task_id).await.map_err(api_to_mcp)?;
+        match review_evidence(Path(task_id), State(self.state.clone())).await {
+            Ok(Json(evidence)) => {
+                if evidence.project.reviewer.mode != lazyteam_core::ReviewerMode::Mcp {
+                    return Err(McpError::internal_error("project reviewer mode is manual; retry from the admin UI or switch the project to ChatGPT / MCP reviewer", None));
+                }
+            }
+            Err((StatusCode::CONFLICT, _)) => {}
+            Err(error) => return Err(api_to_mcp(error)),
+        }
+        let transition = review::retry_task(&self.state, task_id, input.reason.as_deref()).await.map_err(api_to_mcp)?;
         json_result(&transition)
     }
 
@@ -236,7 +278,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, and a distributed AI worker pool. Use project-scoped tasks; workers are matched deterministically by project access and capability tags. Approve reviewed tasks to release their dependencies.".to_string(),
+                "LazyTeam controls projects, tasks, executions, reviews, and a distributed AI worker pool. Use project-scoped tasks; workers are matched deterministically by project access and capability tags. For tasks in review, call reviews_get and evaluate the project reviewer prompt plus execution evidence before tasks_approve or tasks_retry. Never approve from tasks_list alone.".to_string(),
             )
     }
 }

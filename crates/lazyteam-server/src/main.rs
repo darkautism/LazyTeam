@@ -24,7 +24,7 @@ mod security;
 mod web;
 
 pub(crate) use api::{
-    create_project, create_task, list_projects, list_tasks, list_workers, ApiError, AppState,
+    create_project, create_task, list_projects, list_tasks, list_workers, review_evidence, ApiError, AppState,
     CreateProject, CreateTask,
 };
 

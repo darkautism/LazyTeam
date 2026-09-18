@@ -11,7 +11,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use lazyteam_core::{
     worker_matches_task, AgentCapabilities, AgentConfig, Assignment, Execution, ExecutionResult,
-    ExecutionState, Project, Tags, Task, TaskState, Worker, WorkerState, DEFAULT_WORKER_PROMPT,
+    ExecutionState, Project, ReviewerConfig, ReviewerMode, Tags, Task, TaskState, Worker, WorkerState,
+    DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +46,8 @@ pub(crate) struct CreateProject {
     pub(crate) required_worker_tags: Tags,
     #[serde(default)]
     pub(crate) default_task_tags: Tags,
+    #[serde(default)]
+    pub(crate) reviewer: ReviewerConfig,
 }
 
 fn default_branch() -> String { "main".into() }
@@ -57,11 +60,12 @@ struct UpdateProject {
     default_branch: Option<String>,
     required_worker_tags: Option<Tags>,
     default_task_tags: Option<Tags>,
+    reviewer: Option<ReviewerConfig>,
     enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
-struct WorkerRef {
+pub(crate) struct WorkerRef {
     id: Uuid,
     name: String,
 }
@@ -71,6 +75,14 @@ struct TaskBoardItem {
     task: Task,
     worker: Option<WorkerRef>,
     result: Option<ExecutionResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReviewEvidence {
+    pub(crate) project: Project,
+    pub(crate) task: Task,
+    pub(crate) execution: Execution,
+    pub(crate) worker: WorkerRef,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +167,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/{id}", axum::routing::patch(update_project).delete(delete_project))
         .route("/api/tasks", get(list_tasks).post(create_task))
+        .route("/api/tasks/{id}/review", get(review_evidence))
         .route("/api/task-board", get(task_board))
         .route("/api/workers", get(list_workers))
         .route("/api/workers/{id}", axum::routing::patch(update_worker))
@@ -193,11 +206,12 @@ pub(crate) async fn create_project(State(state): State<Arc<AppState>>, Json(inpu
     let project = Project {
         id: Uuid::new_v4(), slug: input.slug, name: input.name, repo_url: input.repo_url,
         default_branch: input.default_branch, required_worker_tags: input.required_worker_tags,
-        default_task_tags: input.default_task_tags, enabled: true, created_at: now, updated_at: now,
+        default_task_tags: input.default_task_tags, reviewer: input.reviewer, enabled: true, created_at: now, updated_at: now,
     };
-    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,required_worker_tags,default_task_tags,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,required_worker_tags,default_task_tags,reviewer_mode,reviewer_prompt,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(project.id.to_string()).bind(&project.slug).bind(&project.name).bind(&project.repo_url)
         .bind(&project.default_branch).bind(json(&project.required_worker_tags)?).bind(json(&project.default_task_tags)?)
+        .bind(reviewer_mode_str(&project.reviewer.mode)).bind(&project.reviewer.initial_prompt)
         .bind(1_i64).bind(ts(project.created_at)).bind(ts(project.updated_at))
         .execute(&state.db).await.map_err(db_conflict)?;
     Ok(Json(project))
@@ -223,10 +237,15 @@ async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
     if name.trim().is_empty() || repo_url.trim().is_empty() || default_branch.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "project name, repository, and default branch are required".into()));
     }
-    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,required_worker_tags=?,default_task_tags=?,enabled=?,updated_at=? WHERE id=?")
+    let reviewer = input.reviewer.unwrap_or(current.reviewer);
+    if reviewer.initial_prompt.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "reviewer initial prompt must not be empty".into()));
+    }
+    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,required_worker_tags=?,default_task_tags=?,reviewer_mode=?,reviewer_prompt=?,enabled=?,updated_at=? WHERE id=?")
         .bind(&slug).bind(name.trim()).bind(repo_url.trim()).bind(default_branch.trim())
         .bind(json(&input.required_worker_tags.unwrap_or(current.required_worker_tags))?)
         .bind(json(&input.default_task_tags.unwrap_or(current.default_task_tags))?)
+        .bind(reviewer_mode_str(&reviewer.mode)).bind(reviewer.initial_prompt.trim())
         .bind(if input.enabled.unwrap_or(current.enabled) { 1_i64 } else { 0_i64 })
         .bind(ts(Utc::now())).bind(id.to_string()).execute(&state.db).await.map_err(db_conflict)?;
     let row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
@@ -261,12 +280,12 @@ pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input):
         id: Uuid::new_v4(), project_id: input.project_id, title: input.title, description: input.description,
         expected_outcome: input.expected_outcome, acceptance_criteria: input.acceptance_criteria,
         required_tags: input.required_tags, preferred_tags: input.preferred_tags, dependencies: input.dependencies,
-        priority: input.priority, state: TaskState::Queued, created_at: now, updated_at: now,
+        review_feedback: String::new(), priority: input.priority, state: TaskState::Queued, created_at: now, updated_at: now,
     };
-    sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,acceptance_criteria,required_tags,preferred_tags,dependencies,priority,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,acceptance_criteria,required_tags,preferred_tags,dependencies,review_feedback,priority,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(task.id.to_string()).bind(task.project_id.to_string()).bind(&task.title).bind(&task.description)
         .bind(&task.expected_outcome).bind(json(&task.acceptance_criteria)?).bind(json(&task.required_tags)?)
-        .bind(json(&task.preferred_tags)?).bind(json(&task.dependencies)?).bind(task.priority).bind("queued")
+        .bind(json(&task.preferred_tags)?).bind(json(&task.dependencies)?).bind(&task.review_feedback).bind(task.priority).bind("queued")
         .bind(ts(task.created_at)).bind(ts(task.updated_at)).execute(&state.db).await.map_err(db_error)?;
     Ok(Json(task))
 }
@@ -274,6 +293,24 @@ pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input):
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Task>> {
     let rows = sqlx::query("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(task_from_row).collect::<Result<Vec<_>,_>>().map(Json)
+}
+
+pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> ApiResult<ReviewEvidence> {
+    let task_row = sqlx::query("SELECT * FROM tasks WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "task not found".into()))?;
+    let task = task_from_row(&task_row)?;
+    if !matches!(task.state, TaskState::Review | TaskState::Done) {
+        return Err((StatusCode::CONFLICT, "review evidence is available only for review/done tasks".into()));
+    }
+    let project_row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(task.project_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    let project = project_from_row(&project_row)?;
+    let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(task.id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::CONFLICT, "task has no execution to review".into()))?;
+    let execution = execution_from_row(&execution_row)?;
+    let worker_row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(execution.worker_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    let worker = worker_from_row(&worker_row)?;
+    Ok(Json(ReviewEvidence { project, task, execution, worker: WorkerRef { id: worker.id, name: worker.name } }))
 }
 
 async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
@@ -553,6 +590,13 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, ApiError> 
         id: uuid(row.try_get("id").map_err(internal)?)?, slug: row.try_get("slug").map_err(internal)?, name: row.try_get("name").map_err(internal)?,
         repo_url: row.try_get("repo_url").map_err(internal)?, default_branch: row.try_get("default_branch").map_err(internal)?,
         required_worker_tags: dejson(row.try_get("required_worker_tags").map_err(internal)?)?, default_task_tags: dejson(row.try_get("default_task_tags").map_err(internal)?)?,
+        reviewer: ReviewerConfig {
+            mode: reviewer_mode(row.try_get("reviewer_mode").map_err(internal)?)?,
+            initial_prompt: {
+                let value: String = row.try_get("reviewer_prompt").map_err(internal)?;
+                if value.trim().is_empty() { DEFAULT_REVIEWER_PROMPT.into() } else { value }
+            },
+        },
         enabled: row.try_get::<i64,_>("enabled").map_err(internal)? != 0, created_at: datetime(row.try_get("created_at").map_err(internal)?)?,
         updated_at: datetime(row.try_get("updated_at").map_err(internal)?)?,
     })
@@ -578,12 +622,36 @@ fn worker_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Worker, ApiError> {
         agent_capabilities: capabilities })
 }
 
+fn execution_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Execution, ApiError> {
+    let state: String = row.try_get("state").map_err(internal)?;
+    let result: Option<String> = row.try_get("result").map_err(internal)?;
+    Ok(Execution {
+        id: uuid(row.try_get("id").map_err(internal)?)?,
+        task_id: uuid(row.try_get("task_id").map_err(internal)?)?,
+        worker_id: uuid(row.try_get("worker_id").map_err(internal)?)?,
+        attempt: row.try_get::<i64,_>("attempt").map_err(internal)? as u32,
+        state: match state.as_str() { "running"=>ExecutionState::Running,"completed"=>ExecutionState::Completed,"failed"=>ExecutionState::Failed,"lost"=>ExecutionState::Lost,"cancelled"=>ExecutionState::Cancelled,_=>ExecutionState::Assigned },
+        lease_until: datetime(row.try_get("lease_until").map_err(internal)?)?,
+        started_at: row.try_get::<Option<String>,_>("started_at").map_err(internal)?.map(datetime).transpose()?,
+        finished_at: row.try_get::<Option<String>,_>("finished_at").map_err(internal)?.map(datetime).transpose()?,
+        result: result.map(dejson).transpose()?,
+    })
+}
+
+fn reviewer_mode_str(mode: &ReviewerMode) -> &'static str {
+    match mode { ReviewerMode::Manual => "manual", ReviewerMode::Mcp => "mcp" }
+}
+
+fn reviewer_mode(value: String) -> Result<ReviewerMode, ApiError> {
+    match value.as_str() { "manual" => Ok(ReviewerMode::Manual), "mcp" => Ok(ReviewerMode::Mcp), _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid reviewer mode {value}"))) }
+}
+
 fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
     let state: String = row.try_get("state").map_err(internal)?;
     Ok(Task { id: uuid(row.try_get("id").map_err(internal)?)?, project_id: uuid(row.try_get("project_id").map_err(internal)?)?,
         title: row.try_get("title").map_err(internal)?, description: row.try_get("description").map_err(internal)?, expected_outcome: row.try_get("expected_outcome").map_err(internal)?,
         acceptance_criteria: dejson(row.try_get("acceptance_criteria").map_err(internal)?)?, required_tags: dejson(row.try_get("required_tags").map_err(internal)?)?,
-        preferred_tags: dejson(row.try_get("preferred_tags").map_err(internal)?)?, dependencies: dejson(row.try_get("dependencies").map_err(internal)?)?, priority: row.try_get("priority").map_err(internal)?,
+        preferred_tags: dejson(row.try_get("preferred_tags").map_err(internal)?)?, dependencies: dejson(row.try_get("dependencies").map_err(internal)?)?, review_feedback: row.try_get("review_feedback").map_err(internal)?, priority: row.try_get("priority").map_err(internal)?,
         state: match state.as_str() { "draft"=>TaskState::Draft,"assigned"=>TaskState::Assigned,"running"=>TaskState::Running,"review"=>TaskState::Review,"done"=>TaskState::Done,"blocked"=>TaskState::Blocked,"failed"=>TaskState::Failed,"cancelled"=>TaskState::Cancelled,_=>TaskState::Queued },
         created_at: datetime(row.try_get("created_at").map_err(internal)?)?, updated_at: datetime(row.try_get("updated_at").map_err(internal)?)? })
 }
