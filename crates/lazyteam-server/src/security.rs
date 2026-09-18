@@ -285,8 +285,9 @@ pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
                 return unauthorized("worker-enrollment");
             }
         } else if (path.starts_with("/api/workers/")
-            && (path.ends_with("/heartbeat") || path.ends_with("/claim") || path.ends_with("/config") || path.ends_with("/capabilities") || path.ends_with("/cleanup") || path.contains("/cleanup/")))
+            && (path.ends_with("/heartbeat") || path.ends_with("/claim") || path.ends_with("/review-claim") || path.ends_with("/config") || path.ends_with("/capabilities") || path.ends_with("/cleanup") || path.contains("/cleanup/")))
             || path.starts_with("/api/executions/")
+            || path.starts_with("/api/reviews/")
         {
             // Per-worker authentication and execution ownership are enforced in the
             // endpoint handlers where the worker/execution ID is available.

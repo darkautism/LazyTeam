@@ -7,7 +7,7 @@ pub type Tags = BTreeMap<String, String>;
 
 pub const DEFAULT_WORKER_PROMPT: &str = "You are an autonomous LazyTeam coding worker. Execute only the assigned task in the provided repository workspace. Treat the task description and acceptance criteria as the contract. Inspect before editing, make the smallest correct change, preserve unrelated behavior, and follow repository instructions. Run relevant validation and never wait for interactive input. Do not broaden scope. If blocked, stop and report the concrete blocker. Do not expose secrets or modify external systems unless the task explicitly requires it. Finish with a concise summary of what changed, validation performed, and any remaining risks.";
 
-pub const DEFAULT_REVIEWER_PROMPT: &str = "You are an independent LazyTeam reviewer. Verify the completed execution against the task description and every acceptance criterion. Inspect the execution summary, changed files, validation evidence, warnings, commit/base identifiers, and patch when available. Do not approve merely because the worker says it succeeded. Approve only when the available evidence supports the contract. If evidence is missing, contradictory, or the implementation is incorrect, retry the task with a concise reason describing what must be fixed or what evidence is required.";
+pub const DEFAULT_REVIEWER_PROMPT: &str = "You are an independent senior LazyTeam reviewer. Review the exact pinned candidate commit in the provided repository checkout, not the worker's claims. Read the task contract and acceptance criteria, inspect the implementation and surrounding code, and run focused validation when practical. Treat the implementation worker as untrusted evidence: verify changed behavior yourself. Do not modify source code, create commits, push branches, merge, or broaden scope. Approve only when the candidate is correct, complete, scoped, and supported by evidence. Otherwise request a retry with a concise, actionable reason. Your final response must be exactly one JSON object with this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[\"...\"]}.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +84,14 @@ pub struct AgentCapabilities {
     pub models: Vec<AgentModel>,
     #[serde(default)]
     pub probe_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    #[default]
+    Worker,
+    Reviewer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,6 +189,8 @@ pub enum WorkerState {
 pub struct Worker {
     pub id: Uuid,
     pub name: String,
+    #[serde(default)]
+    pub role: AgentRole,
     pub state: WorkerState,
     pub os: String,
     pub arch: String,
@@ -298,6 +308,51 @@ pub struct Assignment {
     pub git_credential: GitCredential,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewLease {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub execution_id: Uuid,
+    pub reviewer_worker_id: Uuid,
+    pub lease_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewCheckout {
+    pub repo_url: String,
+    pub default_branch: String,
+    pub review_ref: String,
+    pub commit_sha: String,
+    pub base_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewAssignment {
+    pub review: ReviewLease,
+    pub project: Project,
+    pub task: Task,
+    pub execution: Execution,
+    pub implementation_worker: Worker,
+    pub checkout: ReviewCheckout,
+    #[serde(default)]
+    pub git_credential: GitCredential,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdictKind {
+    Approve,
+    Retry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewVerdict {
+    pub verdict: ReviewVerdictKind,
+    pub reason: String,
+    #[serde(default)]
+    pub validation: Vec<String>,
+}
+
 pub fn worker_can_run_project(worker: &Worker, project: &Project) -> bool {
     worker.allowed_projects.is_empty()
         || worker.allowed_projects.contains("*")
@@ -345,6 +400,7 @@ mod tests {
         Worker {
             id: Uuid::new_v4(),
             name: "rk".into(),
+            role: AgentRole::Worker,
             state: WorkerState::Idle,
             os: "linux".into(),
             arch: "aarch64".into(),

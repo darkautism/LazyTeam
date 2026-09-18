@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, t
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
 use clap::Parser;
-use lazyteam_core::{AgentCapabilities, AgentConfig, Assignment, ExecutionResult, GitCredential};
+use lazyteam_core::{AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, GitCredential, ReviewAssignment, ReviewVerdict};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -57,6 +57,7 @@ struct WorkerJoinPayload {
 
 #[derive(Debug, Deserialize)]
 struct WorkerRuntimeConfig {
+    role: AgentRole,
     agent: AgentConfig,
 }
 
@@ -295,33 +296,58 @@ async fn main() -> anyhow::Result<()> {
             Ok(config) => runtime_config = config,
             Err(error) => warn!(%error, "worker runtime config refresh failed; using last known config"),
         }
-        match claim(&client, &server, &worker_credential, worker_id).await {
-            Ok(Some(assignment)) => {
-                info!(task = %assignment.task.id, execution = %assignment.execution.id, project = %assignment.project.slug, "claimed task");
-                let session_dir = args.state_dir.join("sessions").join(assignment.task.id.to_string());
-                let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir) {
-                    Ok(runtime) => runtime,
-                    Err(error) => { error!(%error, "invalid agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
-                };
-                info!(agent = runtime.kind(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "starting agent runtime");
-                if let Err(error) = execute_assignment(
-                    &client,
-                    &server,
-                    &worker_credential,
-                    &args.workspace_dir,
-                    &args.state_dir,
-                    runtime,
-                    &runtime_config.agent.initial_prompt,
-                    assignment,
-                ).await {
-                    error!(%error, "assignment execution failed");
+        match runtime_config.role {
+            AgentRole::Worker => match claim(&client, &server, &worker_credential, worker_id).await {
+                Ok(Some(assignment)) => {
+                    info!(task = %assignment.task.id, execution = %assignment.execution.id, project = %assignment.project.slug, "claimed implementation task");
+                    let session_dir = args.state_dir.join("sessions").join(assignment.task.id.to_string());
+                    let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir) {
+                        Ok(runtime) => runtime,
+                        Err(error) => { error!(%error, "invalid agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
+                    };
+                    info!(role = "worker", agent = runtime.kind(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "starting agent runtime");
+                    if let Err(error) = execute_assignment(
+                        &client,
+                        &server,
+                        &worker_credential,
+                        &args.workspace_dir,
+                        &args.state_dir,
+                        runtime,
+                        &runtime_config.agent.initial_prompt,
+                        assignment,
+                    ).await {
+                        error!(%error, "assignment execution failed");
+                    }
                 }
-            }
-            Ok(None) => sleep(Duration::from_secs(3)).await,
-            Err(error) => {
-                warn!(%error, "claim failed");
-                sleep(Duration::from_secs(5)).await;
-            }
+                Ok(None) => sleep(Duration::from_secs(3)).await,
+                Err(error) => { warn!(%error, "implementation claim failed"); sleep(Duration::from_secs(5)).await; }
+            },
+            AgentRole::Reviewer => match claim_review(&client, &server, &worker_credential, worker_id).await {
+                Ok(Some(assignment)) => {
+                    info!(task = %assignment.task.id, review = %assignment.review.id, project = %assignment.project.slug, "claimed review");
+                    let session_dir = args.state_dir.join("review-sessions").join(assignment.review.id.to_string());
+                    let runtime = match runtime_for_config(&runtime_config.agent, &pi_bin, legacy_provider.as_deref(), legacy_model.as_deref(), session_dir.clone()) {
+                        Ok(runtime) => runtime,
+                        Err(error) => { error!(%error, "invalid reviewer agent configuration"); sleep(Duration::from_secs(3)).await; continue; }
+                    };
+                    info!(role = "reviewer", agent = runtime.kind(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "starting reviewer runtime");
+                    if let Err(error) = execute_review_assignment(
+                        &client,
+                        &server,
+                        &worker_credential,
+                        &args.workspace_dir,
+                        &args.state_dir,
+                        runtime,
+                        &runtime_config.agent.initial_prompt,
+                        assignment,
+                    ).await {
+                        error!(%error, "review execution failed");
+                    }
+                    if session_dir.exists() { let _ = tokio::fs::remove_dir_all(session_dir).await; }
+                }
+                Ok(None) => sleep(Duration::from_secs(3)).await,
+                Err(error) => { warn!(%error, "review claim failed"); sleep(Duration::from_secs(5)).await; }
+            },
         }
     }
 }
@@ -354,7 +380,7 @@ async fn register(
         "allowed_projects": allowed_projects,
         "slots": slots,
         "worker_version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": 2,
+        "protocol_version": 3,
         "agent_type": "pi",
         "agent_capabilities": agent_capabilities
     })).send().await?;
@@ -370,7 +396,7 @@ async fn register(
 
 async fn report_capabilities(client: &Client, server: &str, credential: &str, worker_id: Uuid, capabilities: &AgentCapabilities) -> anyhow::Result<()> {
     let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capabilities")), credential)
-        .header("x-lazyteam-worker-protocol-version", "2")
+        .header("x-lazyteam-worker-protocol-version", "3")
         .header("x-lazyteam-worker-version", env!("CARGO_PKG_VERSION"))
         .json(capabilities).send().await?;
     ensure_success(response).await?;
@@ -429,6 +455,145 @@ async fn claim(client: &Client, server: &str, credential: &str, worker_id: Uuid)
     if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
     let response = ensure_success(response).await?;
     Ok(Some(response.json().await?))
+}
+
+async fn claim_review(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<Option<ReviewAssignment>> {
+    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/review-claim")), credential).send().await?;
+    if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
+    let response = ensure_success(response).await?;
+    Ok(Some(response.json().await?))
+}
+
+async fn execute_review_assignment(
+    client: &Client,
+    server: &str,
+    worker_credential: &str,
+    workspace_root: &Path,
+    state_dir: &Path,
+    runtime: Arc<dyn AgentRuntime>,
+    initial_prompt: &str,
+    assignment: ReviewAssignment,
+) -> anyhow::Result<()> {
+    let review_id = assignment.review.id;
+    let renew_client = client.clone();
+    let renew_server = server.to_string();
+    let renew_credential = worker_credential.to_string();
+    let renew = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            match worker_auth(
+                renew_client.post(format!("{renew_server}/api/reviews/{review_id}/renew")),
+                &renew_credential,
+            ).send().await {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => warn!(status = %response.status(), %review_id, "review lease renew rejected"),
+                Err(error) => warn!(%error, %review_id, "review lease renew failed"),
+            }
+        }
+    });
+
+    let workspace = workspace_root
+        .join(".reviews")
+        .join(&assignment.project.slug)
+        .join(review_id.to_string());
+    let outcome = match GitAuthContext::prepare(state_dir, assignment.task.id, review_id, &assignment.git_credential).await {
+        Ok(auth) => {
+            let prepared = prepare_review_workspace(&workspace, &assignment, &auth).await;
+            auth.cleanup().await;
+            match prepared {
+                Ok(()) => {
+                    let prompt = build_review_prompt(initial_prompt, &assignment)?;
+                    match runtime.run(&workspace, &prompt, &review_id.to_string()).await {
+                        Ok(agent) => {
+                            let dirty = git_output(&workspace, &["status", "--porcelain"]).await.unwrap_or_default();
+                            if !dirty.is_empty() {
+                                Err(anyhow::anyhow!("reviewer modified the pinned checkout; review discarded"))
+                            } else {
+                                parse_review_verdict(&agent.summary)
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    renew.abort();
+
+    let body = match outcome {
+        Ok(verdict) => json!({"status":"completed","verdict":verdict}),
+        Err(error) => json!({"status":"failed","error":error.to_string()}),
+    };
+    let response = worker_auth(
+        client.post(format!("{server}/api/reviews/{review_id}/finish")),
+        worker_credential,
+    ).json(&body).send().await?;
+    ensure_success(response).await?;
+    if workspace.exists() { let _ = tokio::fs::remove_dir_all(&workspace).await; }
+    Ok(())
+}
+
+async fn prepare_review_workspace(path: &Path, assignment: &ReviewAssignment, git_auth: &GitAuthContext) -> anyhow::Result<()> {
+    if path.exists() { tokio::fs::remove_dir_all(path).await?; }
+    if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
+    command_ok_with_auth(
+        Path::new("."),
+        "git",
+        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &assignment.checkout.repo_url, path.to_str().context("non-utf8 review workspace path")?],
+        git_auth,
+    ).await?;
+    let review_ref = format!("refs/heads/{}", assignment.checkout.review_ref);
+    command_ok_with_auth(path, "git", &["fetch", "origin", &review_ref], git_auth).await?;
+    let fetched = git_output(path, &["rev-parse", "FETCH_HEAD"]).await?;
+    if fetched != assignment.checkout.commit_sha {
+        bail!("review ref moved: expected {}, fetched {}", assignment.checkout.commit_sha, fetched);
+    }
+    command_ok(path, "git", &["checkout", "--detach", &assignment.checkout.commit_sha]).await?;
+    command_ok(path, "git", &["remote", "set-url", "--push", "origin", "disabled://lazyteam-reviewer"]).await?;
+    Ok(())
+}
+
+fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> anyhow::Result<String> {
+    let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
+    let result = serde_json::to_string_pretty(&assignment.execution.result).context("serialize implementation evidence")?;
+    Ok(format!(
+        "{initial_prompt}\n\nProject-specific review policy:\n{}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nReview the checkout at the exact candidate commit. You may inspect files and run validation, but do not edit, commit, push, or merge. Return only the required JSON verdict object.\n",
+        assignment.project.reviewer.initial_prompt,
+        assignment.checkout.repo_url,
+        assignment.checkout.default_branch,
+        assignment.checkout.review_ref,
+        assignment.checkout.commit_sha,
+        assignment.checkout.base_sha.as_deref().unwrap_or("unknown"),
+        assignment.implementation_worker.name,
+        assignment.implementation_worker.os,
+        assignment.implementation_worker.arch,
+        assignment.task.title,
+        assignment.task.description,
+        assignment.task.expected_outcome,
+        criteria,
+        result,
+    ))
+}
+
+fn parse_review_verdict(raw: &str) -> anyhow::Result<ReviewVerdict> {
+    let trimmed = raw.trim();
+    if let Ok(verdict) = serde_json::from_str::<ReviewVerdict>(trimmed) {
+        if verdict.reason.trim().is_empty() { bail!("review verdict reason is empty"); }
+        return Ok(verdict);
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start <= end {
+            let candidate = &trimmed[start..=end];
+            if let Ok(verdict) = serde_json::from_str::<ReviewVerdict>(candidate) {
+                if verdict.reason.trim().is_empty() { bail!("review verdict reason is empty"); }
+                return Ok(verdict);
+            }
+        }
+    }
+    bail!("reviewer did not return the required JSON verdict")
 }
 
 async fn execute_assignment(
@@ -711,6 +876,16 @@ mod tests {
             resolve_worker_path(startup, Path::new("/var/lib/lazyteam")),
             PathBuf::from("/var/lib/lazyteam")
         );
+    }
+
+    #[test]
+    fn reviewer_verdict_parser_accepts_json_and_rejects_missing_reason() {
+        let verdict = parse_review_verdict(r#"{"verdict":"approve","reason":"verified","validation":["cargo test"]}"#).unwrap();
+        assert_eq!(verdict.verdict, lazyteam_core::ReviewVerdictKind::Approve);
+        assert_eq!(verdict.reason, "verified");
+        let wrapped = parse_review_verdict("Result:\n{\"verdict\":\"retry\",\"reason\":\"missing test\",\"validation\":[]}").unwrap();
+        assert_eq!(wrapped.verdict, lazyteam_core::ReviewVerdictKind::Retry);
+        assert!(parse_review_verdict(r#"{"verdict":"approve","reason":"","validation":[]}"#).is_err());
     }
 
     #[tokio::test]

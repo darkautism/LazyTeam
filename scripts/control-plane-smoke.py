@@ -188,6 +188,82 @@ def main():
     expect(by_id[child["id"]]["state"] == "done", "child final state mismatch")
     expect(by_id[foreign_task["id"]]["state"] == "queued", "foreign project task was consumed")
 
+    review_task = post_json("/api/tasks", {
+        "project_id": project_a["id"],
+        "title": "reviewer role smoke",
+        "expected_outcome": "reviewer worker approves a pinned candidate",
+        "required_tags": {"rust": "true"},
+        "priority": 150,
+    })
+    review_impl_claim = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
+    expect(review_impl_claim.status == 200, f"review implementation claim failed: {review_impl_claim.status}")
+    review_impl_assignment = read_json(review_impl_claim)
+    expect(review_impl_assignment["task"]["id"] == review_task["id"], "wrong review implementation task claimed")
+    review_execution = review_impl_assignment["execution"]["id"]
+    review_finish = request(
+        f"/api/executions/{review_execution}/finish",
+        method="POST",
+        obj={"result": {
+            "status": "completed",
+            "summary": "candidate ready",
+            "commit_sha": "candidate-sha",
+            "base_sha": "base-sha",
+            "review_ref": f"lazyteam/task-{review_task['id'].replace('-', '')}",
+        }},
+        headers=worker_headers,
+    )
+    expect(review_finish.status == 204, f"review implementation finish failed: {review_finish.status}")
+
+    reviewer_id = str(uuid.uuid4())
+    reviewer_registration = request("/api/workers/register", method="POST", obj={
+        "id": reviewer_id,
+        "name": "smoke-reviewer",
+        "os": "linux",
+        "arch": "x86_64",
+        "allowed_projects": [project_a["slug"]],
+        "slots": 1,
+        "worker_version": "smoke-reviewer",
+        "protocol_version": 3,
+    })
+    expect(reviewer_registration.status == 200, f"reviewer registration failed: {reviewer_registration.status}")
+    reviewer_headers = {WORKER_CREDENTIAL_HEADER: reviewer_registration.headers.get(WORKER_CREDENTIAL_HEADER)}
+    reviewer_update = request(f"/api/workers/{reviewer_id}", method="PATCH", obj={
+        "role": "reviewer",
+        "initial_prompt": "Independent reviewer smoke prompt",
+    })
+    expect(reviewer_update.status == 200, f"reviewer role update failed: {reviewer_update.status}")
+    reviewer_worker = read_json(reviewer_update)
+    expect(reviewer_worker["role"] == "reviewer", "reviewer role was not persisted")
+
+    wrong_claim = request(f"/api/workers/{reviewer_id}/claim", method="POST", headers=reviewer_headers)
+    expect(wrong_claim.status == 204, "reviewer worker claimed an implementation task")
+
+    review_claim = request(f"/api/workers/{reviewer_id}/review-claim", method="POST", headers=reviewer_headers)
+    expect(review_claim.status == 200, f"reviewer could not claim review: {review_claim.status}")
+    review_assignment = read_json(review_claim)
+    expect(review_assignment["task"]["id"] == review_task["id"], "reviewer claimed wrong task")
+    expect(review_assignment["review"]["execution_id"] == review_execution, "review was not pinned to implementation execution")
+    expect(review_assignment["checkout"]["commit_sha"] == "candidate-sha", "review checkout was not pinned to candidate SHA")
+    expect(review_assignment["implementation_worker"]["id"] == worker_id, "review assignment lost implementation worker identity")
+
+    raced_main = request(f"/api/tasks/{review_task['id']}/approve", method="POST", obj={})
+    expect(raced_main.status == 409, "active reviewer should block main approval")
+
+    review_id = review_assignment["review"]["id"]
+    review_done = request(
+        f"/api/reviews/{review_id}/finish",
+        method="POST",
+        obj={"status": "completed", "verdict": {
+            "verdict": "approve",
+            "reason": "candidate independently verified",
+            "validation": ["smoke validation"],
+        }},
+        headers=reviewer_headers,
+    )
+    expect(review_done.status == 204, f"reviewer finish failed: {review_done.status}")
+    review_state = next(task for task in read_json(request("/api/tasks")) if task["id"] == review_task["id"])
+    expect(review_state["state"] == "merge_pending", "reviewer approval did not move task to merge_pending")
+
     if os.environ.get("LAZYTEAM_GIT_CREDENTIAL_KEY"):
         credential_value = "example-credential-value"
         managed = post_json("/api/projects", {

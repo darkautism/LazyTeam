@@ -70,6 +70,7 @@ async fn merged_task_http(
 }
 
 pub(crate) async fn approve_task(state: &AppState, id: Uuid) -> Result<TaskTransition, ApiError> {
+    ensure_no_active_reviewer(state, id).await?;
     let changed = sqlx::query("UPDATE tasks SET state='merge_pending', updated_at=? WHERE id=? AND state='review'")
         .bind(Utc::now().to_rfc3339())
         .bind(id.to_string())
@@ -117,6 +118,7 @@ pub(crate) async fn retry_task(state: &AppState, id: Uuid, reason: Option<&str>)
     }
     let reason = reason.map(str::trim).filter(|value| !value.is_empty());
     let review_retry = matches!(current.as_str(), "review" | "merge_pending");
+    if current == "review" { ensure_no_active_reviewer(state, id).await?; }
     if review_retry && reason.is_none() {
         return Err((StatusCode::BAD_REQUEST, "review retry requires a reason for the next worker attempt".into()));
     }
@@ -135,6 +137,15 @@ pub(crate) async fn retry_task(state: &AppState, id: Uuid, reason: Option<&str>)
     };
     if changed == 0 { return Err((StatusCode::CONFLICT, "task changed while retrying".into())); }
     Ok(TaskTransition { task_id: id, state: "queued".into() })
+}
+
+async fn ensure_no_active_reviewer(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
+        .bind(id.to_string()).fetch_one(&state.db).await.map_err(internal)?;
+    if active > 0 {
+        return Err((StatusCode::CONFLICT, "task is currently claimed by a reviewer worker".into()));
+    }
+    Ok(())
 }
 
 fn internal(error: impl std::fmt::Display) -> ApiError {
