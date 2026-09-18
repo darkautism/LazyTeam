@@ -198,7 +198,7 @@ There is intentionally no implicit `127.0.0.1:8787` fallback anymore: a fresh wo
 
 ### Embedded agent sandbox
 
-On Linux, `lazyteam-worker` runs Pi inside an embedded sandbox implemented in the same Rust executable; Docker and a separate sandbox binary are not required. Startup is **fail-closed**: if the kernel cannot fully enforce the requested Landlock filesystem policy or install the seccomp filter, the worker refuses to run agents instead of falling back to an unsandboxed process. Check a machine without contacting the control plane with:
+On Linux, `lazyteam-worker` runs Pi inside an embedded sandbox implemented in the same Rust executable; Docker and a separate sandbox binary are not required. It prefers a fully enforced Landlock filesystem policy; kernels without Landlock use a rootless user+mount namespace with a tmpfs root and explicit bind-mount allowlist. Startup is **fail-closed**: if neither filesystem backend can be established or the seccomp filter cannot be installed, the worker refuses to run agents instead of falling back to an unsandboxed process. Check a machine without contacting the control plane with:
 
 ```sh
 lazyteam-worker --sandbox-diagnose

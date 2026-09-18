@@ -17,6 +17,8 @@ const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", 
 struct SandboxSpec {
     read_only: Vec<PathBuf>,
     read_write: Vec<PathBuf>,
+    working_dir: PathBuf,
+    namespace_root_base: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,7 @@ pub struct AgentSandbox {
     cargo_target_dir: PathBuf,
     tmp_dir: PathBuf,
     probe_dir: PathBuf,
+    namespace_root_base: PathBuf,
     read_only: Vec<PathBuf>,
     path: OsString,
     rustup_home: Option<PathBuf>,
@@ -42,7 +45,11 @@ impl AgentSandbox {
         let cargo_target_dir = state_dir.join("agent-cache").join("target");
         let tmp_dir = state_dir.join("agent-tmp");
         let probe_dir = state_dir.join("agent-probe");
-        for dir in [&pi_config_dir, &home_dir, &cargo_home, &cargo_target_dir, &tmp_dir, &probe_dir] {
+        let namespace_root_base = state_dir.join("sandbox-roots");
+        if namespace_root_base.exists() {
+            tokio::fs::remove_dir_all(&namespace_root_base).await?;
+        }
+        for dir in [&pi_config_dir, &home_dir, &cargo_home, &cargo_target_dir, &tmp_dir, &probe_dir, &namespace_root_base] {
             tokio::fs::create_dir_all(dir).await?;
             set_private_dir(dir).await?;
         }
@@ -108,6 +115,7 @@ impl AgentSandbox {
             cargo_target_dir,
             tmp_dir,
             probe_dir,
+            namespace_root_base,
             read_only: read_only.into_iter().collect(),
             path,
             rustup_home,
@@ -127,7 +135,7 @@ impl AgentSandbox {
     }
 
     pub fn diagnostic_summary(&self) -> &'static str {
-        "ready: Landlock filesystem policy fully enforced; seccomp dangerous-syscall denylist active"
+        "ready: filesystem isolation (Landlock or rootless user/mount namespace) + seccomp denylist"
     }
 
     pub fn command(&self, program: &str, workspace: &Path, session_dir: Option<&Path>) -> anyhow::Result<Command> {
@@ -149,7 +157,12 @@ impl AgentSandbox {
             }
         }
 
-        let spec = SandboxSpec { read_only: self.read_only.clone(), read_write };
+        let spec = SandboxSpec {
+            read_only: self.read_only.clone(),
+            read_write,
+            working_dir: workspace.clone(),
+            namespace_root_base: self.namespace_root_base.clone(),
+        };
         let mut command = Command::new(std::env::current_exe().context("resolve lazyteam-worker executable")?);
         command.arg(EXEC_ARG).arg(program);
         command.current_dir(&workspace);
@@ -230,11 +243,10 @@ fn apply_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
         path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus, ABI,
     };
-    use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
-    use std::{collections::BTreeMap, convert::TryInto};
 
-    // ABI V3 is deliberately conservative: it gives us read/write/create/refer/truncate
-    // enforcement while remaining available on a broad range of modern Linux kernels.
+    // Prefer Landlock when the kernel can fully enforce our fixed ABI V3 policy.  Some
+    // vendor kernels expose no Landlock at all; those fall back to a rootless user+mount
+    // namespace containing only the same explicit path allowlist.
     let abi = ABI::V3;
     let status = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))?
@@ -244,9 +256,166 @@ fn apply_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
         .set_compatibility(CompatLevel::HardRequirement)
         .restrict_self()
         .context("apply Landlock filesystem policy")?;
-    if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
-        bail!("Landlock policy was not fully enforced: {status:?}");
+
+    match status.ruleset {
+        RulesetStatus::FullyEnforced if status.no_new_privs => {}
+        RulesetStatus::NotEnforced => apply_namespace_fs_policy(spec)
+            .context("Landlock unavailable and rootless namespace fallback failed")?,
+        _ => bail!("Landlock policy was only partially enforced; refusing ambiguous sandbox: {status:?}"),
     }
+
+    install_seccomp_denylist()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
+    use std::{
+        ffi::CString,
+        fs,
+        os::unix::ffi::OsStrExt,
+        ptr,
+    };
+
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let root = spec.namespace_root_base.join(format!("{}", unsafe { libc::getpid() }));
+    if root.exists() {
+        fs::remove_dir_all(&root).with_context(|| format!("clear namespace root {}", root.display()))?;
+    }
+    fs::create_dir_all(&root).with_context(|| format!("create namespace root {}", root.display()))?;
+
+    let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
+    if unsafe { libc::unshare(flags) } != 0 {
+        bail!("unshare user/mount namespace failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Map namespace uid/gid 0 to the unprivileged host worker user.  This gives enough
+    // capability inside the new namespace to construct mounts, but no host-root identity.
+    let setgroups = Path::new("/proc/self/setgroups");
+    if setgroups.exists() {
+        fs::write(setgroups, b"deny\n").context("disable setgroups for user namespace")?;
+    }
+    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write user namespace uid_map")?;
+    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write user namespace gid_map")?;
+    if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+        bail!("setresgid inside user namespace failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setresuid(0, 0, 0) } != 0 {
+        bail!("setresuid inside user namespace failed: {}", std::io::Error::last_os_error());
+    }
+
+    let slash = CString::new("/")?;
+    if unsafe {
+        libc::mount(
+            ptr::null(),
+            slash.as_ptr(),
+            ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            ptr::null(),
+        )
+    } != 0
+    {
+        bail!("make mount namespace private failed: {}", std::io::Error::last_os_error());
+    }
+
+    let root_c = c_path(&root)?;
+    let tmpfs = CString::new("tmpfs")?;
+    let data = CString::new("mode=0755,size=64m")?;
+    if unsafe {
+        libc::mount(
+            tmpfs.as_ptr(),
+            root_c.as_ptr(),
+            tmpfs.as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
+            data.as_ptr().cast(),
+        )
+    } != 0
+    {
+        bail!("mount sandbox tmpfs root failed: {}", std::io::Error::last_os_error());
+    }
+
+    for source in &spec.read_only {
+        bind_into_root(&root, source, true)?;
+    }
+    for source in &spec.read_write {
+        bind_into_root(&root, source, false)?;
+    }
+
+    let old_root = root.join(".oldroot");
+    fs::create_dir_all(&old_root)?;
+    std::env::set_current_dir(&root).context("chdir to namespace root")?;
+    let dot = CString::new(".")?;
+    let old = CString::new(".oldroot")?;
+    if unsafe { libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), old.as_ptr()) } != 0 {
+        bail!("pivot_root failed: {}", std::io::Error::last_os_error());
+    }
+    std::env::set_current_dir("/").context("chdir after pivot_root")?;
+    let old_abs = CString::new("/.oldroot")?;
+    if unsafe { libc::umount2(old_abs.as_ptr(), libc::MNT_DETACH) } != 0 {
+        bail!("detach old root failed: {}", std::io::Error::last_os_error());
+    }
+    fs::remove_dir("/.oldroot").context("remove detached old root mountpoint")?;
+    std::env::set_current_dir(&spec.working_dir)
+        .with_context(|| format!("enter sandbox workspace {}", spec.working_dir.display()))?;
+    return Ok(());
+
+    fn c_path(path: &Path) -> anyhow::Result<CString> {
+        CString::new(path.as_os_str().as_bytes()).context("sandbox path contains NUL")
+    }
+
+    fn bind_into_root(root: &Path, source: &Path, read_only: bool) -> anyhow::Result<()> {
+        let metadata = fs::metadata(source).with_context(|| format!("stat sandbox path {}", source.display()))?;
+        let relative = source.strip_prefix("/").with_context(|| format!("sandbox path must be absolute: {}", source.display()))?;
+        let destination = root.join(relative);
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else {
+            if let Some(parent) = destination.parent() { fs::create_dir_all(parent)?; }
+            if !destination.exists() { fs::File::create(&destination)?; }
+        }
+        let source_c = c_path(source)?;
+        let destination_c = c_path(&destination)?;
+        let bind_flags = if metadata.is_dir() { libc::MS_BIND | libc::MS_REC } else { libc::MS_BIND };
+        if unsafe {
+            libc::mount(
+                source_c.as_ptr(),
+                destination_c.as_ptr(),
+                std::ptr::null(),
+                bind_flags as libc::c_ulong,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            bail!(
+                "bind mount {} -> {} failed: {}",
+                source.display(),
+                destination.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        if read_only {
+            if unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    destination_c.as_ptr(),
+                    std::ptr::null(),
+                    (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                bail!("remount {} read-only failed: {}", destination.display(), std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_seccomp_denylist() -> anyhow::Result<()> {
+    use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+    use std::{collections::BTreeMap, convert::TryInto};
 
     let denied = [
         libc::SYS_mount,
@@ -259,12 +428,15 @@ fn apply_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
     ];
-    let rules: BTreeMap<i64, Vec<SeccompRule>> = denied.into_iter().map(|syscall| (syscall, vec![])).collect();
+    let rules: BTreeMap<i64, Vec<SeccompRule>> =
+        denied.into_iter().map(|syscall| (syscall, vec![])).collect();
     let filter: BpfProgram = SeccompFilter::new(
         rules,
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
-        std::env::consts::ARCH.try_into().map_err(|_| anyhow::anyhow!("unsupported seccomp architecture {}", std::env::consts::ARCH))?,
+        std::env::consts::ARCH
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("unsupported seccomp architecture {}", std::env::consts::ARCH))?,
     )?
     .try_into()?;
     apply_filter(&filter).context("install seccomp filter")?;
