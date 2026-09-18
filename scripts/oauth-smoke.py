@@ -53,14 +53,14 @@ def mcp_meta():
     }
 
 
-def mcp_call(token, method, params=None):
+def mcp_call(token, method, params=None, path="/mcp"):
     body = json.dumps({
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
         "params": params or {},
     }).encode()
-    return request("/mcp", method="POST", data=body, headers={
+    return request(path, method="POST", data=body, headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -72,6 +72,10 @@ def mcp_call(token, method, params=None):
 def main():
     health = request("/health")
     expect(health.status == 200 and health.read() == b"ok", "health endpoint failed")
+
+    root_prm = read_json(request("/.well-known/oauth-protected-resource"))
+    expect(root_prm["resource"] == BASE + "/", "root protected resource URL mismatch")
+    expect(root_prm["authorization_servers"] == [BASE], "root authorization server mismatch")
 
     prm = read_json(request("/.well-known/oauth-protected-resource/mcp"))
     expect(prm["resource"] == BASE + "/mcp", "protected resource URL mismatch")
@@ -163,10 +167,50 @@ def main():
     expect(refreshed.get("access_token"), "refreshed access token missing")
     expect(refreshed.get("refresh_token") != tokens["refresh_token"], "refresh token did not rotate")
 
+
+    root_verifier = "lazyteam-root-pkce-verifier-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    root_challenge = base64.urlsafe_b64encode(hashlib.sha256(root_verifier.encode()).digest()).rstrip(b"=").decode()
+    root_auth = request("/mcp/oauth/authorize", method="POST", data={
+        "client_id": client_id,
+        "redirect_uri": REDIRECT,
+        "code_challenge": root_challenge,
+        "code_challenge_method": "S256",
+        "scope": "lazyteam",
+        "resource": BASE + "/",
+        "state": "root-state",
+        "password": PASSWORD,
+    }, follow=False)
+    expect(root_auth.status in (302, 303), f"root authorize POST did not redirect: {root_auth.status}")
+    root_location = root_auth.headers["Location"]
+    root_query = urllib.parse.parse_qs(urllib.parse.urlparse(root_location).query)
+    expect(root_query.get("state") == ["root-state"], "root OAuth state was not preserved")
+    root_code = root_query["code"][0]
+
+    root_token_resp = request("/mcp/oauth/token", method="POST", data={
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code": root_code,
+        "redirect_uri": REDIRECT,
+        "code_verifier": root_verifier,
+        "resource": BASE + "/",
+    })
+    expect(root_token_resp.status == 200, f"root token exchange failed with HTTP {root_token_resp.status}")
+    root_tokens = read_json(root_token_resp)
+    root_tools = mcp_call(root_tokens["access_token"], "tools/list", {"_meta": mcp_meta()}, path="/")
+    expect(root_tools.status == 200, f"authenticated root tools/list failed with HTTP {root_tools.status}")
+
     unauthorized = request("/mcp", method="POST", data=b"{}", headers={"Content-Type": "application/json"})
     expect(unauthorized.status == 401, f"MCP without bearer should be 401, got {unauthorized.status}")
     www = unauthorized.headers.get("WWW-Authenticate", "")
     expect("resource_metadata=" in www, "WWW-Authenticate lacks resource_metadata")
+    expect("/.well-known/oauth-protected-resource/mcp" in www, "MCP challenge points to wrong metadata")
+
+    root_unauthorized = request("/", method="POST", data=b"{}", headers={"Content-Type": "application/json"})
+    expect(root_unauthorized.status == 401, f"root MCP without bearer should be 401, got {root_unauthorized.status}")
+    root_www = root_unauthorized.headers.get("WWW-Authenticate", "")
+    expect("resource_metadata=" in root_www, "root WWW-Authenticate lacks resource_metadata")
+    expect("/.well-known/oauth-protected-resource" in root_www, "root challenge points to wrong metadata")
+    expect("/.well-known/oauth-protected-resource/mcp" not in root_www, "root challenge leaked MCP-path metadata")
 
     print("OAuth + MCP smoke test passed")
 
