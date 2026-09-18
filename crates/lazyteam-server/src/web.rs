@@ -89,6 +89,13 @@ mod tests {
         assert!(INDEX.contains("worker-config-slots"));
         assert!(INDEX.contains("worker-config-projects"));
         assert!(INDEX.contains("worker-config-tags"));
+        assert!(INDEX.contains("worker-system-tags"));
+        assert!(INDEX.contains("worker-managed-capabilities"));
+        assert!(INDEX.contains("worker-capability-status"));
+        assert!(INDEX.contains("/api/worker-capabilities"));
+        assert!(INDEX.contains("selectedManagedCapabilities"));
+        assert!(INDEX.contains("Adding tools rebuilds the agent container"));
+        assert!(INDEX.contains("pending and will not claim tasks or reviews"));
         assert!(INDEX.contains("worker-config-agent"));
         assert!(INDEX.contains("worker-agent-status"));
         assert!(INDEX.contains("worker-config-prompt"));
@@ -113,6 +120,9 @@ mod tests {
         assert!(!INDEX.contains("STATIC_MODELS"));
         assert!(!INDEX.contains("STATIC_PROVIDERS"));
         assert!(INDEX.contains("project-reviewer-prompt"));
+        assert!(INDEX.contains("project-contributor-name"));
+        assert!(INDEX.contains("project-contributor-email"));
+        assert!(INDEX.contains("contributor:{name:"));
         assert!(INDEX.contains("ChatGPT / MCP"));
         assert!(INDEX.contains("project-git-worker-managed"));
         assert!(INDEX.contains("project-git-auth-mode"));

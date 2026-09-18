@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 const EXEC_ARG: &str = "__lazyteam-sandbox-exec";
+const CONTAINER_EXEC_ARG: &str = "__lazyteam-container-exec";
 const SPEC_ENV: &str = "LAZYTEAM_SANDBOX_SPEC";
 const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".pytest_cache", ".venv"];
 
@@ -19,6 +20,8 @@ struct SandboxSpec {
     read_write: Vec<PathBuf>,
     working_dir: PathBuf,
     namespace_root_base: PathBuf,
+    container_rootfs: Option<PathBuf>,
+    container_read_only: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,11 +37,14 @@ pub struct AgentSandbox {
     read_only: Vec<PathBuf>,
     path: OsString,
     rustup_home: Option<PathBuf>,
+    container_rootfs: Option<PathBuf>,
+    container_read_only: Vec<PathBuf>,
 }
 
 impl AgentSandbox {
-    pub async fn prepare(state_dir: &Path, pi_bin: &str) -> anyhow::Result<Self> {
+    pub async fn prepare(state_dir: &Path, pi_bin: &str, container_rootfs: Option<&Path>) -> anyhow::Result<Self> {
         let state_dir = canonical_dir(state_dir).context("canonicalize worker state directory")?;
+        let container_rootfs = container_rootfs.map(canonical_dir).transpose().context("canonicalize agent rootfs")?;
         let pi_config_dir = state_dir.join("pi-agent");
         let home_dir = state_dir.join("agent-home");
         let cargo_home = state_dir.join("agent-cache").join("cargo");
@@ -53,54 +59,71 @@ impl AgentSandbox {
             tokio::fs::create_dir_all(dir).await?;
             set_private_dir(dir).await?;
         }
-        let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
+        let host_path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
+        let mut path = if container_rootfs.is_some() {
+            OsString::from("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        } else {
+            host_path.clone()
+        };
         let mut read_only = BTreeSet::new();
+        let mut container_read_only = BTreeSet::new();
         for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
             if let Ok(path) = std::fs::canonicalize(path) {
                 read_only.insert(path);
             }
         }
         for path in ["/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"] {
-            if let Ok(path) = std::fs::canonicalize(path) {
+            if container_rootfs.is_some() {
+                read_only.insert(PathBuf::from(path));
+            } else if let Ok(path) = std::fs::canonicalize(path) {
                 read_only.insert(path);
             }
         }
-        let host_home = std::env::var_os("HOME").map(PathBuf::from).and_then(|path| std::fs::canonicalize(path).ok());
-        for dir in std::env::split_paths(&path) {
-            if let Ok(dir) = std::fs::canonicalize(dir) {
-                let broad_home = host_home.as_ref().is_some_and(|home| dir == *home || home.starts_with(&dir));
-                if !broad_home {
-                    read_only.insert(dir);
+        if container_rootfs.is_none() {
+            let host_home = std::env::var_os("HOME").map(PathBuf::from).and_then(|path| std::fs::canonicalize(path).ok());
+            for dir in std::env::split_paths(&host_path) {
+                if let Ok(dir) = std::fs::canonicalize(dir) {
+                    let broad_home = host_home.as_ref().is_some_and(|home| dir == *home || home.starts_with(&dir));
+                    if !broad_home {
+                        read_only.insert(dir);
+                    }
                 }
             }
         }
 
-        if let Some(program) = resolve_program(pi_bin, &path) {
+        if let Some(program) = resolve_program(pi_bin, &host_path) {
             if let Ok(target) = std::fs::canonicalize(&program) {
-                if let Some(root) = common_ancestor(&program, &target).filter(|root| path_depth(root) >= 3) {
-                    read_only.insert(root);
-                } else {
-                    if let Some(parent) = program.parent() { read_only.insert(parent.to_path_buf()); }
-                    if let Some(parent) = target.parent() { read_only.insert(parent.to_path_buf()); }
+                let runtime_root = common_ancestor(&program, &target).filter(|root| path_depth(root) >= 3)
+                    .or_else(|| program.parent().map(Path::to_path_buf));
+                if let Some(root) = runtime_root {
+                    read_only.insert(root.clone());
+                    if container_rootfs.is_some() {
+                        container_read_only.insert(root.clone());
+                        if let Some(bin) = program.parent() {
+                            let mut paths = vec![bin.to_path_buf()];
+                            paths.extend(std::env::split_paths(&path));
+                            path = std::env::join_paths(paths).context("compose agent container PATH")?;
+                        }
+                    }
                 }
             }
         }
 
-        let host_cargo_bin = std::env::var_os("CARGO_HOME")
+        let host_cargo_bin = container_rootfs.is_none().then(|| std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
             .map(|path| path.join("bin"))
             .filter(|path| path.exists())
-            .and_then(|path| std::fs::canonicalize(path).ok());
+            .and_then(|path| std::fs::canonicalize(path).ok())).flatten();
         if let Some(path) = host_cargo_bin {
             read_only.insert(path);
         }
 
-        let rustup_home = std::env::var_os("RUSTUP_HOME")
+        let rustup_home = container_rootfs.is_none().then(|| std::env::var_os("RUSTUP_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
             .filter(|path| path.exists())
-            .and_then(|path| std::fs::canonicalize(path).ok());
+            .and_then(|path| std::fs::canonicalize(path).ok())).flatten();
         if let Some(path) = &rustup_home {
             read_only.insert(path.clone());
         }
@@ -117,6 +140,8 @@ impl AgentSandbox {
             read_only: read_only.into_iter().collect(),
             path,
             rustup_home,
+            container_rootfs,
+            container_read_only: container_read_only.into_iter().collect(),
         };
         sandbox.probe().await?;
         Ok(sandbox)
@@ -183,9 +208,11 @@ impl AgentSandbox {
             read_write,
             working_dir: workspace.clone(),
             namespace_root_base: self.namespace_root_base.clone(),
+            container_rootfs: self.container_rootfs.clone(),
+            container_read_only: self.container_read_only.clone(),
         };
         let mut command = Command::new(std::env::current_exe().context("resolve lazyteam-worker executable")?);
-        command.arg(EXEC_ARG).arg(program);
+        command.arg(if self.container_rootfs.is_some() { CONTAINER_EXEC_ARG } else { EXEC_ARG }).arg(program);
         command.current_dir(&workspace);
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         command.env_clear();
@@ -236,19 +263,25 @@ pub fn maybe_handle_entrypoint() -> Option<anyhow::Result<()>> {
     let mut args = std::env::args_os();
     let _ = args.next();
     let mode = args.next()?;
-    if mode != OsStr::new(EXEC_ARG) {
-        return None;
+    if mode == OsStr::new(EXEC_ARG) {
+        return Some(sandbox_exec(args.collect(), false));
     }
-    Some(sandbox_exec(args.collect()))
+    if mode == OsStr::new(CONTAINER_EXEC_ARG) {
+        return Some(sandbox_exec(args.collect(), true));
+    }
+    None
 }
 
-fn sandbox_exec(mut args: Vec<OsString>) -> anyhow::Result<()> {
+fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Result<()> {
     if args.is_empty() {
         bail!("sandbox helper missing program");
     }
     let program = args.remove(0);
     let raw = std::env::var(SPEC_ENV).context("sandbox helper missing policy")?;
     let spec: SandboxSpec = serde_json::from_str(&raw).context("parse sandbox policy")?;
+    if enter_container {
+        enter_agent_container(&spec)?;
+    }
     apply_policy(&spec)?;
 
     #[cfg(unix)]
@@ -264,6 +297,171 @@ fn sandbox_exec(mut args: Vec<OsString>) -> anyhow::Result<()> {
         let _ = (program, args);
         bail!("embedded agent sandbox is only supported on Unix")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
+    use std::{ffi::CString, fs, os::unix::ffi::OsStrExt, ptr};
+
+    let rootfs = spec.container_rootfs.as_ref().context("agent container rootfs is missing")?;
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+        bail!("unshare agent container user namespace failed: {}", std::io::Error::last_os_error());
+    }
+    let setgroups = Path::new("/proc/self/setgroups");
+    if setgroups.exists() {
+        fs::write(setgroups, b"deny\n").context("disable setgroups for agent container")?;
+    }
+    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write agent container uid_map")?;
+    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write agent container gid_map")?;
+    if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+        bail!("setresgid inside agent container failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setresuid(0, 0, 0) } != 0 {
+        bail!("setresuid inside agent container failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        bail!("unshare agent container mount namespace failed: {}", std::io::Error::last_os_error());
+    }
+
+    let slash = CString::new("/")?;
+    if unsafe {
+        libc::mount(
+            ptr::null(),
+            slash.as_ptr(),
+            ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            ptr::null(),
+        )
+    } != 0 {
+        bail!("make agent container mounts private failed: {}", std::io::Error::last_os_error());
+    }
+
+    let rootfs_c = CString::new(rootfs.as_os_str().as_bytes())?;
+    if unsafe {
+        libc::mount(
+            rootfs_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            ptr::null(),
+            libc::MS_BIND as libc::c_ulong,
+            ptr::null(),
+        )
+    } != 0 {
+        bail!("bind agent rootfs failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Create every bind target while the image is still writable. This vendor
+    // kernel rejects making the root mount read-only after child mounts already exist.
+    for source in spec.container_read_only.iter().chain(spec.read_write.iter()).chain(std::iter::once(&spec.namespace_root_base)) {
+        prepare_container_mountpoint(rootfs, source)?;
+    }
+
+    // Freeze the image before layering any child mounts. util-linux uses the
+    // new mount API on this RK3588 kernel because legacy bind-remount can be rejected.
+    if let Err(new_api_error) = mount_path_read_only(&rootfs_c) {
+        if unsafe {
+            libc::mount(
+                ptr::null(),
+                rootfs_c.as_ptr(),
+                ptr::null(),
+                (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
+                ptr::null(),
+            )
+        } != 0 {
+            bail!("make agent rootfs read-only failed: mount_setattr={new_api_error}; legacy={}", std::io::Error::last_os_error());
+        }
+    }
+
+    for source in &spec.container_read_only {
+        bind_into_container(rootfs, source, true)?;
+    }
+    for source in &spec.read_write {
+        bind_into_container(rootfs, source, false)?;
+    }
+    // Helper-only scratch for constructing the inner tmpfs root. It is deliberately
+    // not part of spec.read_write, so the final Pi sandbox does not expose it.
+    bind_into_container(rootfs, &spec.namespace_root_base, false)?;
+
+    if unsafe { libc::chroot(rootfs_c.as_ptr()) } != 0 {
+        bail!("chroot agent container failed: {}", std::io::Error::last_os_error());
+    }
+    std::env::set_current_dir("/").context("chdir inside agent container")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_path_read_only(path: &std::ffi::CString) -> anyhow::Result<()> {
+    let attr = libc::mount_attr {
+        attr_set: libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID,
+        attr_clr: libc::MOUNT_ATTR__ATIME,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            0_u32,
+            &attr as *const libc::mount_attr,
+            std::mem::size_of::<libc::mount_attr>(),
+        )
+    };
+    if result != 0 {
+        bail!("mount_setattr read-only failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_container_mountpoint(rootfs: &Path, source: &Path) -> anyhow::Result<()> {
+    use std::fs;
+    let metadata = fs::metadata(source).with_context(|| format!("stat container bind {}", source.display()))?;
+    let relative = source.strip_prefix("/").with_context(|| format!("container bind must be absolute: {}", source.display()))?;
+    let destination = rootfs.join(relative);
+    if metadata.is_dir() {
+        fs::create_dir_all(&destination)?;
+    } else {
+        if let Some(parent) = destination.parent() { fs::create_dir_all(parent)?; }
+        if !destination.exists() { fs::File::create(&destination)?; }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_into_container(rootfs: &Path, source: &Path, read_only: bool) -> anyhow::Result<()> {
+    use std::{ffi::CString, fs, os::unix::ffi::OsStrExt, ptr};
+
+    let metadata = fs::metadata(source).with_context(|| format!("stat container bind {}", source.display()))?;
+    let relative = source.strip_prefix("/").with_context(|| format!("container bind must be absolute: {}", source.display()))?;
+    let destination = rootfs.join(relative);
+    let source_c = CString::new(source.as_os_str().as_bytes())?;
+    let destination_c = CString::new(destination.as_os_str().as_bytes())?;
+    let flags = if metadata.is_dir() { libc::MS_BIND | libc::MS_REC } else { libc::MS_BIND };
+    if unsafe { libc::mount(source_c.as_ptr(), destination_c.as_ptr(), ptr::null(), flags as libc::c_ulong, ptr::null()) } != 0 {
+        bail!("bind container path {} failed: {}", source.display(), std::io::Error::last_os_error());
+    }
+    if read_only {
+        if unsafe {
+            libc::mount(
+                ptr::null(),
+                destination_c.as_ptr(),
+                ptr::null(),
+                (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
+                ptr::null(),
+            )
+        } != 0 {
+            bail!("remount container path {} read-only failed: {}", source.display(), std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enter_agent_container(_spec: &SandboxSpec) -> anyhow::Result<()> {
+    bail!("agent container requires Linux")
 }
 
 #[cfg(target_os = "linux")]
@@ -320,7 +518,11 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
     // a rootless user namespace (for example our Ubuntu container smoke), creating a
     // nested user namespace may be forbidden. In that case reuse the existing rootless
     // user namespace and create only a fresh mount namespace for the agent.
-    let created_user_namespace = if unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0 {
+    let created_user_namespace = if spec.container_rootfs.is_some() {
+        // The outer agent container already mapped host worker uid/gid to namespace root.
+        // Reuse it instead of depending on nested user namespaces or /proc inside the container.
+        false
+    } else if unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0 {
         true
     } else {
         let error = std::io::Error::last_os_error();
@@ -480,7 +682,7 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
             );
         }
         if read_only && metadata.is_dir() {
-            if unsafe {
+            let remount_read_only = unsafe {
                 libc::mount(
                     std::ptr::null(),
                     destination_c.as_ptr(),
@@ -488,9 +690,15 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
                     (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
                     std::ptr::null(),
                 )
-            } != 0
-            {
-                bail!("remount {} read-only failed: {}", destination.display(), std::io::Error::last_os_error());
+            } == 0;
+            if !remount_read_only {
+                // Nested rootless mount namespaces on some vendor kernels reject a
+                // second bind-remount. Accept that only when the source is already
+                // non-writable because the outer Ubuntu image mount is read-only.
+                let writable = unsafe { libc::access(source_c.as_ptr(), libc::W_OK) } == 0;
+                if writable {
+                    bail!("read-only sandbox directory is writable by the worker: {}", source.display());
+                }
             }
         } else if read_only {
             // Prefer an actual read-only bind remount. Some vendor kernels reject this for

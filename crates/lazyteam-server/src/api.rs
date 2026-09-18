@@ -10,11 +10,11 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use lazyteam_core::{
-    worker_can_run_project, worker_matches_task, AgentCapabilities, AgentConfig, AgentRole, Assignment,
-    Execution, ExecutionResult, ExecutionState, GitAuthConfig, GitAuthMode, GitCredential, Project,
-    ReviewAssignment, ReviewCheckout as WorkerReviewCheckout, ReviewLease, ReviewerConfig, ReviewerMode,
-    ReviewVerdict, ReviewVerdictKind, Tags, Task, TaskState, Worker, WorkerState,
-    DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT,
+    managed_capability_tag, worker_can_run_project, worker_matches_task, AgentCapabilities, AgentConfig,
+    AgentRole, Assignment, ContributorIdentity, Execution, ExecutionResult, ExecutionState, GitAuthConfig,
+    GitAuthMode, GitCredential, Project, ReviewAssignment, ReviewCheckout as WorkerReviewCheckout, ReviewLease,
+    ReviewerConfig, ReviewerMode, ReviewVerdict, ReviewVerdictKind, Tags, Task, TaskState, Worker,
+    WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT, MANAGED_CAPABILITY_IDS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u32 = 4;
+pub(crate) const PROTOCOL_VERSION: u32 = 5;
 const MIN_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
@@ -54,6 +54,8 @@ pub(crate) struct CreateProject {
     #[serde(default = "default_branch")]
     pub(crate) default_branch: String,
     #[serde(default)]
+    pub(crate) contributor: ContributorIdentity,
+    #[serde(default)]
     pub(crate) required_worker_tags: Tags,
     #[serde(default)]
     pub(crate) default_task_tags: Tags,
@@ -64,6 +66,15 @@ pub(crate) struct CreateProject {
 }
 
 fn default_branch() -> String { "main".into() }
+
+fn normalize_contributor(mut contributor: ContributorIdentity) -> Result<ContributorIdentity, ApiError> {
+    contributor.name = contributor.name.trim().to_string();
+    contributor.email = contributor.email.trim().to_string();
+    if contributor.name.is_empty() || contributor.email.is_empty() || !contributor.email.contains('@') || contributor.email.chars().any(char::is_whitespace) {
+        return Err((StatusCode::BAD_REQUEST, "contributor name and a valid email are required".into()));
+    }
+    Ok(contributor)
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct ProjectGitAuthInput {
@@ -88,6 +99,7 @@ struct UpdateProject {
     name: Option<String>,
     repo_url: Option<String>,
     default_branch: Option<String>,
+    contributor: Option<ContributorIdentity>,
     required_worker_tags: Option<Tags>,
     default_task_tags: Option<Tags>,
     reviewer: Option<ReviewerConfig>,
@@ -185,6 +197,7 @@ struct UpdateWorker {
     name: Option<String>,
     role: Option<AgentRole>,
     tags: Option<Tags>,
+    managed_capabilities: Option<BTreeSet<String>>,
     allowed_projects: Option<BTreeSet<String>>,
     slots: Option<u32>,
     agent_type: Option<String>,
@@ -198,6 +211,8 @@ struct UpdateWorker {
 struct WorkerRuntimeConfig {
     role: AgentRole,
     agent: AgentConfig,
+    managed_capabilities: BTreeSet<String>,
+    installed_capabilities: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
@@ -218,6 +233,74 @@ struct AgentAuthDelivery {
     id: Uuid,
     provider: String,
     api_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagedCapabilityOption {
+    id: &'static str,
+    label: &'static str,
+    tag: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityBuildReport {
+    #[serde(default)]
+    installed_capabilities: BTreeSet<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn managed_capability_label(id: &str) -> &'static str {
+    match id {
+        "rust" => "Rust",
+        "python" => "Python",
+        "node" => "Node.js",
+        "go" => "Go",
+        "gcc" => "GCC / C",
+        "cpp" => "C++",
+        "clang" => "Clang / LLVM",
+        "java" => "Java",
+        "cmake" => "CMake / Ninja",
+        "ruby" => "Ruby",
+        "php" => "PHP CLI",
+        _ => "Unknown",
+    }
+}
+
+fn validate_managed_capabilities(capabilities: &BTreeSet<String>) -> Result<(), ApiError> {
+    if let Some(unknown) = capabilities.iter().find(|id| !MANAGED_CAPABILITY_IDS.contains(&id.as_str())) {
+        return Err((StatusCode::BAD_REQUEST, format!("unknown managed capability {unknown}")));
+    }
+    Ok(())
+}
+
+fn validate_user_tags(tags: &Tags) -> Result<(), ApiError> {
+    if let Some(key) = tags.keys().find(|key| key.as_str() == "os" || key.as_str() == "arch" || key.starts_with("tool.")) {
+        return Err((StatusCode::BAD_REQUEST, format!("tag {key} is managed by LazyTeam and cannot be edited as a user tag")));
+    }
+    Ok(())
+}
+
+fn effective_worker_tags(os: &str, arch: &str, user_tags: &Tags, managed: &BTreeSet<String>, installed: &BTreeSet<String>) -> Tags {
+    let mut tags = Tags::from([("os".into(), os.into()), ("arch".into(), arch.into())]);
+    tags.extend(user_tags.clone());
+    for capability in managed.intersection(installed) {
+        if let Some(tag) = managed_capability_tag(capability) {
+            tags.insert(tag, "true".into());
+        }
+    }
+    tags
+}
+
+fn worker_state_str(state: &WorkerState) -> &'static str {
+    match state {
+        WorkerState::Idle => "idle",
+        WorkerState::Busy => "busy",
+        WorkerState::Pending => "pending",
+        WorkerState::Draining => "draining",
+        WorkerState::Degraded => "degraded",
+        WorkerState::Offline => "offline",
+    }
 }
 
 fn default_slots() -> u32 { 1 }
@@ -258,6 +341,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/tasks/{id}/review", get(review_evidence))
         .route("/api/task-board", get(task_board))
         .route("/api/workers", get(list_workers))
+        .route("/api/worker-capabilities", get(worker_capability_catalog))
         .route("/api/workers/{id}", axum::routing::patch(update_worker))
         .route("/api/worker-join", post(create_worker_join_code))
         .route("/api/workers/register", post(register_worker))
@@ -265,6 +349,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/provider-key", post(queue_worker_provider_key))
         .route("/api/workers/{id}/agent-auth", get(worker_agent_auth))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
+        .route("/api/workers/{id}/capability-build", post(report_capability_build))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
         .route("/api/workers/{id}/cleanup", get(worker_cleanup))
         .route("/api/workers/{id}/cleanup/{task_id}", post(worker_cleanup_ack))
@@ -277,6 +362,16 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
 }
 
 async fn health() -> &'static str { "ok" }
+
+async fn worker_capability_catalog() -> Json<Vec<ManagedCapabilityOption>> {
+    Json(MANAGED_CAPABILITY_IDS.iter().filter_map(|id| {
+        managed_capability_tag(id).map(|tag| ManagedCapabilityOption {
+            id,
+            label: managed_capability_label(id),
+            tag,
+        })
+    }).collect())
+}
 
 async fn create_worker_join_code(State(state): State<Arc<AppState>>) -> ApiResult<WorkerJoinCode> {
     let server = state.public_url.as_deref().ok_or((
@@ -303,17 +398,19 @@ pub(crate) async fn create_project(State(state): State<Arc<AppState>>, Json(inpu
     if input.reviewer.initial_prompt.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "reviewer initial prompt must not be empty".into()));
     }
+    let contributor = normalize_contributor(input.contributor)?;
     let stored_git_auth = resolve_new_git_auth(&state, input.git_auth)?;
     let now = Utc::now();
     let project = Project {
         id: Uuid::new_v4(), slug: input.slug, name: input.name.trim().into(), repo_url: input.repo_url.trim().into(),
-        default_branch: input.default_branch.trim().into(), required_worker_tags: input.required_worker_tags,
+        default_branch: input.default_branch.trim().into(), contributor, required_worker_tags: input.required_worker_tags,
         default_task_tags: input.default_task_tags, reviewer: input.reviewer,
         git_auth: git_auth_summary(&stored_git_auth), enabled: true, created_at: now, updated_at: now,
     };
-    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,required_worker_tags,default_task_tags,reviewer_mode,reviewer_prompt,git_auth_mode,git_auth_username,git_auth_secret,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,contributor_name,contributor_email,required_worker_tags,default_task_tags,reviewer_mode,reviewer_prompt,git_auth_mode,git_auth_username,git_auth_secret,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(project.id.to_string()).bind(&project.slug).bind(&project.name).bind(&project.repo_url)
-        .bind(&project.default_branch).bind(json(&project.required_worker_tags)?).bind(json(&project.default_task_tags)?)
+        .bind(&project.default_branch).bind(&project.contributor.name).bind(&project.contributor.email)
+        .bind(json(&project.required_worker_tags)?).bind(json(&project.default_task_tags)?)
         .bind(reviewer_mode_str(&project.reviewer.mode)).bind(&project.reviewer.initial_prompt)
         .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret)
         .bind(1_i64).bind(ts(project.created_at)).bind(ts(project.updated_at))
@@ -341,13 +438,15 @@ async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
     if name.trim().is_empty() || repo_url.trim().is_empty() || default_branch.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "project name, repository, and default branch are required".into()));
     }
+    let contributor = normalize_contributor(input.contributor.unwrap_or(current.contributor))?;
     let reviewer = input.reviewer.unwrap_or(current.reviewer);
     if reviewer.initial_prompt.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "reviewer initial prompt must not be empty".into()));
     }
     let stored_git_auth = resolve_updated_git_auth(&state, &row, input.git_auth)?;
-    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,required_worker_tags=?,default_task_tags=?,reviewer_mode=?,reviewer_prompt=?,git_auth_mode=?,git_auth_username=?,git_auth_secret=?,enabled=?,updated_at=? WHERE id=?")
+    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,contributor_name=?,contributor_email=?,required_worker_tags=?,default_task_tags=?,reviewer_mode=?,reviewer_prompt=?,git_auth_mode=?,git_auth_username=?,git_auth_secret=?,enabled=?,updated_at=? WHERE id=?")
         .bind(&slug).bind(name.trim()).bind(repo_url.trim()).bind(default_branch.trim())
+        .bind(&contributor.name).bind(&contributor.email)
         .bind(json(&input.required_worker_tags.unwrap_or(current.required_worker_tags))?)
         .bind(json(&input.default_task_tags.unwrap_or(current.default_task_tags))?)
         .bind(reviewer_mode_str(&reviewer.mode)).bind(reviewer.initial_prompt.trim())
@@ -512,16 +611,15 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
     let now = Utc::now();
     let credential = format!("ltw_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let credential_hash = hash_secret(&credential);
-    let mut tags = input.tags;
-    tags.entry("os".into()).or_insert_with(|| input.os.clone());
-    tags.entry("arch".into()).or_insert_with(|| input.arch.clone());
+    let tags = input.tags;
+    validate_user_tags(&tags)?;
     if input.agent_type != "pi" {
         return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into()));
     }
     let agent_capabilities = json(&input.agent_capabilities)?;
     let role = agent_role_str(&input.role);
     let default_prompt = match input.role { AgentRole::Worker => DEFAULT_WORKER_PROMPT, AgentRole::Reviewer => DEFAULT_REVIEWER_PROMPT };
-    sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at,credential_hash,agent_type,agent_provider,agent_model,initial_prompt,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,state=CASE WHEN workers.running_slots>0 THEN 'busy' ELSE 'idle' END,os=excluded.os,arch=excluded.arch,protocol_version=excluded.protocol_version,worker_version=excluded.worker_version,last_heartbeat_at=excluded.last_heartbeat_at,credential_hash=excluded.credential_hash,agent_capabilities=excluded.agent_capabilities")
+    sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at,credential_hash,agent_type,agent_provider,agent_model,initial_prompt,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,state=CASE WHEN workers.state IN ('pending','draining','degraded') THEN workers.state WHEN workers.running_slots>0 THEN 'busy' ELSE 'idle' END,os=excluded.os,arch=excluded.arch,protocol_version=excluded.protocol_version,worker_version=excluded.worker_version,last_heartbeat_at=excluded.last_heartbeat_at,credential_hash=excluded.credential_hash,agent_capabilities=excluded.agent_capabilities")
         .bind(id.to_string()).bind(&input.name).bind(role).bind("idle").bind(&input.os).bind(&input.arch).bind(json(&tags)?)
         .bind(json(&input.allowed_projects)?).bind(input.slots.max(1) as i64).bind(0_i64).bind(input.protocol_version as i64)
         .bind(&input.worker_version).bind(ts(now)).bind(ts(now)).bind(credential_hash).bind(&input.agent_type)
@@ -545,16 +643,16 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let current = worker_from_row(&row)?;
-    let role = input.role.unwrap_or(current.role.clone());
+    let role = input.role.unwrap_or_else(|| current.role.clone());
     if role == AgentRole::Reviewer && current.protocol_version < 3 {
         return Err((StatusCode::CONFLICT, "update/restart this worker with protocol 3 before assigning the reviewer role".into()));
     }
-    let agent_type = input.agent_type.unwrap_or(current.agent.agent_type);
+    let agent_type = input.agent_type.unwrap_or_else(|| current.agent.agent_type.clone());
     if agent_type != "pi" { return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into())); }
     let (provider, model) = if input.clear_model.unwrap_or(false) {
         (None, None)
     } else {
-        (input.provider.or(current.agent.provider), input.model.or(current.agent.model))
+        (input.provider.or_else(|| current.agent.provider.clone()), input.model.or_else(|| current.agent.model.clone()))
     };
     if provider.is_some() != model.is_some() {
         return Err((StatusCode::BAD_REQUEST, "provider and model must be set or cleared together".into()));
@@ -566,15 +664,33 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
             return Err((StatusCode::BAD_REQUEST, "selected provider/model is not reported by this worker".into()));
         }
     }
-    let initial_prompt = input.initial_prompt.unwrap_or(current.agent.initial_prompt);
+    let initial_prompt = input.initial_prompt.unwrap_or_else(|| current.agent.initial_prompt.clone());
     if initial_prompt.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, "initial prompt must not be empty".into())); }
-    let name = input.name.unwrap_or(current.name);
+    let name = input.name.unwrap_or_else(|| current.name.clone());
     if name.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, "worker name must not be empty".into())); }
-    let tags = input.tags.unwrap_or(current.tags);
-    let allowed_projects = input.allowed_projects.unwrap_or(current.allowed_projects);
+    let tags = input.tags.unwrap_or_else(|| current.user_tags.clone());
+    validate_user_tags(&tags)?;
+    let managed_capabilities = input.managed_capabilities.unwrap_or_else(|| current.managed_capabilities.clone());
+    validate_managed_capabilities(&managed_capabilities)?;
+    if managed_capabilities != current.managed_capabilities && current.protocol_version < 5 {
+        return Err((StatusCode::CONFLICT, "update/restart this worker with protocol 5 before changing managed tools".into()));
+    }
+    let allowed_projects = input.allowed_projects.unwrap_or_else(|| current.allowed_projects.clone());
     let slots = input.slots.unwrap_or(current.slots).max(1);
-    sqlx::query("UPDATE workers SET name=?,role=?,tags=?,allowed_projects=?,slots=?,agent_type=?,agent_provider=?,agent_model=?,initial_prompt=? WHERE id=?")
-        .bind(name.trim()).bind(agent_role_str(&role)).bind(json(&tags)?).bind(json(&allowed_projects)?).bind(slots as i64)
+    let needs_build = !managed_capabilities.is_subset(&current.installed_capabilities);
+    let recovering_capability_state = matches!(current.state, WorkerState::Pending)
+        || (matches!(current.state, WorkerState::Degraded) && current.capability_error.is_some());
+    let next_state = if needs_build {
+        "pending"
+    } else if recovering_capability_state {
+        if current.running_slots > 0 { "busy" } else { "idle" }
+    } else {
+        worker_state_str(&current.state)
+    };
+    let capability_error = if needs_build || recovering_capability_state { None } else { current.capability_error.as_deref() };
+    sqlx::query("UPDATE workers SET name=?,role=?,tags=?,managed_capabilities=?,capability_error=?,state=?,allowed_projects=?,slots=?,agent_type=?,agent_provider=?,agent_model=?,initial_prompt=? WHERE id=?")
+        .bind(name.trim()).bind(agent_role_str(&role)).bind(json(&tags)?).bind(json(&managed_capabilities)?)
+        .bind(capability_error).bind(next_state).bind(json(&allowed_projects)?).bind(slots as i64)
         .bind(&agent_type).bind(&provider).bind(&model).bind(initial_prompt.trim()).bind(id.to_string())
         .execute(&state.db).await.map_err(db_error)?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
@@ -585,7 +701,12 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
     require_worker(&state.db, id, &headers).await?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let worker = worker_from_row(&row)?;
-    Ok(Json(WorkerRuntimeConfig { role: worker.role, agent: worker.agent }))
+    Ok(Json(WorkerRuntimeConfig {
+        role: worker.role,
+        agent: worker.agent,
+        managed_capabilities: worker.managed_capabilities,
+        installed_capabilities: worker.installed_capabilities,
+    }))
 }
 
 async fn queue_worker_provider_key(
@@ -662,9 +783,43 @@ async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Ar
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn report_capability_build(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(report): Json<CapabilityBuildReport>,
+) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    validate_managed_capabilities(&report.installed_capabilities)?;
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
+    let worker = worker_from_row(&row)?;
+    if worker.protocol_version < 5 {
+        return Err((StatusCode::CONFLICT, "worker protocol 5 is required for managed tool builds".into()));
+    }
+    if let Some(error) = report.error.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        sqlx::query("UPDATE workers SET state='degraded',capability_error=? WHERE id=?")
+            .bind(error).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if !worker.installed_capabilities.is_subset(&report.installed_capabilities) {
+        return Err((StatusCode::CONFLICT, "managed tool builds are monotonic; installed capabilities cannot be removed".into()));
+    }
+    let ready = worker.managed_capabilities.is_subset(&report.installed_capabilities);
+    let next_state = if ready {
+        if worker.running_slots > 0 { "busy" } else { "idle" }
+    } else {
+        "pending"
+    };
+    sqlx::query("UPDATE workers SET installed_capabilities=?,capability_error=NULL,state=? WHERE id=?")
+        .bind(json(&report.installed_capabilities)?).bind(next_state).bind(id.to_string())
+        .execute(&state.db).await.map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
     require_worker(&state.db, id, &headers).await?;
-    let changed = sqlx::query("UPDATE workers SET last_heartbeat_at=?, state=CASE WHEN state='draining' THEN state WHEN running_slots>0 THEN 'busy' ELSE 'idle' END WHERE id=?")
+    let changed = sqlx::query("UPDATE workers SET last_heartbeat_at=?, state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots>0 THEN 'busy' ELSE 'idle' END WHERE id=?")
         .bind(ts(Utc::now())).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
     if changed == 0 { return Err((StatusCode::NOT_FOUND, "worker not found".into())); }
     Ok(StatusCode::NO_CONTENT)
@@ -706,7 +861,7 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
     if worker.role != AgentRole::Worker {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    if worker.running_slots >= worker.slots || matches!(worker.state, WorkerState::Draining | WorkerState::Degraded | WorkerState::Offline) {
+    if worker.running_slots >= worker.slots || !matches!(worker.state, WorkerState::Idle | WorkerState::Busy) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     let rows = sqlx::query("SELECT * FROM tasks WHERE state='queued' ORDER BY priority DESC, created_at ASC LIMIT 100")
@@ -756,7 +911,7 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
     if worker.role != AgentRole::Reviewer || worker.protocol_version < 3 {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    if worker.running_slots >= worker.slots || matches!(worker.state, WorkerState::Draining | WorkerState::Degraded | WorkerState::Offline) {
+    if worker.running_slots >= worker.slots || !matches!(worker.state, WorkerState::Idle | WorkerState::Busy) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
@@ -892,7 +1047,7 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
             }
         }
     }
-    sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state='draining' THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
+    sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
         .bind(&reviewer_worker_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -934,7 +1089,7 @@ async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState
         .execute(&mut *tx).await.map_err(db_error)?;
     sqlx::query("UPDATE tasks SET state=?,sticky_worker_id=CASE WHEN ? THEN sticky_worker_id ELSE NULL END,updated_at=? WHERE id=?")
         .bind(if success { "review" } else { "draft" }).bind(success).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
-    sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state='draining' THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
+    sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
         .bind(&worker_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1010,7 +1165,7 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
             sqlx::query("UPDATE tasks SET state='queued',updated_at=? WHERE id=? AND state IN ('assigned','running')")
                 .bind(&now).bind(&task_id).execute(&mut *tx).await?;
         }
-        sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state='draining' THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
+        sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
             .bind(&worker_id).execute(&mut *tx).await?;
         tx.commit().await?;
     }
@@ -1024,7 +1179,7 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
         let changed = sqlx::query("UPDATE reviews SET state='lost',finished_at=? WHERE id=? AND state IN ('assigned','running')")
             .bind(&now).bind(&id).execute(&mut *tx).await?.rows_affected();
         if changed > 0 {
-            sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state='draining' THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
+            sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
                 .bind(&reviewer_worker_id).execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -1203,6 +1358,10 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, ApiError> 
     Ok(Project {
         id: uuid(row.try_get("id").map_err(internal)?)?, slug: row.try_get("slug").map_err(internal)?, name: row.try_get("name").map_err(internal)?,
         repo_url: row.try_get("repo_url").map_err(internal)?, default_branch: row.try_get("default_branch").map_err(internal)?,
+        contributor: ContributorIdentity {
+            name: row.try_get("contributor_name").map_err(internal)?,
+            email: row.try_get("contributor_email").map_err(internal)?,
+        },
         required_worker_tags: dejson(row.try_get("required_worker_tags").map_err(internal)?)?, default_task_tags: dejson(row.try_get("default_task_tags").map_err(internal)?)?,
         reviewer: ReviewerConfig {
             mode: reviewer_mode(row.try_get("reviewer_mode").map_err(internal)?)?,
@@ -1222,10 +1381,18 @@ fn worker_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Worker, ApiError> {
     let initial_prompt: String = row.try_get("initial_prompt").map_err(internal)?;
     let capabilities_raw: String = row.try_get("agent_capabilities").map_err(internal)?;
     let capabilities = serde_json::from_str::<AgentCapabilities>(&capabilities_raw).unwrap_or_default();
+    let os: String = row.try_get("os").map_err(internal)?;
+    let arch: String = row.try_get("arch").map_err(internal)?;
+    let user_tags: Tags = dejson(row.try_get("tags").map_err(internal)?)?;
+    let managed_capabilities: BTreeSet<String> = dejson(row.try_get("managed_capabilities").map_err(internal)?)?;
+    let installed_capabilities: BTreeSet<String> = dejson(row.try_get("installed_capabilities").map_err(internal)?)?;
+    let system_tags = Tags::from([("os".into(), os.clone()), ("arch".into(), arch.clone())]);
+    let tags = effective_worker_tags(&os, &arch, &user_tags, &managed_capabilities, &installed_capabilities);
     Ok(Worker { id: uuid(row.try_get("id").map_err(internal)?)?, name: row.try_get("name").map_err(internal)?,
         role: agent_role(row.try_get("role").map_err(internal)?)?,
-        state: match state.as_str() { "busy" => WorkerState::Busy, "draining" => WorkerState::Draining, "degraded" => WorkerState::Degraded, "offline" => WorkerState::Offline, _ => WorkerState::Idle },
-        os: row.try_get("os").map_err(internal)?, arch: row.try_get("arch").map_err(internal)?, tags: dejson(row.try_get("tags").map_err(internal)?)?,
+        state: match state.as_str() { "busy" => WorkerState::Busy, "pending" => WorkerState::Pending, "draining" => WorkerState::Draining, "degraded" => WorkerState::Degraded, "offline" => WorkerState::Offline, _ => WorkerState::Idle },
+        os, arch, system_tags, user_tags, managed_capabilities, installed_capabilities,
+        capability_error: row.try_get("capability_error").map_err(internal)?, tags,
         allowed_projects: dejson(row.try_get("allowed_projects").map_err(internal)?)?, slots: row.try_get::<i64,_>("slots").map_err(internal)? as u32,
         running_slots: row.try_get::<i64,_>("running_slots").map_err(internal)? as u32, protocol_version: row.try_get::<i64,_>("protocol_version").map_err(internal)? as u32,
         worker_version: row.try_get("worker_version").map_err(internal)?, last_heartbeat_at: datetime(row.try_get("last_heartbeat_at").map_err(internal)?)?,

@@ -28,6 +28,10 @@ pub struct ProjectCreateParams {
     pub repo_url: String,
     #[serde(default = "default_branch")]
     pub default_branch: String,
+    #[serde(default = "default_contributor_name")]
+    pub contributor_name: String,
+    #[serde(default = "default_contributor_email")]
+    pub contributor_email: String,
     #[serde(default)]
     pub required_worker_tags: BTreeMap<String, String>,
     #[serde(default)]
@@ -35,6 +39,8 @@ pub struct ProjectCreateParams {
 }
 
 fn default_branch() -> String { "main".into() }
+fn default_contributor_name() -> String { "LazyTeam Worker".into() }
+fn default_contributor_email() -> String { "lazyteam@local".into() }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskCreateParams {
@@ -120,6 +126,7 @@ impl LazyTeamMcp {
                 name: input.name,
                 repo_url: input.repo_url,
                 default_branch: input.default_branch,
+                contributor: lazyteam_core::ContributorIdentity { name: input.contributor_name, email: input.contributor_email },
                 required_worker_tags: input.required_worker_tags,
                 default_task_tags: input.default_task_tags,
                 reviewer: lazyteam_core::ReviewerConfig::default(),

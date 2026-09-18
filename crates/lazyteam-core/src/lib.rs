@@ -5,6 +5,12 @@ use uuid::Uuid;
 
 pub type Tags = BTreeMap<String, String>;
 
+pub const MANAGED_CAPABILITY_IDS: &[&str] = &["rust", "python", "node", "go", "gcc", "cpp", "clang", "java", "cmake", "ruby", "php"];
+
+pub fn managed_capability_tag(id: &str) -> Option<String> {
+    MANAGED_CAPABILITY_IDS.contains(&id).then(|| format!("tool.{id}"))
+}
+
 pub const DEFAULT_WORKER_PROMPT: &str = "You are an autonomous LazyTeam coding worker. Execute only the assigned task in the provided repository workspace. Treat the task description and acceptance criteria as the contract. Inspect before editing, make the smallest correct change, preserve unrelated behavior, and follow repository instructions. Run relevant validation and never wait for interactive input. Do not broaden scope. If blocked, stop and report the concrete blocker. Do not expose secrets or modify external systems unless the task explicitly requires it. Finish with a concise summary of what changed, validation performed, and any remaining risks.";
 
 pub const DEFAULT_REVIEWER_PROMPT: &str = "You are an independent senior LazyTeam reviewer. Review the exact pinned candidate commit in the provided repository checkout, not the worker's claims. Read the task contract and acceptance criteria, inspect the implementation and surrounding code, and run focused validation when practical. Treat the implementation worker as untrusted evidence: verify changed behavior yourself. Do not modify source code, create commits, push branches, merge, or broaden scope. Approve only when the candidate is correct, complete, scoped, and supported by evidence. Otherwise request a retry with a concise, actionable reason. Your final response must be exactly one JSON object with this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[\"...\"]}.";
@@ -169,6 +175,18 @@ impl fmt::Debug for GitCredential {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContributorIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+impl Default for ContributorIdentity {
+    fn default() -> Self {
+        Self { name: "LazyTeam Worker".into(), email: "lazyteam@local".into() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: Uuid,
@@ -176,6 +194,8 @@ pub struct Project {
     pub name: String,
     pub repo_url: String,
     pub default_branch: String,
+    #[serde(default)]
+    pub contributor: ContributorIdentity,
     #[serde(default)]
     pub required_worker_tags: Tags,
     #[serde(default)]
@@ -194,6 +214,7 @@ pub struct Project {
 pub enum WorkerState {
     Idle,
     Busy,
+    Pending,
     Draining,
     Degraded,
     Offline,
@@ -208,6 +229,17 @@ pub struct Worker {
     pub state: WorkerState,
     pub os: String,
     pub arch: String,
+    #[serde(default)]
+    pub system_tags: Tags,
+    #[serde(default)]
+    pub user_tags: Tags,
+    #[serde(default)]
+    pub managed_capabilities: BTreeSet<String>,
+    #[serde(default)]
+    pub installed_capabilities: BTreeSet<String>,
+    #[serde(default)]
+    pub capability_error: Option<String>,
+    /// Effective scheduler tags: system + user + selected managed capabilities that are installed.
     #[serde(default)]
     pub tags: Tags,
     #[serde(default)]
@@ -418,6 +450,14 @@ mod tests {
             state: WorkerState::Idle,
             os: "linux".into(),
             arch: "aarch64".into(),
+            system_tags: BTreeMap::from([
+                ("os".into(), "linux".into()),
+                ("arch".into(), "aarch64".into()),
+            ]),
+            user_tags: BTreeMap::from([("cpu".into(), "rk3588".into())]),
+            managed_capabilities: BTreeSet::new(),
+            installed_capabilities: BTreeSet::new(),
+            capability_error: None,
             tags: BTreeMap::from([
                 ("os".into(), "linux".into()),
                 ("arch".into(), "aarch64".into()),
@@ -442,6 +482,7 @@ mod tests {
             name: "RockNPU".into(),
             repo_url: "git@example/RockNPU".into(),
             default_branch: "main".into(),
+            contributor: ContributorIdentity::default(),
             required_worker_tags: BTreeMap::from([("cpu".into(), "rk3588".into())]),
             default_task_tags: BTreeMap::new(),
             reviewer: ReviewerConfig::default(),

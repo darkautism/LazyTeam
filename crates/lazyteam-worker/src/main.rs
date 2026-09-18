@@ -18,6 +18,8 @@ use sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
 
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
+const WORKER_PROTOCOL_VERSION: u32 = 5;
+const AGENT_ROOTFS_BUILD_SCRIPT: &str = include_str!("../../../scripts/agent-rootfs-build.sh");
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -64,6 +66,10 @@ struct WorkerJoinPayload {
 struct WorkerRuntimeConfig {
     role: AgentRole,
     agent: AgentConfig,
+    #[serde(default)]
+    managed_capabilities: BTreeSet<String>,
+    #[serde(default)]
+    installed_capabilities: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
@@ -222,8 +228,10 @@ async fn async_main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&args.state_dir).await?;
     clear_stale_git_auth(&args.state_dir).await?;
     tokio::fs::create_dir_all(&args.workspace_dir).await?;
-    let agent_sandbox = AgentSandbox::prepare(&args.state_dir, &args.pi_bin).await?;
-    info!("embedded agent sandbox ready: Landlock filesystem isolation + seccomp denylist");
+    let mut local_installed_capabilities = load_local_installed_capabilities(&args.state_dir).await?;
+    let mut agent_rootfs = build_agent_rootfs(&args.state_dir, &local_installed_capabilities).await?;
+    let mut agent_sandbox = AgentSandbox::prepare(&args.state_dir, &args.pi_bin, Some(&agent_rootfs)).await?;
+    info!(rootfs = %agent_rootfs.display(), "agent Ubuntu rootfs + inner filesystem/seccomp sandbox ready");
     if args.sandbox_diagnose {
         println!("LazyTeam agent sandbox {}", agent_sandbox.diagnostic_summary());
         return Ok(());
@@ -246,7 +254,7 @@ async fn async_main() -> anyhow::Result<()> {
     let pi_bin = args.pi_bin.clone();
     let legacy_provider = args.pi_provider.clone();
     let legacy_model = args.pi_model.clone();
-    let probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None, session_dir: None, sandbox: agent_sandbox.clone() };
+    let mut probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None, session_dir: None, sandbox: agent_sandbox.clone() };
     let mut agent_capabilities = probe_runtime.capabilities().await;
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
     let projects: BTreeSet<String> = args.allowed_projects.into_iter().collect();
@@ -303,6 +311,15 @@ async fn async_main() -> anyhow::Result<()> {
         warn!(%error, "initial agent capability report failed");
     }
     let mut runtime_config = fetch_runtime_config(&client, &server, &worker_credential, worker_id).await?;
+    reconcile_managed_capabilities(
+        &client, &server, &worker_credential, worker_id, &args.state_dir, &args.pi_bin,
+        &mut runtime_config, &mut local_installed_capabilities, &mut agent_rootfs,
+        &mut agent_sandbox, &mut probe_runtime,
+    ).await?;
+    agent_capabilities = probe_runtime.capabilities().await;
+    if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
+        warn!(%error, "agent capability refresh after rootfs reconciliation failed");
+    }
     let mut next_capability_probe = Instant::now() + Duration::from_secs(60);
 
     loop {
@@ -341,6 +358,16 @@ async fn async_main() -> anyhow::Result<()> {
         match fetch_runtime_config(&client, &server, &worker_credential, worker_id).await {
             Ok(config) => runtime_config = config,
             Err(error) => warn!(%error, "worker runtime config refresh failed; using last known config"),
+        }
+        if let Err(error) = reconcile_managed_capabilities(
+            &client, &server, &worker_credential, worker_id, &args.state_dir, &args.pi_bin,
+            &mut runtime_config, &mut local_installed_capabilities, &mut agent_rootfs,
+            &mut agent_sandbox, &mut probe_runtime,
+        ).await {
+            error!(%error, "managed capability provisioning failed");
+            let _ = report_capability_build_error(&client, &server, &worker_credential, worker_id, &local_installed_capabilities, &error.to_string()).await;
+            sleep(Duration::from_secs(5)).await;
+            continue;
         }
         if agent_capabilities.models.is_empty() {
             tracing::debug!("worker has no usable Pi models yet; waiting for explicit provider credentials");
@@ -433,7 +460,7 @@ async fn register(
         "allowed_projects": allowed_projects,
         "slots": slots,
         "worker_version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": 4,
+        "protocol_version": WORKER_PROTOCOL_VERSION,
         "agent_type": "pi",
         "agent_capabilities": agent_capabilities
     })).send().await?;
@@ -449,10 +476,150 @@ async fn register(
 
 async fn report_capabilities(client: &Client, server: &str, credential: &str, worker_id: Uuid, capabilities: &AgentCapabilities) -> anyhow::Result<()> {
     let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capabilities")), credential)
-        .header("x-lazyteam-worker-protocol-version", "4")
+        .header("x-lazyteam-worker-protocol-version", WORKER_PROTOCOL_VERSION.to_string())
         .header("x-lazyteam-worker-version", env!("CARGO_PKG_VERSION"))
         .json(capabilities).send().await?;
     ensure_success(response).await?;
+    Ok(())
+}
+
+async fn load_local_installed_capabilities(state_dir: &Path) -> anyhow::Result<BTreeSet<String>> {
+    let path = state_dir.join("agent-rootfs").join("current").join(".lazyteam-capabilities");
+    match tokio::fs::read_to_string(path).await {
+        Ok(raw) => Ok(raw.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error).context("read local agent rootfs capability manifest"),
+    }
+}
+
+async fn build_agent_rootfs(state_dir: &Path, capabilities: &BTreeSet<String>) -> anyhow::Result<PathBuf> {
+    let script_path = state_dir.join("agent-rootfs-build.sh");
+    let rewrite = match tokio::fs::read_to_string(&script_path).await {
+        Ok(existing) => existing != AGENT_ROOTFS_BUILD_SCRIPT,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error).context("read agent rootfs builder"),
+    };
+    if rewrite {
+        tokio::fs::write(&script_path, AGENT_ROOTFS_BUILD_SCRIPT).await.context("write agent rootfs builder")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+    }
+
+    let mut command = Command::new("/bin/bash");
+    command.arg(&script_path).arg(state_dir);
+    for capability in capabilities {
+        command.arg(capability);
+    }
+    command.stdin(std::process::Stdio::null());
+    let output = command.output().await.context("run fixed agent rootfs builder")?;
+    if !output.status.success() {
+        bail!(
+            "agent rootfs build failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("agent rootfs builder emitted non-UTF8 output")?;
+    let path = stdout.lines().rev().find(|line| !line.trim().is_empty())
+        .context("agent rootfs builder did not return a rootfs path")?;
+    let rootfs = PathBuf::from(path.trim());
+    tokio::fs::canonicalize(&rootfs).await
+        .with_context(|| format!("canonicalize built agent rootfs {}", rootfs.display()))
+}
+
+async fn build_agent_rootfs_with_heartbeat(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    state_dir: &Path,
+    capabilities: &BTreeSet<String>,
+) -> anyhow::Result<PathBuf> {
+    let build = build_agent_rootfs(state_dir, capabilities);
+    tokio::pin!(build);
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tokio::select! {
+            result = &mut build => return result,
+            _ = tick.tick() => {
+                if let Err(error) = heartbeat(client, server, credential, worker_id).await {
+                    warn!(%error, "heartbeat failed while rebuilding agent rootfs");
+                }
+            }
+        }
+    }
+}
+
+async fn report_capability_build(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    installed: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capability-build")), credential)
+        .json(&json!({"installed_capabilities": installed})).send().await?;
+    ensure_success(response).await?;
+    Ok(())
+}
+
+async fn report_capability_build_error(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    installed: &BTreeSet<String>,
+    error: &str,
+) -> anyhow::Result<()> {
+    let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capability-build")), credential)
+        .json(&json!({"installed_capabilities": installed, "error": error})).send().await?;
+    ensure_success(response).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_managed_capabilities(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    state_dir: &Path,
+    pi_bin: &str,
+    runtime_config: &mut WorkerRuntimeConfig,
+    local_installed: &mut BTreeSet<String>,
+    agent_rootfs: &mut PathBuf,
+    agent_sandbox: &mut AgentSandbox,
+    probe_runtime: &mut PiRuntime,
+) -> anyhow::Result<()> {
+    let mut target = local_installed.clone();
+    target.extend(runtime_config.installed_capabilities.iter().cloned());
+    target.extend(runtime_config.managed_capabilities.iter().cloned());
+
+    if target != *local_installed {
+        info!(?target, "rebuilding agent rootfs for added managed capabilities");
+        let rootfs = build_agent_rootfs_with_heartbeat(client, server, credential, worker_id, state_dir, &target).await?;
+        let sandbox = AgentSandbox::prepare(state_dir, pi_bin, Some(&rootfs)).await?;
+        *agent_rootfs = rootfs;
+        *local_installed = target;
+        *agent_sandbox = sandbox.clone();
+        *probe_runtime = PiRuntime {
+            binary: pi_bin.to_string(),
+            provider: None,
+            model: None,
+            session_dir: None,
+            sandbox,
+        };
+        info!(rootfs = %agent_rootfs.display(), ?local_installed, "agent rootfs rebuild activated");
+    }
+
+    if runtime_config.installed_capabilities != *local_installed
+        || !runtime_config.managed_capabilities.is_subset(local_installed)
+    {
+        report_capability_build(client, server, credential, worker_id, local_installed).await?;
+        runtime_config.installed_capabilities = local_installed.clone();
+    }
     Ok(())
 }
 
@@ -854,8 +1021,8 @@ async fn auto_commit(path: &Path, assignment: &Assignment) -> anyhow::Result<()>
     let status = trusted_git_command().args(["diff", "--cached", "--quiet"]).current_dir(path).status().await?;
     if status.success() { return Ok(()); }
     command_ok(path, "git", &[
-        "-c", "user.name=LazyTeam Worker",
-        "-c", "user.email=lazyteam@local",
+        "-c", &format!("user.name={}", assignment.project.contributor.name),
+        "-c", &format!("user.email={}", assignment.project.contributor.email),
         "commit", "-m", &format!("lazyteam: {}", assignment.task.title),
     ]).await
 }
@@ -1039,6 +1206,67 @@ mod tests {
 
         command_ok(&root, "git", &["commit", "-m", "hook must stay disabled"]).await.unwrap();
         assert!(!root.join("hook-ran").exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn auto_commit_uses_project_contributor_identity() {
+        let root = std::env::temp_dir().join(format!("lazyteam-contributor-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        command_ok(&root, "git", &["init"]).await.unwrap();
+        tokio::fs::write(root.join("contribution.txt"), b"project contribution\n").await.unwrap();
+
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let assignment: Assignment = serde_json::from_value(json!({
+            "project": {
+                "id": project_id,
+                "slug": "test-project",
+                "name": "Test Project",
+                "repo_url": "https://example.invalid/repo.git",
+                "default_branch": "main",
+                "contributor": {"name": "Project Contributor", "email": "project@example.test"},
+                "required_worker_tags": {},
+                "default_task_tags": {},
+                "reviewer": {"mode": "mcp", "initial_prompt": "review"},
+                "git_auth": {"mode": "worker", "credential_configured": false},
+                "enabled": true,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            },
+            "task": {
+                "id": task_id,
+                "project_id": project_id,
+                "title": "Use contributor identity",
+                "description": "",
+                "expected_outcome": "",
+                "acceptance_criteria": [],
+                "required_tags": {},
+                "preferred_tags": {},
+                "dependencies": [],
+                "review_feedback": "",
+                "priority": 0,
+                "state": "running",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            },
+            "execution": {
+                "id": Uuid::new_v4(),
+                "task_id": task_id,
+                "worker_id": Uuid::new_v4(),
+                "attempt": 1,
+                "state": "running",
+                "lease_until": "2026-01-01T00:02:00Z",
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": null,
+                "result": null
+            },
+            "git_credential": {"mode": "worker"}
+        })).unwrap();
+
+        auto_commit(&root, &assignment).await.unwrap();
+        let author = git_output(&root, &["log", "-1", "--format=%an <%ae>"]).await.unwrap();
+        assert_eq!(author, "Project Contributor <project@example.test>");
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
