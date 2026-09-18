@@ -81,10 +81,11 @@ const rt=await ModelRuntime.create({{
   allowModelNetwork:false,
   refreshOnCreate:false
 }});
+const stored=new Set((await rt.listCredentials()).map(c=>c.providerId));
 const providers=rt.getProviders().map(p=>({{
   id:p.id,
   name:p.name,
-  configured:!!rt.getProviderAuthStatus(p.id)?.configured,
+  configured:stored.has(p.id)||!!rt.getProviderAuthStatus(p.id)?.configured,
   api_key_label:p.auth?.apiKey?.name??null,
   oauth_label:p.auth?.oauth?.name??null
 }}));
