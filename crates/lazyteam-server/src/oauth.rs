@@ -732,3 +732,58 @@ fn internal_oauth(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
         &error.to_string(),
     )
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn state(public_url: Option<&str>) -> AppState {
+        let db = sqlx::SqlitePool::connect_lazy("sqlite::memory:").expect("lazy sqlite");
+        AppState {
+            db,
+            public_url: public_url.map(str::to_string),
+            oauth_password: None,
+        }
+    }
+
+    #[test]
+    fn explicit_public_url_is_authoritative() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("wrong.example"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert_eq!(
+            issuer(&state(Some("https://correct.example")), &headers),
+            "https://correct.example"
+        );
+    }
+
+    #[test]
+    fn public_host_defaults_to_https_without_explicit_public_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("random-subdomain.example.com"));
+        assert_eq!(
+            issuer(&state(None), &headers),
+            "https://random-subdomain.example.com"
+        );
+    }
+
+    #[test]
+    fn forwarded_https_is_honored_for_tunnelled_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("random-subdomain.example.com"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(
+            issuer(&state(None), &headers),
+            "https://random-subdomain.example.com"
+        );
+    }
+
+    #[test]
+    fn localhost_without_proxy_headers_remains_http_for_development() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+        assert_eq!(issuer(&state(None), &headers), "http://127.0.0.1:8787");
+    }
+}
