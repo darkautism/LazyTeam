@@ -33,8 +33,8 @@ struct ResolvedClient {
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/.well-known/oauth-protected-resource", get(protected_resource_metadata))
-        .route("/.well-known/oauth-protected-resource/mcp", get(protected_resource_metadata))
+        .route("/.well-known/oauth-protected-resource", get(protected_resource_metadata_root))
+        .route("/.well-known/oauth-protected-resource/mcp", get(protected_resource_metadata_mcp))
         .route("/.well-known/oauth-authorization-server", get(authorization_server_metadata))
         .route("/.well-known/openid-configuration", get(authorization_server_metadata))
         .route("/.well-known/oauth-authorization-server/mcp", get(authorization_server_metadata))
@@ -61,14 +61,26 @@ fn resource_url(state: &AppState, headers: &HeaderMap) -> String {
     format!("{}/mcp", issuer(state, headers))
 }
 
-async fn protected_resource_metadata(
+async fn protected_resource_metadata_root(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Json<Value> {
     let origin = issuer(&state, &headers);
+    protected_resource_metadata_response(format!("{origin}/"), origin)
+}
+
+async fn protected_resource_metadata_mcp(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let origin = issuer(&state, &headers);
+    protected_resource_metadata_response(format!("{origin}/mcp"), origin)
+}
+
+fn protected_resource_metadata_response(resource: String, authorization_server: String) -> Json<Value> {
     Json(json!({
-        "resource": format!("{origin}/mcp"),
-        "authorization_servers": [origin],
+        "resource": resource,
+        "authorization_servers": [authorization_server],
         "scopes_supported": [DEFAULT_SCOPE],
         "bearer_methods_supported": ["header"]
     }))
@@ -569,7 +581,12 @@ pub async fn require_mcp_auth(
     next: Next,
 ) -> Response {
     let origin = issuer(&state, &headers);
-    let resource = format!("{origin}/mcp");
+    let root_resource = request.uri().path() == "/";
+    let resource = if root_resource {
+        format!("{origin}/")
+    } else {
+        format!("{origin}/mcp")
+    };
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -580,7 +597,11 @@ pub async fn require_mcp_auth(
     };
 
     if !valid {
-        let metadata = format!("{origin}/.well-known/oauth-protected-resource/mcp");
+        let metadata = if root_resource {
+            format!("{origin}/.well-known/oauth-protected-resource")
+        } else {
+            format!("{origin}/.well-known/oauth-protected-resource/mcp")
+        };
         return (
             StatusCode::UNAUTHORIZED,
             [(
