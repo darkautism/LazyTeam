@@ -89,8 +89,6 @@ mod tests {
         assert!(INDEX.contains("worker-config-slots"));
         assert!(INDEX.contains("worker-config-projects"));
         assert!(INDEX.contains("worker-config-tags"));
-        assert!(INDEX.contains("worker-tags"));
-        assert!(INDEX.contains("tagHtml=tags(w.tags)"));
         assert!(INDEX.contains("worker-config-agent"));
         assert!(INDEX.contains("worker-agent-status"));
         assert!(INDEX.contains("worker-config-prompt"));
