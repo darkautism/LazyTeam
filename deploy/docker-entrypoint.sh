@@ -77,12 +77,16 @@ fix_tree_if_needed() {
     needs_fix=1
   fi
 
-  if [ -n "$important_child" ] && [ -e "$important_child" ]; then
-    child_uid="$(stat -c '%u' "$important_child")"
-    child_gid="$(stat -c '%g' "$important_child")"
-    if [ "$child_uid" -ne "$runtime_uid" ] || [ "$child_gid" -ne "$runtime_gid" ]; then
-      needs_fix=1
-    fi
+  if [ -n "$important_child" ]; then
+    for child in "$important_child"*; do
+      [ -e "$child" ] || continue
+      child_uid="$(stat -c '%u' "$child")"
+      child_gid="$(stat -c '%g' "$child")"
+      if [ "$child_uid" -ne "$runtime_uid" ] || [ "$child_gid" -ne "$runtime_gid" ]; then
+        needs_fix=1
+        break
+      fi
+    done
   fi
 
   if [ "$needs_fix" -eq 1 ]; then
