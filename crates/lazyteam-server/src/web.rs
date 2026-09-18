@@ -41,7 +41,27 @@ mod tests {
         assert!(INDEX.contains("modelCostLabel"));
         assert!(INDEX.contains("Re-dispatch"));
         assert!(INDEX.contains("deleteTask"));
-        assert!(INDEX.contains("unclaimed"));
+        assert!(INDEX.contains("Unclaimed"));
+        assert!(INDEX.contains("Working"));
+        assert!(INDEX.contains("Review"));
+        assert!(INDEX.contains("MergePending"));
+        assert!(INDEX.contains("#queue-cards"));
+        assert!(INDEX.contains("#working-cards"));
+        assert!(INDEX.contains("#review-cards"));
+        assert!(INDEX.contains("#merge-cards"));
+        // Compact task cards: single title + 3-line clamped summary, no lifecycle pills.
+        assert!(INDEX.contains("cardSummary"));
+        assert!(INDEX.contains("compactCard"));
+        assert!(INDEX.contains("x.result?.summary||t.expected_outcome||t.description"));
+        assert!(INDEX.contains("-webkit-line-clamp:3"));
+        assert!(INDEX.contains("-webkit-box-orient:vertical"));
+        assert!(INDEX.contains("text-overflow:ellipsis"));
+        assert!(INDEX.contains("card-title"));
+        assert!(INDEX.contains("card-actions"));
+        assert!(!INDEX.contains("worker-pill"));
+        assert!(!INDEX.contains("ChatGPT / MCP review"));
+        assert!(!INDEX.contains("'unclaimed'"));
+        assert!(!INDEX.contains("merge_pending</span>"));
         assert!(!INDEX.contains("STATIC_MODELS"));
         assert!(INDEX.contains("project-reviewer-prompt"));
         assert!(INDEX.contains("ChatGPT / MCP"));
