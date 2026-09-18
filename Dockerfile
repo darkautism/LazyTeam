@@ -1,4 +1,6 @@
 FROM rust:1-bookworm AS builder
+ARG LAZYTEAM_GIT_SHA
+ENV LAZYTEAM_GIT_SHA=${LAZYTEAM_GIT_SHA}
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p lazyteam-server

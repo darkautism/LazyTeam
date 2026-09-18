@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 pub type Tags = BTreeMap<String, String>;
 
+pub const BUILD_GIT_SHA: &str = env!("LAZYTEAM_BUILD_GIT_SHA");
+
 pub const MANAGED_CAPABILITY_IDS: &[&str] = &["rust", "python", "node", "go", "gcc", "cpp", "clang", "java", "cmake", "ruby", "php"];
 
 pub fn managed_capability_tag(id: &str) -> Option<String> {

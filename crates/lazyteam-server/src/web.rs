@@ -98,8 +98,10 @@ mod tests {
         assert!(INDEX.contains("worker-capability-status"));
         assert!(INDEX.contains("/api/worker-capabilities"));
         assert!(INDEX.contains("selectedManagedCapabilities"));
-        assert!(INDEX.contains("managedCapabilitiesDirty"));
-        assert!(INDEX.contains("onchange=\"managedCapabilitiesDirty=true\""));
+        assert!(INDEX.contains("managedCapabilitiesDraft"));
+        assert!(INDEX.contains("updateManagedCapabilityDraft(this)"));
+        assert!(INDEX.contains("refreshManagedCapabilityStatus(w);renderAgentCatalog(w)"));
+        assert!(!INDEX.contains("if(w){renderManagedCapabilities(w);renderAgentCatalog(w)}"));
         assert!(INDEX.contains("Adding tools rebuilds the agent container"));
         assert!(INDEX.contains("pending and will not claim tasks or reviews"));
         assert!(INDEX.contains("worker-config-agent"));

@@ -228,6 +228,7 @@ async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    eprintln!("LazyTeam worker starting version={} git_sha={}", env!("CARGO_PKG_VERSION"), lazyteam_core::BUILD_GIT_SHA);
     let mut args = Args::parse();
     let startup_dir = std::env::current_dir().context("read worker startup directory")?;
     args.state_dir = resolve_worker_path(&startup_dir, &args.state_dir);
