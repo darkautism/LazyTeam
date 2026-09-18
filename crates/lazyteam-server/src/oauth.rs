@@ -748,8 +748,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn explicit_public_url_is_authoritative() {
+    #[tokio::test]
+    async fn explicit_public_url_is_authoritative() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("wrong.example"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
@@ -759,8 +759,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn public_host_defaults_to_https_without_explicit_public_url() {
+    #[tokio::test]
+    async fn public_host_defaults_to_https_without_explicit_public_url() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("random-subdomain.example.com"));
         assert_eq!(
@@ -769,8 +769,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn forwarded_https_is_honored_for_tunnelled_requests() {
+    #[tokio::test]
+    async fn forwarded_https_is_honored_for_tunnelled_requests() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("random-subdomain.example.com"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
@@ -780,8 +780,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn localhost_without_proxy_headers_remains_http_for_development() {
+    #[tokio::test]
+    async fn localhost_without_proxy_headers_remains_http_for_development() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
         assert_eq!(issuer(&state(None), &headers), "http://127.0.0.1:8787");
