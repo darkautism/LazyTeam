@@ -180,11 +180,7 @@ pub(crate) async fn middleware(mut request: Request, next: Next) -> Response {
     }
 
     let path = request.uri().path();
-    if path == "/" && production() {
-        if !bearer_matches(&request, config().admin_token.as_deref()) {
-            return unauthorized("admin");
-        }
-    } else if path.starts_with("/api/") {
+    if path.starts_with("/api/") {
         if path == "/api/workers/register" {
             // The shared worker secret is an enrollment credential only. Normal worker
             // traffic is authenticated by the per-worker credential issued at enrollment.
