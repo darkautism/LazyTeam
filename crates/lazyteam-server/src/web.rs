@@ -92,8 +92,11 @@ mod tests {
         assert!(INDEX.contains("Slots are concurrent isolated assignments on this worker"));
         assert!(INDEX.contains("each slot gets its own container, workspace, execution ID, and task branch"));
         assert!(INDEX.contains("worker-config-projects"));
+        assert!(INDEX.contains("Comma-separated project slugs; spaces are optional"));
+        assert!(INDEX.contains("parseProjectInput"));
         assert!(INDEX.contains("worker-config-tags"));
-        assert!(INDEX.contains("worker-system-tags"));
+        assert!(!INDEX.contains("worker-system-tags"));
+        assert!(!INDEX.contains(">System tags<"));
         assert!(INDEX.contains("worker-managed-capabilities"));
         assert!(INDEX.contains("worker-capability-status"));
         assert!(INDEX.contains("worker-capability-log-details"));
@@ -118,6 +121,9 @@ mod tests {
         assert!(INDEX.contains("renderAgentCatalog"));
         assert!(INDEX.contains("saveWorkerConfig"));
         assert!(INDEX.contains("card-title"));
+        assert!(INDEX.contains("project-pill"));
+        assert!(INDEX.contains("projectPill(p)"));
+        assert!(INDEX.contains("taskCard(x,pm)"));
         assert!(INDEX.contains("white-space:nowrap"));
         assert!(INDEX.contains("height:calc(1.35em * 3)"));
         assert!(!INDEX.contains("card-actions"));
@@ -133,6 +139,14 @@ mod tests {
         assert!(!INDEX.contains("STATIC_PROVIDERS"));
         assert!(INDEX.contains("project-reviewer-prompt"));
         assert!(INDEX.contains("Advanced review"));
+        assert!(INDEX.contains("project-runner-labels"));
+        assert!(INDEX.contains("Runs on"));
+        assert!(INDEX.contains("All labels are required (AND)"));
+        assert!(INDEX.contains("parseRunnerLabels"));
+        assert!(INDEX.contains("formatRunnerLabels"));
+        assert!(!INDEX.contains("Advanced tags"));
+        assert!(!INDEX.contains("project-worker-tags"));
+        assert!(!INDEX.contains("project-task-tags"));
         assert!(INDEX.contains("Reviewer workers are configured separately"));
         assert!(!INDEX.contains("· contributor "));
         assert!(!INDEX.contains("review ChatGPT / MCP ·"));

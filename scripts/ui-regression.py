@@ -110,8 +110,22 @@ def main():
            "Working cards must identify the assigned worker")
     expect("Review · " in ui and "reviewer-pill" in ui,
            "Review cards must identify the configured or active reviewer")
+    expect("project-pill" in ui and "projectPill(p)" in ui,
+           "every task-card renderer must include a compact project pill")
 
-    # 9. Fresh-worker provider auth uses Pi-reported capability data and a write-only API-key handoff.
+    # 9. Worker/project routing UI uses human-readable comma-separated selectors.
+    expect('id="worker-config-projects"' in ui, "Allowed projects input missing")
+    expect("Comma-separated project slugs" in ui and "parseProjectInput" in ui,
+           "Allowed projects must document and parse comma-separated slugs")
+    expect("worker-system-tags" not in ui and ">System tags<" not in ui,
+           "read-only system tags must not consume worker configuration space")
+    expect('id="project-runner-labels"' in ui, "Project Runs on input missing")
+    expect("All labels are required (AND)" in ui and "parseRunnerLabels" in ui,
+           "Project Runs on must use AND-style human-readable runner labels")
+    expect("Advanced tags" not in ui and "project-worker-tags" not in ui and "project-task-tags" not in ui,
+           "JSON Advanced tags UI must be removed")
+
+    # 10. Fresh-worker provider auth uses Pi-reported capability data and a write-only API-key handoff.
     expect('id="worker-provider-api-key"' in ui, "provider API-key input missing")
     expect("caps.providers||[]" in ui, "provider picker must use worker/Pi-reported provider metadata")
     expect("/provider-key" in ui, "provider API key must be sent through the dedicated write-only endpoint")
@@ -119,7 +133,7 @@ def main():
     expect("STATIC_PROVIDERS" not in ui and "STATIC_MODELS" not in ui,
            "UI must not contain mock/static provider or model catalogs")
 
-    # 10. Backend review scheduling/runtime files must be untouched by UI work
+    # 11. Backend review scheduling/runtime files must be untouched by UI work
     #     (guarded by task contract; informational only here).
     print("Management UI regression test passed")
 

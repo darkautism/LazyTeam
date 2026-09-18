@@ -517,4 +517,71 @@ mod tests {
         };
         assert!(worker_matches_task(&worker(), &project, &task));
     }
+
+    #[test]
+    fn allowed_projects_blocks_other_projects() {
+        let mut project = Project {
+            id: Uuid::new_v4(),
+            slug: "lazyteam".into(),
+            name: "LazyTeam".into(),
+            repo_url: "git@example/LazyTeam".into(),
+            default_branch: "main".into(),
+            contributor: ContributorIdentity::default(),
+            required_worker_tags: BTreeMap::new(),
+            default_task_tags: BTreeMap::new(),
+            reviewer: ReviewerConfig::default(),
+            git_auth: GitAuthConfig::default(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let w = worker();
+        assert!(!worker_can_run_project(&w, &project));
+        project.slug = "rocknpu".into();
+        assert!(worker_can_run_project(&w, &project));
+    }
+
+    #[test]
+    fn project_runner_labels_are_all_required() {
+        let mut w = worker();
+        w.tags.insert("tool.rust".into(), "true".into());
+        let mut project = Project {
+            id: Uuid::new_v4(),
+            slug: "rocknpu".into(),
+            name: "RockNPU".into(),
+            repo_url: "git@example/RockNPU".into(),
+            default_branch: "main".into(),
+            contributor: ContributorIdentity::default(),
+            required_worker_tags: BTreeMap::from([
+                ("os".into(), "linux".into()),
+                ("arch".into(), "aarch64".into()),
+                ("tool.rust".into(), "true".into()),
+            ]),
+            default_task_tags: BTreeMap::new(),
+            reviewer: ReviewerConfig::default(),
+            git_auth: GitAuthConfig::default(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let task = Task {
+            id: Uuid::new_v4(),
+            project_id: project.id,
+            title: "labels".into(),
+            description: String::new(),
+            expected_outcome: String::new(),
+            acceptance_criteria: vec![],
+            required_tags: BTreeMap::new(),
+            preferred_tags: BTreeMap::new(),
+            dependencies: vec![],
+            review_feedback: String::new(),
+            priority: 0,
+            state: TaskState::Queued,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(worker_matches_task(&w, &project, &task));
+        project.required_worker_tags.insert("site".into(), "lab".into());
+        assert!(!worker_matches_task(&w, &project, &task));
+    }
 }
