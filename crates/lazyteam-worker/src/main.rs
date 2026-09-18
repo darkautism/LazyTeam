@@ -176,6 +176,10 @@ fn normalize_server(raw: &str) -> anyhow::Result<String> {
     Ok(raw.to_string())
 }
 
+fn resolve_worker_path(startup_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() { path.to_path_buf() } else { startup_dir.join(path) }
+}
+
 fn parse_tag(raw: &str) -> Result<(String, String), String> {
     let (key, value) = raw.split_once('=').ok_or_else(|| "tag must be key=value".to_string())?;
     if key.is_empty() || value.is_empty() { return Err("tag key/value must not be empty".into()); }
@@ -187,7 +191,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+    let startup_dir = std::env::current_dir().context("read worker startup directory")?;
+    args.state_dir = resolve_worker_path(&startup_dir, &args.state_dir);
+    args.workspace_dir = resolve_worker_path(&startup_dir, &args.workspace_dir);
     tokio::fs::create_dir_all(&args.state_dir).await?;
     clear_stale_git_auth(&args.state_dir).await?;
     tokio::fs::create_dir_all(&args.workspace_dir).await?;
@@ -680,6 +687,23 @@ mod tests {
         assert!(normalize_server("https://lazyteam.example.test").is_ok());
         assert!(normalize_server("https://lazyteam.example.test/mcp").is_err());
         assert!(normalize_server("https://user@lazyteam.example.test").is_err());
+    }
+
+    #[test]
+    fn relative_worker_paths_are_anchored_at_worker_startup() {
+        let startup = Path::new("/srv/lazyteam");
+        assert_eq!(
+            resolve_worker_path(startup, Path::new(".lazyteam-worker")),
+            PathBuf::from("/srv/lazyteam/.lazyteam-worker")
+        );
+        assert_eq!(
+            resolve_worker_path(startup, Path::new("lazyteam-workspaces")),
+            PathBuf::from("/srv/lazyteam/lazyteam-workspaces")
+        );
+        assert_eq!(
+            resolve_worker_path(startup, Path::new("/var/lib/lazyteam")),
+            PathBuf::from("/var/lib/lazyteam")
+        );
     }
 
     #[tokio::test]
