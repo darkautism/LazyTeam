@@ -1,7 +1,7 @@
 {$LAZYTEAM_DOMAIN} {
     encode zstd gzip
 
-    @protocol path /health /mcp /mcp/* /.well-known/*
+    @protocol path / /health /mcp /mcp/* /.well-known/*
     handle @protocol {
         reverse_proxy lazyteam:8787
     }
