@@ -62,7 +62,7 @@ impl AgentSandbox {
                 read_only.insert(path);
             }
         }
-        for path in ["/dev/urandom", "/dev/random", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"] {
+        for path in ["/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"] {
             if let Ok(path) = std::fs::canonicalize(path) {
                 read_only.insert(path);
             }
@@ -151,7 +151,7 @@ impl AgentSandbox {
         if let Some(session_dir) = session_dir {
             read_write.push(canonical_dir(session_dir).context("canonicalize Pi session directory")?);
         }
-        for device in ["/dev/null", "/dev/zero", "/dev/full"] {
+        for device in ["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"] {
             if let Ok(path) = std::fs::canonicalize(device) {
                 read_write.push(path);
             }
