@@ -130,7 +130,16 @@ async fn main() -> anyhow::Result<()> {
             .with_legacy_session_mode(false)
             .with_json_response(true),
     );
+    let root_mcp_state = state.clone();
+    let root_mcp_service = StreamableHttpService::new(
+        move || Ok(mcp::LazyTeamMcp::new(root_mcp_state.clone())),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(false)
+            .with_json_response(true),
+    );
     let mcp_router = Router::<Arc<AppState>>::new()
+        .route_service("/", root_mcp_service)
         .route_service("/mcp", mcp_service)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
