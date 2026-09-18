@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LazyTeam</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--line:#30363d;--muted:#8b949e;--text:#e6edf3;--blue:#2f81f7;--green:#3fb950;--yellow:#d29922;--red:#f85149;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text)}button,input,textarea{font:inherit}
+button{cursor:pointer}.topbar{height:52px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 18px;gap:18px;position:sticky;top:0;background:rgba(13,17,23,.96);z-index:20}.brand{font-weight:650;letter-spacing:.1px}.tabs{display:flex;height:100%;gap:4px}.tab{border:0;background:transparent;color:var(--muted);padding:0 12px;border-bottom:2px solid transparent}.tab.active{color:var(--text);border-bottom-color:#f78166}.spacer{flex:1}.connect{border:1px solid var(--line);background:#21262d;color:var(--text);border-radius:6px;padding:6px 10px}.connect.connected:before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:7px}.page{display:none;max-width:1280px;margin:0 auto;padding:22px}.page.active{display:block}.page-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px}.page-head h1{font-size:20px;margin:0}.subtle{color:var(--muted);font-size:13px}.primary{background:#238636;color:white;border:1px solid rgba(240,246,252,.1);border-radius:6px;padding:7px 12px}.secondary{background:#21262d;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 10px}.danger{color:#ff7b72}.admin-only.hidden{display:none!important}
+.board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.lane{border:1px solid var(--line);border-radius:8px;background:#0d1117;min-height:420px}.lane-head{display:flex;align-items:center;justify-content:space-between;padding:12px 13px;border-bottom:1px solid var(--line);font-weight:600}.count{font-size:12px;color:var(--muted);background:#21262d;border-radius:20px;padding:2px 7px}.cards{padding:10px;display:grid;gap:9px}.card{border:1px solid var(--line);background:var(--panel);border-radius:7px;padding:11px}.card-title{font-weight:600;margin-bottom:5px}.meta{display:flex;gap:7px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:12px}.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:20px;padding:1px 7px;font-size:11px}.worker-pill{color:#79c0ff}.summary{font-size:13px;color:#c9d1d9;margin-top:8px;line-height:1.35}.card-actions{margin-top:10px;display:flex;gap:7px}
+.list{border:1px solid var(--line);border-radius:8px;overflow:hidden}.list-row{display:grid;grid-template-columns:minmax(180px,1.4fr) minmax(160px,1fr) minmax(180px,1.2fr) auto;gap:16px;align-items:center;padding:12px 14px;border-top:1px solid var(--line)}.list-row:first-child{border-top:0}.list-main{min-width:0}.list-main b{display:block}.truncate{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{font-size:12px;font-weight:600}.status.enabled,.status.idle{color:#56d364}.status.disabled,.status.offline{color:var(--muted)}.status.busy{color:#d2a8ff}.tag{display:inline-block;border:1px solid var(--line);border-radius:12px;padding:1px 6px;font-size:11px;color:#c9d1d9;margin:1px 3px 1px 0}.row-actions{display:flex;gap:6px}
+.popover{position:fixed;top:58px;right:14px;width:min(420px,calc(100vw - 28px));background:#161b22;border:1px solid var(--line);border-radius:8px;box-shadow:0 12px 36px rgba(0,0,0,.42);z-index:50;display:none}.popover.open{display:block}.popover-head{padding:12px 14px;border-bottom:1px solid var(--line);font-weight:600}.popover-body{padding:13px 14px;display:grid;gap:10px}.field{display:grid;gap:6px}.field label{font-size:12px;color:#c9d1d9}.field input,.field textarea{width:100%;background:#0d1117;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px}.token-row{display:flex}.token-row input{border-radius:6px 0 0 6px}.token-row button{border-radius:0 6px 6px 0;border-left:0}.popover-foot{padding:11px 14px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+dialog{width:min(620px,calc(100vw - 30px));border:1px solid var(--line);border-radius:9px;background:#161b22;color:var(--text);padding:0;box-shadow:0 18px 60px rgba(0,0,0,.5)}dialog::backdrop{background:rgba(0,0,0,.58)}.dialog-head,.dialog-foot{padding:13px 16px;display:flex;align-items:center;justify-content:space-between}.dialog-head{border-bottom:1px solid var(--line)}.dialog-foot{border-top:1px solid var(--line);justify-content:flex-end;gap:8px}.dialog-body{padding:15px 16px;display:grid;grid-template-columns:1fr 1fr;gap:12px}.dialog-body .wide{grid-column:1/-1}details.wide{border-top:1px solid var(--line);padding-top:10px}details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-bottom:10px}.icon-btn{border:0;background:transparent;color:var(--muted);font-size:18px}.empty{padding:24px;color:var(--muted);text-align:center}.error{color:#ff7b72}.review-note{font-size:12px;color:var(--muted);margin-bottom:12px}
+@media(max-width:860px){.board{grid-template-columns:1fr}.lane{min-height:0}.list-row{grid-template-columns:1fr}.tabs{gap:0}.tab{padding:0 8px}.page{padding:14px}.brand{display:none}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">LazyTeam</div>
+  <nav class="tabs">
+    <button class="tab active" data-page="home" onclick="showPage('home')">Home</button>
+    <button class="tab" data-page="projects" onclick="showPage('projects')">Projects</button>
+    <button class="tab" data-page="workers" onclick="showPage('workers')">Workers</button>
+  </nav>
+  <div class="spacer"></div>
+  <button id="connect-button" class="connect" onclick="toggleConnectPopover()">Connect</button>
+</header>
+
+<div id="connect-popover" class="popover">
+  <div class="popover-head">Admin connection</div>
+  <div class="popover-body">
+    <div class="field"><label>Admin token</label><input id="admin-token" type="password" autocomplete="off" placeholder="LAZYTEAM_ADMIN_TOKEN"></div>
+    <div id="connect-error" class="error"></div>
+  </div>
+  <div class="popover-foot">
+    <button class="secondary" onclick="disconnectAdmin()">Disconnect</button>
+    <button class="primary" onclick="connectAdmin()">Connect</button>
+  </div>
+</div>
+
+<main id="page-home" class="page active">
+  <div class="page-head"><div><h1>Tasks</h1><div class="subtle">Current work across all projects</div></div></div>
+  <section class="board">
+    <div class="lane"><div class="lane-head"><span>Unclaimed</span><span id="queue-count" class="count">0</span></div><div id="queue-cards" class="cards"></div></div>
+    <div class="lane"><div class="lane-head"><span>Working</span><span id="working-count" class="count">0</span></div><div id="working-cards" class="cards"></div></div>
+    <div class="lane"><div class="lane-head"><span>Review</span><span id="review-count" class="count">0</span></div><div id="review-cards" class="cards"></div></div>
+  </section>
+</main>
+
+<main id="page-projects" class="page">
+  <div class="page-head"><div><h1>Projects</h1><div class="subtle">Repositories available to LazyTeam</div></div><button id="new-project-button" class="primary admin-only hidden" onclick="openProjectDialog()">New project</button></div>
+  <div id="project-list" class="list"></div>
+</main>
+
+<main id="page-workers" class="page">
+  <div class="page-head"><div><h1>Workers</h1><div class="subtle">Registered execution agents</div></div><button id="new-worker-button" class="primary admin-only hidden" onclick="openWorkerPopover()">New worker ▾</button></div>
+  <div id="worker-list" class="list"></div>
+</main>
+
+<div id="worker-popover" class="popover">
+  <div class="popover-head">How to start a worker</div>
+  <div class="popover-body">
+    <div class="field"><label>Registration token</label><div class="token-row"><input id="worker-join-code" readonly><button class="secondary" onclick="copyJoinCode()">Copy</button></div></div>
+    <div id="worker-join-meta" class="subtle">Generating…</div>
+  </div>
+  <div class="popover-foot"><button class="secondary" onclick="generateJoinCode()">Reset token</button><button class="secondary" onclick="closeWorkerPopover()">Close</button></div>
+</div>
+
+<dialog id="project-dialog">
+  <div class="dialog-head"><b id="project-dialog-title">New project</b><button class="icon-btn" onclick="closeProjectDialog()">×</button></div>
+  <div class="dialog-body">
+    <div class="field"><label>Slug</label><input id="project-slug" placeholder="rocknpu"></div>
+    <div class="field"><label>Name</label><input id="project-name" placeholder="RockNPU"></div>
+    <div class="field wide"><label>Repository URL</label><input id="project-repo" placeholder="git@github.com:org/repo.git"></div>
+    <div class="field"><label>Default branch</label><input id="project-branch" value="main"></div>
+    <div class="field"><label>Status</label><select id="project-enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></div>
+    <details class="wide"><summary>Advanced tags</summary><div class="field"><label>Required worker tags (JSON)</label><input id="project-worker-tags" value="{}"></div><div class="field" style="margin-top:10px"><label>Default task tags (JSON)</label><input id="project-task-tags" value="{}"></div></details>
+    <div id="project-form-error" class="error wide"></div>
+  </div>
+  <div class="dialog-foot"><button class="secondary" onclick="closeProjectDialog()">Cancel</button><button class="primary" onclick="saveProject()">Save project</button></div>
+</dialog>
+
+<script>
+const TOKEN_KEY='lazyteam.adminToken';
+let connected=false, currentPage='home', projects=[], workers=[], board=[], editingProjectId=null;
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const short=s=>String(s??'').slice(0,8);
+const tags=t=>Object.entries(t||{}).map(([k,v])=>'<span class="tag">'+esc(k)+'='+esc(v)+'</span>').join('');
+const currentToken=()=>sessionStorage.getItem(TOKEN_KEY)||'';
+
+async function api(url,opt={}){
+  const headers=new Headers(opt.headers||{}), token=currentToken();
+  if(token&&url.startsWith('/api/'))headers.set('Authorization','Bearer '+token);
+  if(opt.body&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');
+  const r=await fetch(url,{...opt,headers});
+  if(!r.ok){const body=await r.text();if(r.status===401)connected=false;renderConnection();throw new Error(body||r.statusText)}
+  if(r.status===204)return null;return r.json();
+}
+function renderConnection(){
+  const b=$('#connect-button');b.textContent=connected?'Connected':'Connect';b.classList.toggle('connected',connected);
+  document.querySelectorAll('.admin-only').forEach(x=>x.classList.toggle('hidden',!connected));
+}
+function toggleConnectPopover(){const p=$('#connect-popover');p.classList.toggle('open');$('#admin-token').value=currentToken();$('#connect-error').textContent=''}
+async function connectAdmin(){
+  const token=$('#admin-token').value.trim();if(!token)return;
+  sessionStorage.setItem(TOKEN_KEY,token);
+  try{await api('/api/projects');connected=true;$('#connect-popover').classList.remove('open');renderConnection();await refreshPage()}
+  catch(e){connected=false;renderConnection();$('#connect-error').textContent='Connection failed'}
+}
+function disconnectAdmin(){sessionStorage.removeItem(TOKEN_KEY);connected=false;renderConnection();$('#connect-popover').classList.remove('open');clearViews()}
+async function verifyConnection(){if(!currentToken()){connected=false;renderConnection();return}try{projects=await api('/api/projects');connected=true}catch{connected=false}renderConnection()}
+
+function showPage(page){currentPage=page;location.hash=page==='home'?'':page;document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id==='page-'+page));document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.page===page));refreshPage()}
+async function refreshPage(){if(!connected){clearViews();return}try{if(currentPage==='home')await refreshBoard();if(currentPage==='projects')await refreshProjects();if(currentPage==='workers')await refreshWorkers()}catch(e){console.error(e)}}
+function clearViews(){$('#queue-cards').innerHTML=$('#working-cards').innerHTML=$('#review-cards').innerHTML='<div class="empty">Connect admin token to load data</div>';$('#project-list').innerHTML=$('#worker-list').innerHTML='<div class="empty">Connect admin token to load data</div>'}
+
+async function refreshBoard(){
+  [projects,board]=await Promise.all([api('/api/projects'),api('/api/task-board')]);const pm=Object.fromEntries(projects.map(p=>[p.id,p]));
+  const queue=board.filter(x=>['queued','failed','blocked'].includes(x.task.state));
+  const working=board.filter(x=>['assigned','running'].includes(x.task.state));
+  const review=board.filter(x=>x.task.state==='review');
+  renderLane('#queue-cards','#queue-count',queue,x=>taskCard(x,pm,true));
+  renderLane('#working-cards','#working-count',working,x=>taskCard(x,pm,false));
+  renderLane('#review-cards','#review-count',review,x=>reviewCard(x,pm));
+}
+function renderLane(sel,countSel,items,render){$(countSel).textContent=items.length;$(sel).innerHTML=items.length?items.map(render).join(''):'<div class="empty">Nothing here</div>'}
+function taskCard(x,pm,canRetry){
+  const t=x.task,p=pm[t.project_id];const worker=x.worker?'<span class="pill worker-pill">'+esc(x.worker.name)+'</span>':'';
+  const retry=canRetry&&['failed','blocked'].includes(t.state)?'<div class="card-actions"><button class="secondary" onclick="transitionTask(\''+t.id+'\',\'retry\')">Retry</button></div>':'';
+  return '<article class="card"><div class="card-title">'+esc(t.title)+'</div><div class="meta"><span class="pill">'+esc(p?.slug||short(t.project_id))+'</span><span>'+esc(t.state)+'</span>'+worker+'</div>'+(t.expected_outcome?'<div class="summary">'+esc(t.expected_outcome)+'</div>':'')+retry+'</article>';
+}
+function reviewCard(x,pm){
+  const t=x.task,p=pm[t.project_id],summary=x.result?.summary||t.expected_outcome||'Ready for review';
+  return '<article class="card"><div class="card-title">'+esc(t.title)+'</div><div class="meta"><span class="pill">'+esc(p?.slug||short(t.project_id))+'</span>'+(x.worker?'<span class="pill worker-pill">'+esc(x.worker.name)+'</span>':'')+'</div><div class="summary">'+esc(summary)+'</div><div class="card-actions"><button class="primary" onclick="transitionTask(\''+t.id+'\',\'approve\')">Approve</button><button class="secondary" onclick="transitionTask(\''+t.id+'\',\'retry\')">Retry</button></div></article>';
+}
+async function transitionTask(id,action){try{await api('/api/tasks/'+id+'/'+action,{method:'POST'});await refreshBoard()}catch(e){alert(e.message)}}
+
+async function refreshProjects(){projects=await api('/api/projects');$('#project-list').innerHTML=projects.length?projects.map(projectRow).join(''):'<div class="empty">No projects</div>'}
+function projectRow(p){return '<div class="list-row"><div class="list-main"><b>'+esc(p.name)+'</b><span class="subtle">'+esc(p.slug)+'</span></div><div><span class="status '+(p.enabled?'enabled':'disabled')+'">'+(p.enabled?'Enabled':'Disabled')+'</span><div class="subtle">branch '+esc(p.default_branch)+'</div></div><div class="truncate">'+esc(p.repo_url)+'<div>'+tags(p.required_worker_tags)+'</div></div><div class="row-actions"><button class="secondary" onclick="editProject(\''+p.id+'\')">Edit</button><button class="secondary" onclick="toggleProject(\''+p.id+'\')">'+(p.enabled?'Disable':'Enable')+'</button><button class="secondary danger" onclick="removeProject(\''+p.id+'\')">Delete</button></div></div>'}
+function openProjectDialog(project=null){editingProjectId=project?.id||null;$('#project-dialog-title').textContent=project?'Edit project':'New project';$('#project-slug').value=project?.slug||'';$('#project-name').value=project?.name||'';$('#project-repo').value=project?.repo_url||'';$('#project-branch').value=project?.default_branch||'main';$('#project-enabled').value=String(project?.enabled??true);$('#project-worker-tags').value=JSON.stringify(project?.required_worker_tags||{});$('#project-task-tags').value=JSON.stringify(project?.default_task_tags||{});$('#project-form-error').textContent='';$('#project-dialog').showModal()}
+function closeProjectDialog(){$('#project-dialog').close()}
+function editProject(id){openProjectDialog(projects.find(p=>p.id===id))}
+function parseObject(id){const value=JSON.parse($(id).value||'{}');if(!value||Array.isArray(value)||typeof value!=='object')throw new Error('Tags must be a JSON object');return value}
+async function saveProject(){try{const body={slug:$('#project-slug').value.trim(),name:$('#project-name').value.trim(),repo_url:$('#project-repo').value.trim(),default_branch:$('#project-branch').value.trim(),required_worker_tags:parseObject('#project-worker-tags'),default_task_tags:parseObject('#project-task-tags'),enabled:$('#project-enabled').value==='true'};await api(editingProjectId?'/api/projects/'+editingProjectId:'/api/projects',{method:editingProjectId?'PATCH':'POST',body:JSON.stringify(body)});closeProjectDialog();await refreshProjects()}catch(e){$('#project-form-error').textContent=e.message}}
+async function toggleProject(id){const p=projects.find(x=>x.id===id);try{await api('/api/projects/'+id,{method:'PATCH',body:JSON.stringify({enabled:!p.enabled})});await refreshProjects()}catch(e){alert(e.message)}}
+async function removeProject(id){const p=projects.find(x=>x.id===id);if(!confirm('Delete project '+p.name+'? Projects with task history must be disabled instead.'))return;try{await api('/api/projects/'+id,{method:'DELETE'});await refreshProjects()}catch(e){alert(e.message)}}
+
+async function refreshWorkers(){workers=await api('/api/workers');$('#worker-list').innerHTML=workers.length?workers.map(workerRow).join(''):'<div class="empty">No workers</div>'}
+function workerRow(w){return '<div class="list-row"><div class="list-main"><b>'+esc(w.name)+'</b><span class="subtle">ID '+esc(short(w.id))+'</span></div><div><span class="status '+esc(w.state)+'">'+esc(w.state)+'</span><div class="subtle">'+esc(w.os)+' / '+esc(w.arch)+'</div></div><div><span class="subtle">v'+esc(w.worker_version)+' · slots '+w.running_slots+'/'+w.slots+'</span><div>'+tags(w.tags)+'</div></div><div class="subtle">'+new Date(w.last_heartbeat_at).toLocaleString()+'</div></div>'}
+async function openWorkerPopover(){$('#worker-popover').classList.add('open');await generateJoinCode()}
+function closeWorkerPopover(){$('#worker-popover').classList.remove('open')}
+async function generateJoinCode(){try{const data=await api('/api/worker-join',{method:'POST'});$('#worker-join-code').value=data.join_code;$('#worker-join-meta').textContent='Expires '+new Date(data.expires_at).toLocaleString()}catch(e){$('#worker-join-meta').textContent=e.message}}
+async function copyJoinCode(){const code=$('#worker-join-code').value;if(!code)return;try{await navigator.clipboard.writeText(code);$('#worker-join-meta').textContent='Copied'}catch{$('#worker-join-code').select();document.execCommand('copy')}}
+
+window.addEventListener('hashchange',()=>showPage(location.hash.slice(1)||'home'));
+(async()=>{await verifyConnection();const start=location.hash.slice(1)||'home';showPage(['home','projects','workers'].includes(start)?start:'home');setInterval(refreshPage,5000)})();
+</script>
+</body>
+</html>

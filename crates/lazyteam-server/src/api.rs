@@ -50,6 +50,30 @@ pub(crate) struct CreateProject {
 fn default_branch() -> String { "main".into() }
 
 #[derive(Debug, Deserialize)]
+struct UpdateProject {
+    slug: Option<String>,
+    name: Option<String>,
+    repo_url: Option<String>,
+    default_branch: Option<String>,
+    required_worker_tags: Option<Tags>,
+    default_task_tags: Option<Tags>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerRef {
+    id: Uuid,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskBoardItem {
+    task: Task,
+    worker: Option<WorkerRef>,
+    result: Option<ExecutionResult>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct CreateTask {
     pub(crate) project_id: Uuid,
     pub(crate) title: String,
@@ -106,7 +130,9 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
         .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/projects/{id}", axum::routing::patch(update_project).delete(delete_project))
         .route("/api/tasks", get(list_tasks).post(create_task))
+        .route("/api/task-board", get(task_board))
         .route("/api/workers", get(list_workers))
         .route("/api/worker-join", post(create_worker_join_code))
         .route("/api/workers/register", post(register_worker))
@@ -156,6 +182,42 @@ pub(crate) async fn list_projects(State(state): State<Arc<AppState>>) -> ApiResu
     rows.iter().map(project_from_row).collect::<Result<Vec<_>,_>>().map(Json)
 }
 
+async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, Json(input): Json<UpdateProject>) -> ApiResult<Project> {
+    let row = sqlx::query("SELECT * FROM projects WHERE id=?")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    let current = project_from_row(&row)?;
+    let slug = input.slug.unwrap_or(current.slug);
+    if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+        return Err((StatusCode::BAD_REQUEST, "invalid project slug".into()));
+    }
+    let name = input.name.unwrap_or(current.name);
+    let repo_url = input.repo_url.unwrap_or(current.repo_url);
+    let default_branch = input.default_branch.unwrap_or(current.default_branch);
+    if name.trim().is_empty() || repo_url.trim().is_empty() || default_branch.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "project name, repository, and default branch are required".into()));
+    }
+    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,required_worker_tags=?,default_task_tags=?,enabled=?,updated_at=? WHERE id=?")
+        .bind(&slug).bind(name.trim()).bind(repo_url.trim()).bind(default_branch.trim())
+        .bind(json(&input.required_worker_tags.unwrap_or(current.required_worker_tags))?)
+        .bind(json(&input.default_task_tags.unwrap_or(current.default_task_tags))?)
+        .bind(if input.enabled.unwrap_or(current.enabled) { 1_i64 } else { 0_i64 })
+        .bind(ts(Utc::now())).bind(id.to_string()).execute(&state.db).await.map_err(db_conflict)?;
+    let row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    Ok(Json(project_from_row(&row)?))
+}
+
+async fn delete_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE project_id=?")
+        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    if task_count > 0 {
+        return Err((StatusCode::CONFLICT, "project has task history; disable it instead of deleting it".into()));
+    }
+    let changed = sqlx::query("DELETE FROM projects WHERE id=?").bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
+    if changed == 0 { return Err((StatusCode::NOT_FOUND, "project not found".into())); }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input): Json<CreateTask>) -> ApiResult<Task> {
     let project_id = input.project_id.to_string();
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id=? AND enabled=1")
@@ -186,6 +248,23 @@ pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input):
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Task>> {
     let rows = sqlx::query("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(task_from_row).collect::<Result<Vec<_>,_>>().map(Json)
+}
+
+async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
+    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id ORDER BY t.priority DESC, t.created_at ASC")
+        .fetch_all(&state.db).await.map_err(db_error)?;
+    rows.iter().map(|row| {
+        let task = task_from_row(row)?;
+        let worker_id: Option<String> = row.try_get("board_worker_id").map_err(internal)?;
+        let worker_name: Option<String> = row.try_get("board_worker_name").map_err(internal)?;
+        let worker = match (worker_id, worker_name) {
+            (Some(id), Some(name)) => Some(WorkerRef { id: uuid(id)?, name }),
+            _ => None,
+        };
+        let result: Option<String> = row.try_get("board_result").map_err(internal)?;
+        let result = result.map(dejson).transpose()?;
+        Ok(TaskBoardItem { task, worker, result })
+    }).collect::<Result<Vec<_>, ApiError>>().map(Json)
 }
 
 async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<RegisterWorker>) -> Result<Response, ApiError> {
