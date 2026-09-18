@@ -47,11 +47,16 @@ process_uid() {
   docker exec "$1" sh -c "awk '/^Uid:/{print \$2}' /proc/1/status"
 }
 
+process_caps() {
+  docker exec "$1" sh -c "awk '/^CapEff:/{print \$2}' /proc/1/status"
+}
+
 root_data="$(mktemp -d)"
 root_workspaces="$(mktemp -d)"
 sudo chown 0:0 "$root_data" "$root_workspaces"
 run_case lazyteam-perm-root 8877 "$root_data" "$root_workspaces"
 test "$(process_uid lazyteam-perm-root)" = "10001"
+test "$(process_caps lazyteam-perm-root)" = "0000000000000000"
 test "$(stat -c '%u' "$root_data/lazyteam.db")" = "10001"
 docker rm -f lazyteam-perm-root >/dev/null
 
@@ -69,6 +74,7 @@ docker volume create "$data_volume" >/dev/null
 docker volume create "$workspace_volume" >/dev/null
 run_case lazyteam-perm-volume 8879 "$data_volume" "$workspace_volume"
 test "$(process_uid lazyteam-perm-volume)" = "10001"
+test "$(process_caps lazyteam-perm-volume)" = "0000000000000000"
 docker rm -f lazyteam-perm-volume >/dev/null
 docker volume rm "$data_volume" "$workspace_volume" >/dev/null
 
