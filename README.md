@@ -49,7 +49,17 @@ The process working directory is `/app`. Persistent server state is stored in `/
 
 For NAS deployments, bind-mount host datasets to `/app/data` and `/app/workspaces` if you prefer explicit host paths over Docker named volumes.
 
-The container runs as a non-root user with a read-only root filesystem, all Linux capabilities dropped, and `no-new-privileges` enabled.
+No manual `chown`, PUID or PGID setting is required in the normal case. The container entrypoint starts with only the capabilities needed to initialize the mounts, detects an existing non-root owner, and then drops privileges before starting LazyTeam:
+
+- TrueNAS datasets owned by `568:568` are automatically run as `568:568`.
+- Arbitrary non-root bind-mount owners are adopted the same way.
+- Root-owned empty bind mounts are initialized to the default runtime identity `10001:10001`.
+- Docker named volumes work without extra settings.
+- If an older root-run image left a root-owned database inside a non-root dataset, the dataset owner wins and the database ownership is repaired.
+
+After initialization, the LazyTeam server itself runs non-root and its effective Linux capabilities are cleared. The root filesystem remains read-only and `no-new-privileges` is enabled.
+
+For unusual environments, `PUID`/`PGID` (or `LAZYTEAM_PUID`/`LAZYTEAM_PGID`) may explicitly override the automatic identity selection, but they are not required for TrueNAS or ordinary Docker deployments.
 
 ### Required production settings
 
