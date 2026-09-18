@@ -241,6 +241,10 @@ pub struct Worker {
     pub installed_capabilities: BTreeSet<String>,
     #[serde(default)]
     pub capability_error: Option<String>,
+    #[serde(default)]
+    pub capability_phase: Option<String>,
+    #[serde(default)]
+    pub capability_log: String,
     /// Effective scheduler tags: system + user + selected managed capabilities that are installed.
     #[serde(default)]
     pub tags: Tags,
@@ -460,6 +464,8 @@ mod tests {
             managed_capabilities: BTreeSet::new(),
             installed_capabilities: BTreeSet::new(),
             capability_error: None,
+            capability_phase: None,
+            capability_log: String::new(),
             tags: BTreeMap::from([
                 ("os".into(), "linux".into()),
                 ("arch".into(), "aarch64".into()),

@@ -96,6 +96,10 @@ mod tests {
         assert!(INDEX.contains("worker-system-tags"));
         assert!(INDEX.contains("worker-managed-capabilities"));
         assert!(INDEX.contains("worker-capability-status"));
+        assert!(INDEX.contains("worker-capability-log-details"));
+        assert!(INDEX.contains("Provisioning log"));
+        assert!(INDEX.contains("w.capability_phase"));
+        assert!(INDEX.contains("w.capability_log"));
         assert!(INDEX.contains("/api/worker-capabilities"));
         assert!(INDEX.contains("selectedManagedCapabilities"));
         assert!(INDEX.contains("managedCapabilitiesDraft"));

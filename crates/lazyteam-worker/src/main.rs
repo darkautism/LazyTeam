@@ -347,8 +347,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Err(error) => {
             warn!(%error, "initial managed capability reconciliation failed; worker remains pending and will retry");
+            let tail = capability_build_log_tail(&args.state_dir).await;
             let _ = report_capability_build_error(
-                &client, &server, &worker_credential, worker_id, &local_installed_capabilities, &error.to_string(),
+                &client, &server, &worker_credential, worker_id, &local_installed_capabilities, &error.to_string(), &tail,
             ).await;
         }
     }
@@ -405,7 +406,8 @@ async fn async_main() -> anyhow::Result<()> {
             &mut agent_sandbox, &mut probe_runtime,
         ).await {
             error!(%error, "managed capability provisioning failed");
-            let _ = report_capability_build_error(&client, &server, &worker_credential, worker_id, &local_installed_capabilities, &error.to_string()).await;
+            let tail = capability_build_log_tail(&args.state_dir).await;
+            let _ = report_capability_build_error(&client, &server, &worker_credential, worker_id, &local_installed_capabilities, &error.to_string(), &tail).await;
             sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -588,6 +590,17 @@ async fn load_local_installed_capabilities(state_dir: &Path) -> anyhow::Result<B
     }
 }
 
+fn capability_build_log_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("capability-build.log")
+}
+
+async fn capability_build_log_tail(state_dir: &Path) -> String {
+    const MAX_CHARS: usize = 16_000;
+    let raw = tokio::fs::read_to_string(capability_build_log_path(state_dir)).await.unwrap_or_default();
+    let count = raw.chars().count();
+    if count <= MAX_CHARS { raw } else { raw.chars().skip(count - MAX_CHARS).collect() }
+}
+
 async fn build_agent_rootfs(state_dir: &Path, capabilities: &BTreeSet<String>) -> anyhow::Result<PathBuf> {
     let script_path = state_dir.join("agent-rootfs-build.sh");
     let rewrite = match tokio::fs::read_to_string(&script_path).await {
@@ -604,23 +617,27 @@ async fn build_agent_rootfs(state_dir: &Path, capabilities: &BTreeSet<String>) -
         }
     }
 
+    let log_path = capability_build_log_path(state_dir);
+    tokio::fs::write(&log_path, format!("LazyTeam managed-tool build target: {:?}\n", capabilities)).await
+        .context("initialize capability build log")?;
+    let stdout_log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+        .context("open capability build log stdout")?;
+    let stderr_log = stdout_log.try_clone().context("clone capability build log")?;
+
     let mut command = Command::new("/bin/bash");
     command.arg(&script_path).arg(state_dir);
     for capability in capabilities {
         command.arg(capability);
     }
     command.stdin(std::process::Stdio::null());
-    let output = command.output().await.context("run fixed agent rootfs builder")?;
-    if !output.status.success() {
-        bail!(
-            "agent rootfs build failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    command.stdout(std::process::Stdio::from(stdout_log));
+    command.stderr(std::process::Stdio::from(stderr_log));
+    let status = command.status().await.context("run fixed agent rootfs builder")?;
+    if !status.success() {
+        let tail = capability_build_log_tail(state_dir).await;
+        bail!("agent rootfs build failed; provisioning log tail:\n{tail}");
     }
-    let stdout = String::from_utf8(output.stdout).context("agent rootfs builder emitted non-UTF8 output")?;
-    let path = stdout.lines().rev().find(|line| !line.trim().is_empty())
-        .context("agent rootfs builder did not return a rootfs path")?;
-    let rootfs = PathBuf::from(path.trim());
+    let rootfs = state_dir.join("agent-rootfs").join("current");
     tokio::fs::canonicalize(&rootfs).await
         .with_context(|| format!("canonicalize built agent rootfs {}", rootfs.display()))
 }
@@ -632,17 +649,23 @@ async fn build_agent_rootfs_with_heartbeat(
     worker_id: Uuid,
     state_dir: &Path,
     capabilities: &BTreeSet<String>,
+    installed_before: &BTreeSet<String>,
 ) -> anyhow::Result<PathBuf> {
     let build = build_agent_rootfs(state_dir, capabilities);
     tokio::pin!(build);
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(10));
+    let mut log_tick = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
             result = &mut build => return result,
-            _ = tick.tick() => {
+            _ = heartbeat_tick.tick() => {
                 if let Err(error) = heartbeat(client, server, credential, worker_id).await {
                     warn!(%error, "heartbeat failed while rebuilding agent rootfs");
                 }
+            }
+            _ = log_tick.tick() => {
+                let tail = capability_build_log_tail(state_dir).await;
+                let _ = report_capability_build(client, server, credential, worker_id, installed_before, "building", &tail).await;
             }
         }
     }
@@ -654,9 +677,11 @@ async fn report_capability_build(
     credential: &str,
     worker_id: Uuid,
     installed: &BTreeSet<String>,
+    phase: &str,
+    log_tail: &str,
 ) -> anyhow::Result<()> {
     let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capability-build")), credential)
-        .json(&json!({"installed_capabilities": installed})).send().await?;
+        .json(&json!({"installed_capabilities": installed, "phase": phase, "log_tail": log_tail})).send().await?;
     ensure_success(response).await?;
     Ok(())
 }
@@ -668,9 +693,10 @@ async fn report_capability_build_error(
     worker_id: Uuid,
     installed: &BTreeSet<String>,
     error: &str,
+    log_tail: &str,
 ) -> anyhow::Result<()> {
     let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/capability-build")), credential)
-        .json(&json!({"installed_capabilities": installed, "error": error})).send().await?;
+        .json(&json!({"installed_capabilities": installed, "error": error, "phase": "failed", "log_tail": log_tail})).send().await?;
     ensure_success(response).await?;
     Ok(())
 }
@@ -695,7 +721,9 @@ async fn reconcile_managed_capabilities(
 
     if target != *local_installed {
         info!(?target, "rebuilding agent rootfs for added managed capabilities");
-        let rootfs = build_agent_rootfs_with_heartbeat(client, server, credential, worker_id, state_dir, &target).await?;
+        let rootfs = build_agent_rootfs_with_heartbeat(client, server, credential, worker_id, state_dir, &target, local_installed).await?;
+        let tail = capability_build_log_tail(state_dir).await;
+        let _ = report_capability_build(client, server, credential, worker_id, local_installed, "activating", &tail).await;
         let sandbox = AgentSandbox::prepare(state_dir, pi_bin, Some(&rootfs)).await?;
         *agent_rootfs = rootfs;
         *local_installed = target;
@@ -713,7 +741,8 @@ async fn reconcile_managed_capabilities(
     if runtime_config.installed_capabilities != *local_installed
         || !runtime_config.managed_capabilities.is_subset(local_installed)
     {
-        report_capability_build(client, server, credential, worker_id, local_installed).await?;
+        let tail = capability_build_log_tail(state_dir).await;
+        report_capability_build(client, server, credential, worker_id, local_installed, "ready", &tail).await?;
         runtime_config.installed_capabilities = local_installed.clone();
     }
     Ok(())

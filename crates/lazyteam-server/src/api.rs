@@ -249,6 +249,18 @@ struct CapabilityBuildReport {
     installed_capabilities: BTreeSet<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    log_tail: Option<String>,
+}
+
+fn bounded_capability_log(raw: Option<&str>) -> String {
+    const MAX_CHARS: usize = 16_000;
+    let raw = raw.unwrap_or_default();
+    let count = raw.chars().count();
+    if count <= MAX_CHARS { return raw.to_string(); }
+    raw.chars().skip(count - MAX_CHARS).collect()
 }
 
 fn managed_capability_label(id: &str) -> &'static str {
@@ -689,9 +701,11 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
         worker_state_str(&current.state)
     };
     let capability_error = if needs_build || recovering_capability_state { None } else { current.capability_error.as_deref() };
-    sqlx::query("UPDATE workers SET name=?,role=?,tags=?,managed_capabilities=?,capability_error=?,state=?,allowed_projects=?,slots=?,agent_type=?,agent_provider=?,agent_model=?,initial_prompt=? WHERE id=?")
+    let capability_phase = if needs_build { Some("queued") } else { current.capability_phase.as_deref() };
+    let capability_log = if needs_build { "" } else { current.capability_log.as_str() };
+    sqlx::query("UPDATE workers SET name=?,role=?,tags=?,managed_capabilities=?,capability_error=?,capability_phase=?,capability_log=?,state=?,allowed_projects=?,slots=?,agent_type=?,agent_provider=?,agent_model=?,initial_prompt=? WHERE id=?")
         .bind(name.trim()).bind(agent_role_str(&role)).bind(json(&tags)?).bind(json(&managed_capabilities)?)
-        .bind(capability_error).bind(next_state).bind(json(&allowed_projects)?).bind(slots as i64)
+        .bind(capability_error).bind(capability_phase).bind(capability_log).bind(next_state).bind(json(&allowed_projects)?).bind(slots as i64)
         .bind(&agent_type).bind(&provider).bind(&model).bind(initial_prompt.trim()).bind(id.to_string())
         .execute(&state.db).await.map_err(db_error)?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
@@ -799,9 +813,11 @@ async fn report_capability_build(
     if worker.protocol_version < 5 {
         return Err((StatusCode::CONFLICT, "worker protocol 5 is required for managed tool builds".into()));
     }
+    let log_tail = bounded_capability_log(report.log_tail.as_deref());
     if let Some(error) = report.error.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-        sqlx::query("UPDATE workers SET state='degraded',capability_error=? WHERE id=?")
-            .bind(error).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
+        let phase = report.phase.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("failed");
+        sqlx::query("UPDATE workers SET state='degraded',capability_error=?,capability_phase=?,capability_log=? WHERE id=?")
+            .bind(error).bind(phase).bind(log_tail).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
         return Ok(StatusCode::NO_CONTENT);
     }
     if !worker.installed_capabilities.is_subset(&report.installed_capabilities) {
@@ -813,8 +829,10 @@ async fn report_capability_build(
     } else {
         "pending"
     };
-    sqlx::query("UPDATE workers SET installed_capabilities=?,capability_error=NULL,state=? WHERE id=?")
-        .bind(json(&report.installed_capabilities)?).bind(next_state).bind(id.to_string())
+    let phase = report.phase.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        .unwrap_or(if ready { "ready" } else { "building" });
+    sqlx::query("UPDATE workers SET installed_capabilities=?,capability_error=NULL,capability_phase=?,capability_log=?,state=? WHERE id=?")
+        .bind(json(&report.installed_capabilities)?).bind(phase).bind(log_tail).bind(next_state).bind(id.to_string())
         .execute(&state.db).await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1394,7 +1412,9 @@ fn worker_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Worker, ApiError> {
         role: agent_role(row.try_get("role").map_err(internal)?)?,
         state: match state.as_str() { "busy" => WorkerState::Busy, "pending" => WorkerState::Pending, "draining" => WorkerState::Draining, "degraded" => WorkerState::Degraded, "offline" => WorkerState::Offline, _ => WorkerState::Idle },
         os, arch, system_tags, user_tags, managed_capabilities, installed_capabilities,
-        capability_error: row.try_get("capability_error").map_err(internal)?, tags,
+        capability_error: row.try_get("capability_error").map_err(internal)?,
+        capability_phase: row.try_get("capability_phase").map_err(internal)?,
+        capability_log: row.try_get("capability_log").map_err(internal)?, tags,
         allowed_projects: dejson(row.try_get("allowed_projects").map_err(internal)?)?, slots: row.try_get::<i64,_>("slots").map_err(internal)? as u32,
         running_slots: row.try_get::<i64,_>("running_slots").map_err(internal)? as u32, protocol_version: row.try_get::<i64,_>("protocol_version").map_err(internal)? as u32,
         worker_version: row.try_get("worker_version").map_err(internal)?, last_heartbeat_at: datetime(row.try_get("last_heartbeat_at").map_err(internal)?)?,
