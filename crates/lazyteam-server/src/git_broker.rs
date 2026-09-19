@@ -637,10 +637,17 @@ impl HostGitAuth {
             GitCredential::Worker => {}
             GitCredential::HttpsBasic { username, secret } => {
                 let encoded = STANDARD.encode(format!("{username}:{secret}"));
+                // Explicit project credentials must not be combined with ambient Host
+                // authentication. Empty multi-value entries reset inherited Git config
+                // before the project-scoped Authorization header is added.
                 auth.env.extend([
-                    ("GIT_CONFIG_COUNT".into(), "1".into()),
+                    ("GIT_CONFIG_COUNT".into(), "3".into()),
                     ("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()),
-                    ("GIT_CONFIG_VALUE_0".into(), format!("Authorization: Basic {encoded}")),
+                    ("GIT_CONFIG_VALUE_0".into(), String::new()),
+                    ("GIT_CONFIG_KEY_1".into(), "credential.helper".into()),
+                    ("GIT_CONFIG_VALUE_1".into(), String::new()),
+                    ("GIT_CONFIG_KEY_2".into(), "http.extraHeader".into()),
+                    ("GIT_CONFIG_VALUE_2".into(), format!("Authorization: Basic {encoded}")),
                 ]);
             }
             GitCredential::SshKey { private_key } => {

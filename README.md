@@ -162,6 +162,16 @@ Each project chooses how the Host reaches upstream:
 - **Host SSH private key**: store a project-scoped private key in LazyTeam. The Host materializes it only for the upstream Git command and removes the temporary key afterward.
 - **Host HTTPS username + token/password**: store a project-scoped HTTPS credential. The Host applies it only to its upstream fetch/publish command.
 
+#### GitHub fine-grained PAT: least privilege
+
+For normal LazyTeam Host fetch/publish over HTTPS, a GitHub fine-grained personal access token should be restricted to the required repository or repositories and needs only:
+
+- **Repository permissions → Contents: Read and write** — required to fetch and push Git objects/refs.
+- **Metadata: Read-only** — GitHub adds this required permission automatically.
+- **Workflows: Read and write** — add this only if LazyTeam must publish commits that modify files under `.github/workflows/`.
+
+**Administration is not required** for ordinary Git fetch/push. It controls repository settings and does not replace `Contents: Read and write`. Actions, Pull requests, Issues, and other repository permissions are also unnecessary unless a separate LazyTeam feature explicitly uses those APIs. Repository rules or branch protection can still reject a push independently of token permissions.
+
 Stored project secrets are write-only from the Project UI/API and encrypted at rest with AES-256-GCM. On first boot LazyTeam generates a random master key at `LAZYTEAM_GIT_ROOT/credential.key` (normally `/app/data/git/credential.key` in the container) with private permissions and reuses it across restarts. `LAZYTEAM_GIT_CREDENTIAL_KEY` remains only as an optional compatibility override; normal deployments do not need to provide it.
 
 For execution, the Host maintains a project mirror and creates a bare repository scoped to the execution. Assignments contain a Host URL such as `https://lazyteam.example.com/git/task/<execution-id>/repo.git`, never the upstream URL plus credentials. Every implementation or review claim also mints a fresh opaque **lease capability**. Broker access and lease renew/finish calls require both the worker identity credential and that exact lease capability, so two slots on the same worker cannot authorize each other's execution/review. Only a hash of the lease capability is stored by the Host. The capability is revoked immediately when the execution/review finishes or is marked lost, and an expired lease cannot be renewed. Workers may push only the stable task ref allowed by the Host pre-receive hook; reviewer broker endpoints are read-only. After approval, `tasks_merge` makes the Host re-fetch upstream, verifies that the reviewed base and candidate have not moved, and publishes the exact reviewed candidate upstream with the Host-only project credential.
