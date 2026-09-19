@@ -20,33 +20,6 @@ pub const DEFAULT_REVIEWER_PROMPT: &str = "You are an independent senior LazyTea
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ReviewerMode {
-    Manual,
-    Mcp,
-}
-
-impl Default for ReviewerMode {
-    fn default() -> Self { Self::Mcp }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReviewerConfig {
-    #[serde(default)]
-    pub mode: ReviewerMode,
-    #[serde(default = "default_reviewer_prompt")]
-    pub initial_prompt: String,
-}
-
-fn default_reviewer_prompt() -> String { DEFAULT_REVIEWER_PROMPT.into() }
-
-impl Default for ReviewerConfig {
-    fn default() -> Self {
-        Self { mode: ReviewerMode::Mcp, initial_prompt: DEFAULT_REVIEWER_PROMPT.into() }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum AgentLoginMode {
     Unsupported,
     LocalInteractive,
@@ -203,8 +176,6 @@ pub struct Project {
     pub required_worker_tags: Tags,
     #[serde(default)]
     pub default_task_tags: Tags,
-    #[serde(default)]
-    pub reviewer: ReviewerConfig,
     #[serde(default)]
     pub git_auth: GitAuthConfig,
     pub enabled: bool,
@@ -492,7 +463,6 @@ mod tests {
             contributor: ContributorIdentity::default(),
             required_worker_tags: BTreeMap::from([("cpu".into(), "rk3588".into())]),
             default_task_tags: BTreeMap::new(),
-            reviewer: ReviewerConfig::default(),
             git_auth: GitAuthConfig::default(),
             enabled: true,
             created_at: Utc::now(),
@@ -528,7 +498,6 @@ mod tests {
             contributor: ContributorIdentity::default(),
             required_worker_tags: BTreeMap::new(),
             default_task_tags: BTreeMap::new(),
-            reviewer: ReviewerConfig::default(),
             git_auth: GitAuthConfig::default(),
             enabled: true,
             created_at: Utc::now(),
@@ -557,7 +526,6 @@ mod tests {
                 ("tool.rust".into(), "true".into()),
             ]),
             default_task_tags: BTreeMap::new(),
-            reviewer: ReviewerConfig::default(),
             git_auth: GitAuthConfig::default(),
             enabled: true,
             created_at: Utc::now(),

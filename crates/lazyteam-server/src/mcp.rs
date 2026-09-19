@@ -136,7 +136,6 @@ impl LazyTeamMcp {
                 contributor: lazyteam_core::ContributorIdentity { name: input.contributor_name, email: input.contributor_email },
                 required_worker_tags: input.required_worker_tags,
                 default_task_tags: input.default_task_tags,
-                reviewer: lazyteam_core::ReviewerConfig::default(),
                 git_auth: crate::api::ProjectGitAuthInput::default(),
             }),
         ).await.map_err(api_to_mcp)?;

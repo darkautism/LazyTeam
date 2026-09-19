@@ -13,7 +13,7 @@ use lazyteam_core::{
     managed_capability_tag, worker_can_run_project, worker_matches_task, AgentCapabilities, AgentConfig,
     AgentRole, Assignment, ContributorIdentity, Execution, ExecutionResult, ExecutionState, GitAuthConfig,
     GitAuthMode, GitCredential, Project, ReviewAssignment, ReviewCheckout as WorkerReviewCheckout, ReviewLease,
-    ReviewerConfig, ReviewerMode, ReviewVerdict, ReviewVerdictKind, Tags, Task, TaskState, Worker,
+    ReviewVerdict, ReviewVerdictKind, Tags, Task, TaskState, Worker,
     WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT, LEASE_CAPABILITY_HEADER,
     MANAGED_CAPABILITY_IDS,
 };
@@ -63,8 +63,6 @@ pub(crate) struct CreateProject {
     #[serde(default)]
     pub(crate) default_task_tags: Tags,
     #[serde(default)]
-    pub(crate) reviewer: ReviewerConfig,
-    #[serde(default)]
     pub(crate) git_auth: ProjectGitAuthInput,
 }
 
@@ -105,7 +103,6 @@ struct UpdateProject {
     contributor: Option<ContributorIdentity>,
     required_worker_tags: Option<Tags>,
     default_task_tags: Option<Tags>,
-    reviewer: Option<ReviewerConfig>,
     git_auth: Option<ProjectGitAuthInput>,
     enabled: Option<bool>,
 }
@@ -419,23 +416,19 @@ pub(crate) async fn create_project(State(state): State<Arc<AppState>>, Json(inpu
     if input.name.trim().is_empty() || input.repo_url.trim().is_empty() || input.default_branch.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "project name, repository, and default branch are required".into()));
     }
-    if input.reviewer.initial_prompt.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "reviewer initial prompt must not be empty".into()));
-    }
     let contributor = normalize_contributor(input.contributor)?;
     let stored_git_auth = resolve_new_git_auth(&state, input.git_auth)?;
     let now = Utc::now();
     let project = Project {
         id: Uuid::new_v4(), slug: input.slug, name: input.name.trim().into(), repo_url: input.repo_url.trim().into(),
         default_branch: input.default_branch.trim().into(), contributor, required_worker_tags: input.required_worker_tags,
-        default_task_tags: input.default_task_tags, reviewer: input.reviewer,
+        default_task_tags: input.default_task_tags,
         git_auth: git_auth_summary(&stored_git_auth), enabled: true, created_at: now, updated_at: now,
     };
-    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,contributor_name,contributor_email,required_worker_tags,default_task_tags,reviewer_mode,reviewer_prompt,git_auth_mode,git_auth_username,git_auth_secret,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,contributor_name,contributor_email,required_worker_tags,default_task_tags,git_auth_mode,git_auth_username,git_auth_secret,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(project.id.to_string()).bind(&project.slug).bind(&project.name).bind(&project.repo_url)
         .bind(&project.default_branch).bind(&project.contributor.name).bind(&project.contributor.email)
         .bind(json(&project.required_worker_tags)?).bind(json(&project.default_task_tags)?)
-        .bind(reviewer_mode_str(&project.reviewer.mode)).bind(&project.reviewer.initial_prompt)
         .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret)
         .bind(1_i64).bind(ts(project.created_at)).bind(ts(project.updated_at))
         .execute(&state.db).await.map_err(db_conflict)?;
@@ -489,19 +482,14 @@ async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
         return Err((StatusCode::BAD_REQUEST, "project name, repository, and default branch are required".into()));
     }
     let contributor = normalize_contributor(input.contributor.unwrap_or(current.contributor))?;
-    let reviewer = input.reviewer.unwrap_or(current.reviewer);
-    if reviewer.initial_prompt.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "reviewer initial prompt must not be empty".into()));
-    }
     let stored_git_auth = resolve_updated_git_auth(&state, &row, input.git_auth)?;
     let now = ts(Utc::now());
     let mut tx = state.db.begin().await.map_err(db_error)?;
-    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,contributor_name=?,contributor_email=?,required_worker_tags=?,default_task_tags=?,reviewer_mode=?,reviewer_prompt=?,git_auth_mode=?,git_auth_username=?,git_auth_secret=?,enabled=?,updated_at=? WHERE id=?")
+    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,contributor_name=?,contributor_email=?,required_worker_tags=?,default_task_tags=?,git_auth_mode=?,git_auth_username=?,git_auth_secret=?,enabled=?,updated_at=? WHERE id=?")
         .bind(&slug).bind(name.trim()).bind(repo_url.trim()).bind(default_branch.trim())
         .bind(&contributor.name).bind(&contributor.email)
         .bind(json(&input.required_worker_tags.unwrap_or(current.required_worker_tags))?)
         .bind(json(&input.default_task_tags.unwrap_or(current.default_task_tags))?)
-        .bind(reviewer_mode_str(&reviewer.mode)).bind(reviewer.initial_prompt.trim())
         .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret)
         .bind(if enabled { 1_i64 } else { 0_i64 })
         .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_conflict)?;
@@ -1595,13 +1583,6 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, ApiError> 
             email: row.try_get("contributor_email").map_err(internal)?,
         },
         required_worker_tags: dejson(row.try_get("required_worker_tags").map_err(internal)?)?, default_task_tags: dejson(row.try_get("default_task_tags").map_err(internal)?)?,
-        reviewer: ReviewerConfig {
-            mode: reviewer_mode(row.try_get("reviewer_mode").map_err(internal)?)?,
-            initial_prompt: {
-                let value: String = row.try_get("reviewer_prompt").map_err(internal)?;
-                if value.trim().is_empty() { DEFAULT_REVIEWER_PROMPT.into() } else { value }
-            },
-        },
         git_auth: git_auth_summary(&stored_git_auth_from_row(row)?),
         enabled: row.try_get::<i64,_>("enabled").map_err(internal)? != 0, created_at: datetime(row.try_get("created_at").map_err(internal)?)?,
         updated_at: datetime(row.try_get("updated_at").map_err(internal)?)?,
@@ -1661,14 +1642,6 @@ fn agent_role_str(role: &AgentRole) -> &'static str {
 
 fn agent_role(value: String) -> Result<AgentRole, ApiError> {
     match value.as_str() { "worker" => Ok(AgentRole::Worker), "reviewer" => Ok(AgentRole::Reviewer), _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid agent role {value}"))) }
-}
-
-fn reviewer_mode_str(mode: &ReviewerMode) -> &'static str {
-    match mode { ReviewerMode::Manual => "manual", ReviewerMode::Mcp => "mcp" }
-}
-
-fn reviewer_mode(value: String) -> Result<ReviewerMode, ApiError> {
-    match value.as_str() { "manual" => Ok(ReviewerMode::Manual), "mcp" => Ok(ReviewerMode::Mcp), _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid reviewer mode {value}"))) }
 }
 
 fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
