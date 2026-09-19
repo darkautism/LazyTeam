@@ -821,8 +821,14 @@ async fn execute_review_assignment(
     renew.abort();
 
     let body = match outcome {
-        Ok(verdict) => json!({"status":"completed","verdict":verdict}),
-        Err(error) => json!({"status":"failed","error":error.to_string()}),
+        Ok(verdict) => {
+            info!(%review_id, verdict = ?verdict.verdict, "reviewer produced verdict; reporting review finish");
+            json!({"status":"completed","verdict":verdict})
+        }
+        Err(error) => {
+            warn!(%review_id, %error, "reviewer failed before verdict; reporting failed review");
+            json!({"status":"failed","error":error.to_string()})
+        }
     };
     let response = lease_auth(
         client.post(format!("{server}/api/reviews/{review_id}/finish")),
@@ -830,6 +836,7 @@ async fn execute_review_assignment(
         &assignment.lease_capability,
     ).json(&body).send().await?;
     ensure_success(response).await?;
+    info!(%review_id, "server accepted review finish");
     if workspace.exists() { let _ = tokio::fs::remove_dir_all(&workspace).await; }
     let agent_workspace = sandbox.reviewer_workspace(review_id);
     if agent_workspace.exists() { let _ = tokio::fs::remove_dir_all(&agent_workspace).await; }

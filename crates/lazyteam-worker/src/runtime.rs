@@ -10,8 +10,9 @@ use tokio::time::{Duration, Instant};
 use crate::sandbox::AgentSandbox;
 
 const DEFAULT_AGENT_RUN_TIMEOUT_SECS: u64 = 600;
-const DEFAULT_REVIEW_EVIDENCE_TIMEOUT_SECS: u64 = 180;
-const DEFAULT_REVIEW_FINAL_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_REVIEW_RUN_TIMEOUT_SECS: u64 = 1800;
+const DEFAULT_REVIEW_SOFT_TOOL_BUDGET: u64 = 12;
+const DEFAULT_REVIEW_HARD_TOOL_BUDGET: u64 = 20;
 
 fn bounded_timeout_from_env(name: &str, default_secs: u64, min_secs: u64, max_secs: u64) -> Duration {
     let seconds = std::env::var(name)
@@ -26,22 +27,37 @@ fn agent_run_timeout() -> Duration {
     bounded_timeout_from_env("LAZYTEAM_AGENT_TIMEOUT_SECS", DEFAULT_AGENT_RUN_TIMEOUT_SECS, 60, 3600)
 }
 
-fn review_evidence_timeout() -> Duration {
+fn review_run_timeout() -> Duration {
     bounded_timeout_from_env(
-        "LAZYTEAM_REVIEW_EVIDENCE_TIMEOUT_SECS",
-        DEFAULT_REVIEW_EVIDENCE_TIMEOUT_SECS,
-        60,
-        1800,
+        "LAZYTEAM_REVIEW_TIMEOUT_SECS",
+        DEFAULT_REVIEW_RUN_TIMEOUT_SECS,
+        300,
+        7200,
     )
 }
 
-fn review_final_timeout() -> Duration {
-    bounded_timeout_from_env(
-        "LAZYTEAM_REVIEW_FINAL_TIMEOUT_SECS",
-        DEFAULT_REVIEW_FINAL_TIMEOUT_SECS,
-        30,
-        600,
-    )
+fn review_tool_budgets() -> (u64, u64) {
+    let soft = std::env::var("LAZYTEAM_REVIEW_SOFT_TOOL_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REVIEW_SOFT_TOOL_BUDGET)
+        .clamp(4, 200);
+    let hard = std::env::var("LAZYTEAM_REVIEW_HARD_TOOL_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REVIEW_HARD_TOOL_BUDGET)
+        .clamp(soft + 1, 400);
+    (soft, hard)
+}
+
+fn review_steer_message(completed_tools: u64, soft: u64, hard: u64) -> Option<&'static str> {
+    if completed_tools == soft {
+        Some("You have completed substantial review inspection. Avoid repeating checks already performed. If the acceptance criteria are now resolved, return the required final JSON verdict; continue using tools only for a concrete unresolved question.")
+    } else if completed_tools == hard {
+        Some("Conclude the review now unless one specific unresolved acceptance criterion still requires evidence. Do not repeat prior repository inspection. Return the required final JSON verdict as soon as that concrete question is resolved.")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -92,14 +108,13 @@ impl PiRuntime {
         prompt: &str,
         session_name: &str,
         timeout: Duration,
-        no_tools: bool,
+        review_budgets: Option<(u64, u64)>,
     ) -> anyhow::Result<AgentRunResult> {
         if let Some(session_dir) = &self.session_dir {
             tokio::fs::create_dir_all(session_dir).await?;
         }
         let mut command = self.sandbox.command(&self.binary, workspace, self.session_dir.as_deref())?;
         command.arg("--mode").arg("rpc").arg("--name").arg(session_name);
-        if no_tools { command.arg("--no-tools"); }
         if let Some(session_dir) = &self.session_dir {
             command.arg("--session-dir").arg(session_dir).arg("--session-id").arg(session_name);
         } else {
@@ -130,6 +145,7 @@ impl PiRuntime {
         let mut lines = BufReader::new(stdout).lines();
         let mut requested_final = false;
         let mut summary = String::new();
+        let mut completed_tools = 0u64;
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -162,6 +178,28 @@ impl PiRuntime {
                 Some("extension_ui_request") => {
                     let _ = child.kill().await;
                     bail!("Pi requested interactive extension UI; worker tasks must be unattended");
+                }
+                Some("tool_execution_end") => {
+                    if let Some((soft, hard)) = review_budgets {
+                        completed_tools += 1;
+                        if let Some(message) = review_steer_message(completed_tools, soft, hard) {
+                            tracing::warn!(
+                                session = session_name,
+                                completed_tools,
+                                soft,
+                                hard,
+                                "review tool budget reached; steering reviewer toward a verdict without interrupting running tools"
+                            );
+                            let request = json!({
+                                "id": format!("review-steer-{completed_tools}"),
+                                "type": "steer",
+                                "message": message,
+                            });
+                            stdin.write_all(request.to_string().as_bytes()).await?;
+                            stdin.write_all(b"\n").await?;
+                            stdin.flush().await?;
+                        }
+                    }
                 }
                 Some("agent_settled") if !requested_final => {
                     requested_final = true;
@@ -330,35 +368,32 @@ impl AgentRuntime for PiRuntime {
     }
 
     async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
-        self.run_rpc(workspace, prompt, session_name, agent_run_timeout(), false).await
+        self.run_rpc(workspace, prompt, session_name, agent_run_timeout(), None).await
     }
 
     async fn run_review(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
-        let evidence_timeout = review_evidence_timeout();
-        match self.run_rpc(workspace, prompt, session_name, evidence_timeout, false).await {
-            Ok(result) => Ok(result),
-            Err(error) if error.to_string().contains("Pi RPC timed out after") => {
-                tracing::warn!(
-                    session = session_name,
-                    seconds = evidence_timeout.as_secs(),
-                    "review evidence phase exhausted; continuing the same session with tools disabled for final verdict"
-                );
-                self.run_rpc(
-                    workspace,
-                    "Return the final review verdict now using the evidence already gathered in this session. Output exactly one JSON object with this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[\"...\"]}.",
-                    session_name,
-                    review_final_timeout(),
-                    true,
-                ).await
-            }
-            Err(error) => Err(error),
-        }
+        self.run_rpc(
+            workspace,
+            prompt,
+            session_name,
+            review_run_timeout(),
+            Some(review_tool_budgets()),
+        ).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewer_convergence_steers_on_completed_tool_budgets_only() {
+        assert!(review_steer_message(11, 12, 20).is_none());
+        assert!(review_steer_message(12, 12, 20).is_some());
+        assert!(review_steer_message(13, 12, 20).is_none());
+        assert!(review_steer_message(20, 12, 20).is_some());
+        assert!(review_steer_message(21, 12, 20).is_none());
+    }
 
     #[test]
     fn parses_real_pi_model_name_and_cost_metadata() {
