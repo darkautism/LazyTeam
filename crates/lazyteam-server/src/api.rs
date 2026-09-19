@@ -25,7 +25,6 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub(crate) const PROTOCOL_VERSION: u32 = 6;
-const MIN_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
 const REVIEW_FAILURE_LIMIT: i64 = 3;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
@@ -668,8 +667,8 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
 }
 
 async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<RegisterWorker>) -> Result<Response, ApiError> {
-    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&input.protocol_version) {
-        return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol {}; supported {}..={}", input.protocol_version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION)));
+    if input.protocol_version != PROTOCOL_VERSION {
+        return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol {}; upgrade to worker protocol {PROTOCOL_VERSION} or enroll as a new worker", input.protocol_version)));
     }
     let id = input.id.unwrap_or_else(Uuid::new_v4);
     let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workers WHERE id=? AND retired_at IS NOT NULL")
@@ -767,9 +766,6 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     validate_user_tags(&tags)?;
     let managed_capabilities = input.managed_capabilities.unwrap_or_else(|| current.managed_capabilities.clone());
     validate_managed_capabilities(&managed_capabilities)?;
-    if managed_capabilities != current.managed_capabilities && current.protocol_version < 5 {
-        return Err((StatusCode::CONFLICT, "update/restart this worker with protocol 5 before changing managed tools".into()));
-    }
     let allowed_projects = input.allowed_projects.unwrap_or_else(|| current.allowed_projects.clone());
     let slots = input.slots.unwrap_or(current.slots).max(1);
     let needs_build = !managed_capabilities.is_subset(&current.installed_capabilities);
@@ -842,9 +838,6 @@ async fn queue_worker_provider_key(
         .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&row)?;
-    if worker.protocol_version < 4 {
-        return Err((StatusCode::CONFLICT, "update/restart this worker with protocol 4 before configuring provider credentials".into()));
-    }
     let candidate = worker.agent_capabilities.providers.iter()
         .find(|candidate| candidate.id == provider)
         .ok_or((StatusCode::BAD_REQUEST, "provider is not reported by this worker's Pi runtime".into()))?;
@@ -886,8 +879,8 @@ async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Ar
         .map(str::parse::<u32>)
         .transpose()
         .map_err(|_| (StatusCode::BAD_REQUEST, "invalid worker protocol version header".into()))?;
-    if protocol_version.is_some_and(|version| !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)) {
-        return Err((StatusCode::BAD_REQUEST, "unsupported worker protocol version".into()));
+    if protocol_version.is_some_and(|version| version != PROTOCOL_VERSION) {
+        return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol version; upgrade to worker protocol {PROTOCOL_VERSION} or enroll as a new worker")));
     }
     let worker_version = headers
         .get("x-lazyteam-worker-version")
@@ -914,9 +907,6 @@ async fn report_capability_build(
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&row)?;
-    if worker.protocol_version < 5 {
-        return Err((StatusCode::CONFLICT, "worker protocol 5 is required for managed tool builds".into()));
-    }
     let log_tail = bounded_capability_log(report.log_tail.as_deref());
     if let Some(error) = report.error.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         let phase = report.phase.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("failed");
