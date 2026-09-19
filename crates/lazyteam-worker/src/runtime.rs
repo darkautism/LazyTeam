@@ -9,12 +9,14 @@ use tokio::time::{Duration, Instant};
 
 use crate::sandbox::AgentSandbox;
 
-const DEFAULT_AGENT_RUN_TIMEOUT_SECS: u64 = 600;
-const DEFAULT_REVIEW_RUN_TIMEOUT_SECS: u64 = 1800;
+const DEFAULT_WATCHDOG_PROBE_INTERVAL_SECS: u64 = 120;
+const DEFAULT_WATCHDOG_PROBE_GRACE_SECS: u64 = 30;
+const DEFAULT_WATCHDOG_MAX_MISSED_PROBES: u32 = 3;
+const DEFAULT_WATCHDOG_MAX_INACTIVE_PROBES: u32 = 3;
 const DEFAULT_REVIEW_SOFT_TOOL_BUDGET: u64 = 12;
 const DEFAULT_REVIEW_HARD_TOOL_BUDGET: u64 = 20;
 
-fn bounded_timeout_from_env(name: &str, default_secs: u64, min_secs: u64, max_secs: u64) -> Duration {
+fn bounded_duration_from_env(name: &str, default_secs: u64, min_secs: u64, max_secs: u64) -> Duration {
     let seconds = std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -23,17 +25,38 @@ fn bounded_timeout_from_env(name: &str, default_secs: u64, min_secs: u64, max_se
     Duration::from_secs(seconds)
 }
 
-fn agent_run_timeout() -> Duration {
-    bounded_timeout_from_env("LAZYTEAM_AGENT_TIMEOUT_SECS", DEFAULT_AGENT_RUN_TIMEOUT_SECS, 60, 3600)
+fn watchdog_probe_interval() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_HARNESS_PROBE_INTERVAL_SECS",
+        DEFAULT_WATCHDOG_PROBE_INTERVAL_SECS,
+        30,
+        600,
+    )
 }
 
-fn review_run_timeout() -> Duration {
-    bounded_timeout_from_env(
-        "LAZYTEAM_REVIEW_TIMEOUT_SECS",
-        DEFAULT_REVIEW_RUN_TIMEOUT_SECS,
-        300,
-        7200,
+fn watchdog_probe_grace() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_HARNESS_PROBE_GRACE_SECS",
+        DEFAULT_WATCHDOG_PROBE_GRACE_SECS,
+        5,
+        120,
     )
+}
+
+fn watchdog_max_missed_probes() -> u32 {
+    std::env::var("LAZYTEAM_HARNESS_MAX_MISSED_PROBES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_WATCHDOG_MAX_MISSED_PROBES)
+        .clamp(2, 10)
+}
+
+fn watchdog_max_inactive_probes() -> u32 {
+    std::env::var("LAZYTEAM_HARNESS_MAX_INACTIVE_PROBES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_WATCHDOG_MAX_INACTIVE_PROBES)
+        .clamp(2, 10)
 }
 
 fn review_tool_budgets() -> (u64, u64) {
@@ -58,6 +81,115 @@ fn review_steer_message(completed_tools: u64, soft: u64, hard: u64) -> Option<&'
     } else {
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunPhase {
+    Starting,
+    ModelStreaming,
+    ModelWaiting,
+    ToolRunning,
+    Compacting,
+    ProviderRetry,
+    Finalizing,
+}
+
+impl RunPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::ModelStreaming => "model_streaming",
+            Self::ModelWaiting => "model_waiting",
+            Self::ToolRunning => "tool_running",
+            Self::Compacting => "compacting",
+            Self::ProviderRetry => "provider_retry",
+            Self::Finalizing => "finalizing",
+        }
+    }
+}
+
+fn observe_pi_activity(event: &Value, phase: &mut RunPhase, active_tool: &mut Option<String>) -> bool {
+    match event.get("type").and_then(Value::as_str) {
+        Some("agent_start") | Some("turn_start") | Some("message_start") | Some("message_update") => {
+            *phase = RunPhase::ModelStreaming;
+            true
+        }
+        Some("message_end") | Some("turn_end") | Some("agent_end") => {
+            *phase = RunPhase::ModelWaiting;
+            true
+        }
+        Some("tool_execution_start") => {
+            *active_tool = event.get("toolName").and_then(Value::as_str).map(str::to_string);
+            *phase = RunPhase::ToolRunning;
+            true
+        }
+        Some("tool_execution_update") => {
+            *phase = RunPhase::ToolRunning;
+            true
+        }
+        Some("tool_execution_end") => {
+            *active_tool = None;
+            *phase = RunPhase::ModelWaiting;
+            true
+        }
+        Some("compaction_start") => {
+            *phase = RunPhase::Compacting;
+            true
+        }
+        Some("compaction_end") => {
+            *phase = RunPhase::ModelWaiting;
+            true
+        }
+        Some("auto_retry_start") | Some("summarization_retry_scheduled") | Some("summarization_retry_attempt_start") => {
+            *phase = RunPhase::ProviderRetry;
+            true
+        }
+        Some("auto_retry_end") | Some("summarization_retry_finished") => {
+            *phase = RunPhase::ModelWaiting;
+            true
+        }
+        Some("agent_settled") => {
+            *phase = RunPhase::Finalizing;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn pi_state_probe_active(event: &Value, phase: RunPhase, active_tool: Option<&str>) -> Option<bool> {
+    if event.get("type").and_then(Value::as_str) != Some("response")
+        || event.get("command").and_then(Value::as_str) != Some("get_state")
+    {
+        return None;
+    }
+    if event.get("success").and_then(Value::as_bool) != Some(true) {
+        return Some(false);
+    }
+    let data = event.get("data")?;
+    let streaming = data.get("isStreaming").and_then(Value::as_bool).unwrap_or(false);
+    let compacting = data.get("isCompacting").and_then(Value::as_bool).unwrap_or(false);
+    let pending = data.get("pendingMessageCount").and_then(Value::as_u64).unwrap_or(0) > 0;
+    Some(
+        streaming
+            || compacting
+            || pending
+            || active_tool.is_some()
+            || matches!(phase, RunPhase::ToolRunning | RunPhase::Compacting | RunPhase::ProviderRetry),
+    )
+}
+
+async fn abort_pi_run(
+    child: &mut tokio::process::Child,
+    stdin: &mut tokio::process::ChildStdin,
+) {
+    let request = json!({"id":"lazyteam-watchdog-abort","type":"abort"});
+    if stdin.write_all(request.to_string().as_bytes()).await.is_ok() {
+        let _ = stdin.write_all(b"\n").await;
+        let _ = stdin.flush().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 #[derive(Debug)]
@@ -107,7 +239,6 @@ impl PiRuntime {
         workspace: &Path,
         prompt: &str,
         session_name: &str,
-        timeout: Duration,
         review_budgets: Option<(u64, u64)>,
     ) -> anyhow::Result<AgentRunResult> {
         if let Some(session_dir) = &self.session_dir {
@@ -146,15 +277,62 @@ impl PiRuntime {
         let mut requested_final = false;
         let mut summary = String::new();
         let mut completed_tools = 0u64;
-        let deadline = Instant::now() + timeout;
+        let probe_interval = watchdog_probe_interval();
+        let probe_grace = watchdog_probe_grace();
+        let max_missed_probes = watchdog_max_missed_probes();
+        let max_inactive_probes = watchdog_max_inactive_probes();
+        let mut phase = RunPhase::Starting;
+        let mut active_tool: Option<String> = None;
+        let mut next_probe_at = Instant::now() + probe_interval;
+        let mut probe_deadline: Option<Instant> = None;
+        let mut missed_probes = 0u32;
+        let mut inactive_probes = 0u32;
+        let mut probe_sequence = 0u64;
 
         loop {
-            let line = match tokio::time::timeout_at(deadline, lines.next_line()).await {
-                Ok(result) => result?,
+            let wait_until = probe_deadline.unwrap_or(next_probe_at);
+            let line = match tokio::time::timeout_at(wait_until, lines.next_line()).await {
+                Ok(result) => {
+                    let result = result?;
+                    let now = Instant::now();
+                    next_probe_at = now + probe_interval;
+                    probe_deadline = None;
+                    missed_probes = 0;
+                    result
+                }
                 Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    bail!("Pi RPC timed out after {} seconds without completing the agent run", timeout.as_secs());
+                    let now = Instant::now();
+                    if probe_deadline.take().is_some() {
+                        missed_probes += 1;
+                        tracing::warn!(
+                            session = session_name,
+                            phase = phase.as_str(),
+                            active_tool = active_tool.as_deref().unwrap_or("none"),
+                            missed_probes,
+                            max_missed_probes,
+                            "Pi harness liveness probe timed out"
+                        );
+                        if missed_probes >= max_missed_probes {
+                            let reason = format!(
+                                "Pi harness unresponsive after {missed_probes} liveness probes; phase={} active_tool={}",
+                                phase.as_str(),
+                                active_tool.as_deref().unwrap_or("none"),
+                            );
+                            abort_pi_run(&mut child, &mut stdin).await;
+                            bail!(reason);
+                        }
+                    }
+
+                    probe_sequence += 1;
+                    let request = json!({
+                        "id": format!("lazyteam-liveness-{probe_sequence}"),
+                        "type": "get_state"
+                    });
+                    stdin.write_all(request.to_string().as_bytes()).await?;
+                    stdin.write_all(b"\n").await?;
+                    stdin.flush().await?;
+                    probe_deadline = Some(now + probe_grace);
+                    continue;
                 }
             };
             let Some(line) = line else { break; };
@@ -165,6 +343,33 @@ impl PiRuntime {
                     continue;
                 }
             };
+
+            if observe_pi_activity(&event, &mut phase, &mut active_tool) {
+                inactive_probes = 0;
+            }
+            if let Some(active) = pi_state_probe_active(&event, phase, active_tool.as_deref()) {
+                if active {
+                    inactive_probes = 0;
+                } else {
+                    inactive_probes += 1;
+                    tracing::warn!(
+                        session = session_name,
+                        phase = phase.as_str(),
+                        inactive_probes,
+                        max_inactive_probes,
+                        "Pi harness responded but reports no active model, tool, compaction, retry, or queued work"
+                    );
+                    if inactive_probes >= max_inactive_probes {
+                        let reason = format!(
+                            "Pi harness stayed inactive for {inactive_probes} consecutive state probes; phase={}",
+                            phase.as_str(),
+                        );
+                        abort_pi_run(&mut child, &mut stdin).await;
+                        bail!(reason);
+                    }
+                }
+            }
+
             match event.get("type").and_then(Value::as_str) {
                 Some("message_update") => {
                     if let Some(delta) = event
@@ -368,7 +573,7 @@ impl AgentRuntime for PiRuntime {
     }
 
     async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
-        self.run_rpc(workspace, prompt, session_name, agent_run_timeout(), None).await
+        self.run_rpc(workspace, prompt, session_name, None).await
     }
 
     async fn run_review(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
@@ -376,7 +581,6 @@ impl AgentRuntime for PiRuntime {
             workspace,
             prompt,
             session_name,
-            review_run_timeout(),
             Some(review_tool_budgets()),
         ).await
     }
@@ -393,6 +597,69 @@ mod tests {
         assert!(review_steer_message(13, 12, 20).is_none());
         assert!(review_steer_message(20, 12, 20).is_some());
         assert!(review_steer_message(21, 12, 20).is_none());
+    }
+
+    #[test]
+    fn harness_activity_tracks_tool_compaction_and_retry_phases() {
+        let mut phase = RunPhase::Starting;
+        let mut tool = None;
+
+        assert!(observe_pi_activity(&json!({"type":"message_update"}), &mut phase, &mut tool));
+        assert_eq!(phase, RunPhase::ModelStreaming);
+
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"bash"}),
+            &mut phase,
+            &mut tool,
+        ));
+        assert_eq!(phase, RunPhase::ToolRunning);
+        assert_eq!(tool.as_deref(), Some("bash"));
+
+        assert!(observe_pi_activity(&json!({"type":"tool_execution_update"}), &mut phase, &mut tool));
+        assert_eq!(phase, RunPhase::ToolRunning);
+
+        assert!(observe_pi_activity(&json!({"type":"tool_execution_end"}), &mut phase, &mut tool));
+        assert_eq!(phase, RunPhase::ModelWaiting);
+        assert!(tool.is_none());
+
+        assert!(observe_pi_activity(&json!({"type":"compaction_start"}), &mut phase, &mut tool));
+        assert_eq!(phase, RunPhase::Compacting);
+        assert!(observe_pi_activity(&json!({"type":"compaction_end"}), &mut phase, &mut tool));
+        assert_eq!(phase, RunPhase::ModelWaiting);
+
+        assert!(observe_pi_activity(&json!({"type":"auto_retry_start"}), &mut phase, &mut tool));
+        assert_eq!(phase, RunPhase::ProviderRetry);
+        assert!(observe_pi_activity(&json!({"type":"auto_retry_end"}), &mut phase, &mut tool));
+        assert_eq!(phase, RunPhase::ModelWaiting);
+    }
+
+    #[test]
+    fn state_probe_keeps_slow_streaming_and_active_tools_alive() {
+        let streaming = json!({
+            "type":"response",
+            "command":"get_state",
+            "success":true,
+            "data":{"isStreaming":true,"isCompacting":false,"pendingMessageCount":0}
+        });
+        assert_eq!(
+            pi_state_probe_active(&streaming, RunPhase::ModelWaiting, None),
+            Some(true),
+        );
+
+        let idle = json!({
+            "type":"response",
+            "command":"get_state",
+            "success":true,
+            "data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0}
+        });
+        assert_eq!(
+            pi_state_probe_active(&idle, RunPhase::ModelWaiting, None),
+            Some(false),
+        );
+        assert_eq!(
+            pi_state_probe_active(&idle, RunPhase::ToolRunning, Some("bash")),
+            Some(true),
+        );
     }
 
     #[test]
