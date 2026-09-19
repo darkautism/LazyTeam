@@ -1,63 +1,31 @@
-name: publish-image
+name: Build and Push Docker Images
 
 on:
-  workflow_run:
-    workflows: ["ci"]
-    types: [completed]
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: publish-image-main
+  group: docker-images-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  gate:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
-    runs-on: ubuntu-24.04
-    outputs:
-      publish: ${{ steps.current.outputs.publish }}
-    steps:
-      - name: Check out validated commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Verify validated commit is still main HEAD
-        id: current
-        env:
-          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          git fetch origin main
-          current_sha="$(git rev-parse origin/main)"
-          if [ "$VALIDATED_SHA" = "$current_sha" ]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping stale validated commit $VALIDATED_SHA; main is $current_sha"
-          fi
-
   server-amd64:
-    needs: gate
-    if: needs.gate.outputs.publish == 'true'
+    name: Server / amd64
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Build and push server amd64
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -65,31 +33,28 @@ jobs:
           push: true
           platforms: linux/amd64
           build-args: |
-            LAZYTEAM_GIT_SHA=${{ github.event.workflow_run.head_sha }}
-          tags: ghcr.io/darkautism/lazyteam:sha-${{ github.event.workflow_run.head_sha }}-amd64
+            LAZYTEAM_GIT_SHA=${{ github.sha }}
+          tags: ghcr.io/darkautism/lazyteam:sha-${{ github.sha }}-amd64
           labels: |
             org.opencontainers.image.source=https://github.com/darkautism/LazyTeam
-            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=lazyteam-server-amd64
           cache-to: type=gha,mode=max,scope=lazyteam-server-amd64
           provenance: false
           sbom: false
 
   server-arm64:
-    needs: gate
-    if: needs.gate.outputs.publish == 'true'
+    name: Server / arm64
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Build and push server arm64
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -97,31 +62,28 @@ jobs:
           push: true
           platforms: linux/arm64
           build-args: |
-            LAZYTEAM_GIT_SHA=${{ github.event.workflow_run.head_sha }}
-          tags: ghcr.io/darkautism/lazyteam:sha-${{ github.event.workflow_run.head_sha }}-arm64
+            LAZYTEAM_GIT_SHA=${{ github.sha }}
+          tags: ghcr.io/darkautism/lazyteam:sha-${{ github.sha }}-arm64
           labels: |
             org.opencontainers.image.source=https://github.com/darkautism/LazyTeam
-            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=lazyteam-server-arm64
           cache-to: type=gha,mode=max,scope=lazyteam-server-arm64
           provenance: false
           sbom: false
 
   worker-amd64:
-    needs: gate
-    if: needs.gate.outputs.publish == 'true'
+    name: Worker / amd64
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Build and push worker amd64
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -129,31 +91,28 @@ jobs:
           push: true
           platforms: linux/amd64
           build-args: |
-            LAZYTEAM_GIT_SHA=${{ github.event.workflow_run.head_sha }}
-          tags: ghcr.io/darkautism/lazyteam-worker:sha-${{ github.event.workflow_run.head_sha }}-amd64
+            LAZYTEAM_GIT_SHA=${{ github.sha }}
+          tags: ghcr.io/darkautism/lazyteam-worker:sha-${{ github.sha }}-amd64
           labels: |
             org.opencontainers.image.source=https://github.com/darkautism/LazyTeam
-            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=lazyteam-worker-amd64
           cache-to: type=gha,mode=max,scope=lazyteam-worker-amd64
           provenance: false
           sbom: false
 
   worker-arm64:
-    needs: gate
-    if: needs.gate.outputs.publish == 'true'
+    name: Worker / arm64
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Build and push worker arm64
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -161,24 +120,19 @@ jobs:
           push: true
           platforms: linux/arm64
           build-args: |
-            LAZYTEAM_GIT_SHA=${{ github.event.workflow_run.head_sha }}
-          tags: ghcr.io/darkautism/lazyteam-worker:sha-${{ github.event.workflow_run.head_sha }}-arm64
+            LAZYTEAM_GIT_SHA=${{ github.sha }}
+          tags: ghcr.io/darkautism/lazyteam-worker:sha-${{ github.sha }}-arm64
           labels: |
             org.opencontainers.image.source=https://github.com/darkautism/LazyTeam
-            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=lazyteam-worker-arm64
           cache-to: type=gha,mode=max,scope=lazyteam-worker-arm64
           provenance: false
           sbom: false
 
   manifest:
-    needs: [gate, server-amd64, server-arm64, worker-amd64, worker-arm64]
-    if: >-
-      needs.gate.outputs.publish == 'true' &&
-      needs.server-amd64.result == 'success' &&
-      needs.server-arm64.result == 'success' &&
-      needs.worker-amd64.result == 'success' &&
-      needs.worker-arm64.result == 'success'
+    name: Publish multi-arch manifests
+    needs: [server-amd64, server-arm64, worker-amd64, worker-arm64]
     runs-on: ubuntu-24.04
     steps:
       - uses: docker/setup-buildx-action@v3
@@ -187,27 +141,27 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Publish multi-arch manifests
+      - name: Create manifests
         env:
-          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+          SHA: ${{ github.sha }}
         run: |
           set -eu
           for package in lazyteam lazyteam-worker
           do
             docker buildx imagetools create \
               -t "ghcr.io/darkautism/$package:latest" \
-              -t "ghcr.io/darkautism/$package:sha-$VALIDATED_SHA" \
-              "ghcr.io/darkautism/$package:sha-$VALIDATED_SHA-amd64" \
-              "ghcr.io/darkautism/$package:sha-$VALIDATED_SHA-arm64"
+              -t "ghcr.io/darkautism/$package:sha-$SHA" \
+              "ghcr.io/darkautism/$package:sha-$SHA-amd64" \
+              "ghcr.io/darkautism/$package:sha-$SHA-arm64"
           done
-      - name: Verify multi-arch manifests
+      - name: Verify manifests
         env:
-          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+          SHA: ${{ github.sha }}
         run: |
           set -eu
           for image in \
-            "ghcr.io/darkautism/lazyteam:sha-$VALIDATED_SHA" \
-            "ghcr.io/darkautism/lazyteam-worker:sha-$VALIDATED_SHA"
+            "ghcr.io/darkautism/lazyteam:sha-$SHA" \
+            "ghcr.io/darkautism/lazyteam-worker:sha-$SHA"
           do
             raw="$(docker buildx imagetools inspect --raw "$image")"
             printf '%s' "$raw" | jq -e '
@@ -218,39 +172,35 @@ jobs:
           done
 
   worker-smoke-amd64:
+    name: Worker smoke / amd64
     needs: manifest
-    if: needs.manifest.result == 'success'
     continue-on-error: true
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Verify published worker sandbox amd64
+      - name: Verify sandbox
         env:
-          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: sh scripts/worker-container-smoke.sh "ghcr.io/darkautism/lazyteam-worker:sha-$VALIDATED_SHA-amd64"
+          SHA: ${{ github.sha }}
+        run: sh scripts/worker-container-smoke.sh "ghcr.io/darkautism/lazyteam-worker:sha-$SHA-amd64"
 
   worker-smoke-arm64:
+    name: Worker smoke / arm64
     needs: manifest
-    if: needs.manifest.result == 'success'
     continue-on-error: true
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Verify published worker sandbox arm64
+      - name: Verify sandbox
         env:
-          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: sh scripts/worker-container-smoke.sh "ghcr.io/darkautism/lazyteam-worker:sha-$VALIDATED_SHA-arm64"
+          SHA: ${{ github.sha }}
+        run: sh scripts/worker-container-smoke.sh "ghcr.io/darkautism/lazyteam-worker:sha-$SHA-arm64"
