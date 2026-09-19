@@ -300,17 +300,20 @@ fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Resul
 }
 
 #[cfg(target_os = "linux")]
-fn deny_setgroups_if_allowed(context: &str) -> anyhow::Result<()> {
+fn prepare_gid_mapping(context: &str) -> anyhow::Result<bool> {
     let path = Path::new("/proc/self/setgroups");
     if !path.exists() {
-        return Ok(());
+        return Ok(true);
     }
     let current = std::fs::read_to_string(path)
         .with_context(|| format!("read setgroups state for {context}"))?;
     match current.trim() {
-        "deny" => Ok(()),
-        "allow" => std::fs::write(path, b"deny\n")
-            .with_context(|| format!("disable setgroups for {context}")),
+        "deny" => Ok(true),
+        "allow" => match std::fs::write(path, b"deny\n") {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("disable setgroups for {context}")),
+        },
         other => bail!("unexpected setgroups state for {context}: {other}"),
     }
 }
@@ -326,11 +329,13 @@ fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
         bail!("unshare agent container user namespace failed: {}", std::io::Error::last_os_error());
     }
-    deny_setgroups_if_allowed("agent container")?;
+    let map_gid = prepare_gid_mapping("agent container")?;
     fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write agent container uid_map")?;
-    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write agent container gid_map")?;
-    if unsafe { libc::setresgid(0, 0, 0) } != 0 {
-        bail!("setresgid inside agent container failed: {}", std::io::Error::last_os_error());
+    if map_gid {
+        fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write agent container gid_map")?;
+        if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+            bail!("setresgid inside agent container failed: {}", std::io::Error::last_os_error());
+        }
     }
     if unsafe { libc::setresuid(0, 0, 0) } != 0 {
         bail!("setresuid inside agent container failed: {}", std::io::Error::last_os_error());
@@ -549,11 +554,13 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
     if created_user_namespace {
         // Map namespace uid/gid 0 to the unprivileged host worker user. This gives enough
         // capability inside the new namespace to construct mounts, but no host-root identity.
-        deny_setgroups_if_allowed("user namespace")?;
+        let map_gid = prepare_gid_mapping("user namespace")?;
         fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write user namespace uid_map")?;
-        fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write user namespace gid_map")?;
-        if unsafe { libc::setresgid(0, 0, 0) } != 0 {
-            bail!("setresgid inside user namespace failed: {}", std::io::Error::last_os_error());
+        if map_gid {
+            fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write user namespace gid_map")?;
+            if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+                bail!("setresgid inside user namespace failed: {}", std::io::Error::last_os_error());
+            }
         }
         if unsafe { libc::setresuid(0, 0, 0) } != 0 {
             bail!("setresuid inside user namespace failed: {}", std::io::Error::last_os_error());
