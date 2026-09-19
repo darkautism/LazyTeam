@@ -11,6 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
+    api::delete_worker,
     create_project, create_task, delete_task, list_projects, list_tasks, list_workers, review, review_evidence, AppState,
     CreateProject, CreateTask,
 };
@@ -72,6 +73,11 @@ pub struct TaskRetryParams {
     pub task_id: String,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkerIdParams {
+    pub worker_id: String,
 }
 
 
@@ -321,6 +327,28 @@ impl LazyTeamMcp {
     async fn workers_list(&self) -> Result<CallToolResult, McpError> {
         let Json(items) = list_workers(State(self.state.clone())).await.map_err(api_to_mcp)?;
         json_result(&items)
+    }
+
+    #[tool(
+        name = "workers_delete",
+        title = "Delete inactive worker",
+        description = "Delete an inactive LazyTeam worker registration only when it has no execution/review history. Active workers and historical audit records are protected.",
+        annotations(
+            title = "Delete inactive worker",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn workers_delete(
+        &self,
+        Parameters(input): Parameters<WorkerIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let worker_id = Uuid::parse_str(&input.worker_id)
+            .map_err(|e| McpError::invalid_params("invalid worker_id", Some(serde_json::json!({"error": e.to_string()}))))?;
+        delete_worker(Path(worker_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        json_result(&serde_json::json!({"worker_id": worker_id, "deleted": true}))
     }
 }
 

@@ -700,7 +700,7 @@ pub(crate) async fn list_workers(State(state): State<Arc<AppState>>) -> ApiResul
     rows.iter().map(worker_from_row).collect::<Result<Vec<_>,_>>().map(Json)
 }
 
-async fn delete_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+pub(crate) async fn delete_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
     let worker_id = id.to_string();
     let row = sqlx::query("SELECT running_slots FROM workers WHERE id=?")
         .bind(&worker_id).fetch_optional(&state.db).await.map_err(db_error)?
