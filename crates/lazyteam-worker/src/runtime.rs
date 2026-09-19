@@ -5,8 +5,20 @@ use async_trait::async_trait;
 use lazyteam_core::{AgentCapabilities, AgentLoginMode, AgentModel, AgentModelCost, AgentProvider};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::time::{Duration, Instant};
 
 use crate::sandbox::AgentSandbox;
+
+const DEFAULT_AGENT_RUN_TIMEOUT_SECS: u64 = 600;
+
+fn agent_run_timeout() -> Duration {
+    let seconds = std::env::var("LAZYTEAM_AGENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AGENT_RUN_TIMEOUT_SECS)
+        .clamp(60, 3600);
+    Duration::from_secs(seconds)
+}
 
 #[derive(Debug)]
 pub struct AgentRunResult {
@@ -194,6 +206,7 @@ impl AgentRuntime for PiRuntime {
         if let Some(provider) = &self.provider { command.arg("--provider").arg(provider); }
         if let Some(model) = &self.model { command.arg("--model").arg(model); }
         command.current_dir(workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
 
         let mut child = command.spawn().with_context(|| format!("spawn {} --mode rpc", self.binary))?;
         let mut stdin = child.stdin.take().context("Pi RPC stdin missing")?;
@@ -215,8 +228,19 @@ impl AgentRuntime for PiRuntime {
         let mut lines = BufReader::new(stdout).lines();
         let mut requested_final = false;
         let mut summary = String::new();
+        let timeout = agent_run_timeout();
+        let deadline = Instant::now() + timeout;
 
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            let line = match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    bail!("Pi RPC timed out after {} seconds without completing the agent run", timeout.as_secs());
+                }
+            };
+            let Some(line) = line else { break; };
             let event: Value = match serde_json::from_str(&line) {
                 Ok(event) => event,
                 Err(_) => {
