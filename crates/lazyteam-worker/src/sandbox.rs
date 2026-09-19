@@ -23,6 +23,8 @@ struct SandboxSpec {
     container_rootfs: Option<PathBuf>,
     container_read_only: Vec<PathBuf>,
     #[serde(default)]
+    nested_read_only: Vec<PathBuf>,
+    #[serde(default)]
     trusted_container_daemon: bool,
 }
 
@@ -212,6 +214,8 @@ impl AgentSandbox {
             }
         }
 
+        let nested_read_only = workspace.join(".git");
+        let nested_read_only = nested_read_only.exists().then_some(nested_read_only).into_iter().collect();
         let spec = SandboxSpec {
             read_only: self.read_only.clone(),
             read_write,
@@ -219,6 +223,7 @@ impl AgentSandbox {
             namespace_root_base: self.namespace_root_base.clone(),
             container_rootfs: self.container_rootfs.clone(),
             container_read_only: self.container_read_only.clone(),
+            nested_read_only,
             trusted_container_daemon: self.trusted_container_daemon,
         };
         let mut command = Command::new(std::env::current_exe().context("resolve lazyteam-worker executable")?);
@@ -236,6 +241,15 @@ impl AgentSandbox {
         command.env("XDG_CONFIG_HOME", self.home_dir.join(".config"));
         command.env("TMPDIR", &self.tmp_dir);
         command.env("GIT_TERMINAL_PROMPT", "0");
+        command.env("GIT_CONFIG_NOSYSTEM", "1");
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+        command.env("GIT_ASKPASS", "/bin/false");
+        command.env("SSH_ASKPASS", "/bin/false");
+        command.env("GIT_SSH_COMMAND", "/bin/false");
+        if let Some(parent) = workspace.parent() {
+            command.env("GIT_CEILING_DIRECTORIES", parent);
+        }
         if let Some(rustup_home) = &self.rustup_home {
             command.env("RUSTUP_HOME", rustup_home);
         }
@@ -438,7 +452,11 @@ fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
 
     // Create every bind target while the image is still writable. This vendor
     // kernel rejects making the root mount read-only after child mounts already exist.
-    for source in spec.container_read_only.iter().chain(spec.read_write.iter()).chain(std::iter::once(&spec.namespace_root_base)) {
+    for source in spec.container_read_only.iter()
+        .chain(spec.read_write.iter())
+        .chain(spec.nested_read_only.iter())
+        .chain(std::iter::once(&spec.namespace_root_base))
+    {
         prepare_container_mountpoint(rootfs, source)?;
     }
 
@@ -463,6 +481,12 @@ fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
     }
     for source in &spec.read_write {
         bind_into_container(rootfs, source, false)?;
+    }
+    // Layer task-local Git metadata read-only over the writable workspace. This lets
+    // agents use status/diff/log/show while preventing commit/reset/rebase from
+    // changing the synthetic repository we prepared for them.
+    for source in &spec.nested_read_only {
+        bind_into_container(rootfs, source, true)?;
     }
     // Helper-only scratch for constructing the inner tmpfs root. It is deliberately
     // not part of spec.read_write, so the final Pi sandbox does not expose it.
@@ -896,17 +920,142 @@ fn apply_policy(_spec: &SandboxSpec) -> anyhow::Result<()> {
     bail!("embedded agent sandbox requires Linux; refusing to run an unsandboxed agent")
 }
 
-pub async fn prepare_agent_workspace(source: &Path, destination: &Path) -> anyhow::Result<()> {
+pub async fn prepare_agent_workspace(source: &Path, destination: &Path, base_ref: Option<&str>) -> anyhow::Result<()> {
     let source = source.to_path_buf();
     let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        if destination.exists() {
-            std::fs::remove_dir_all(&destination)?;
+    let base_ref = base_ref.map(str::to_string);
+    tokio::task::spawn_blocking(move || prepare_agent_workspace_blocking(&source, &destination, base_ref.as_deref())).await??;
+    Ok(())
+}
+
+fn prepare_agent_workspace_blocking(source: &Path, destination: &Path, base_ref: Option<&str>) -> anyhow::Result<()> {
+    if destination.exists() {
+        std::fs::remove_dir_all(destination)?;
+    }
+    std::fs::create_dir_all(destination)?;
+
+    if let Some(base_ref) = base_ref {
+        extract_git_tree(source, destination, base_ref)?;
+    } else {
+        copy_tree(source, destination, true)?;
+    }
+    init_sandbox_git(destination, "lazyteam-base", "LazyTeam base snapshot")?;
+
+    if base_ref.is_some() {
+        clear_worktree_except_git(destination)?;
+        copy_tree(source, destination, true)?;
+        sandbox_git_ok(destination, &["add", "-A"])?;
+        let changed = std::process::Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null", "diff", "--cached", "--quiet"])
+            .current_dir(destination)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()?;
+        sandbox_git_ok(destination, &["checkout", "-b", "lazyteam-task"])?;
+        if !changed.success() {
+            sandbox_git_ok(destination, &["commit", "-m", "LazyTeam task snapshot"])?;
         }
-        std::fs::create_dir_all(&destination)?;
-        copy_tree(&source, &destination, true)
-    })
-    .await??;
+    } else {
+        sandbox_git_ok(destination, &["branch", "-M", "lazyteam-task"])?;
+    }
+    sanitize_sandbox_git(destination)?;
+    Ok(())
+}
+
+fn extract_git_tree(source: &Path, destination: &Path, revision: &str) -> anyhow::Result<()> {
+    let mut archive = std::process::Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null", "archive", "--format=tar", revision])
+        .current_dir(source)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("archive sandbox base {revision}"))?;
+    let stdout = archive.stdout.take().context("capture git archive stdout")?;
+    let output = std::process::Command::new("tar")
+        .args(["-xf", "-", "-C"])
+        .arg(destination)
+        .stdin(stdout)
+        .output()
+        .context("extract sandbox base archive")?;
+    let archive_output = archive.wait_with_output().context("wait for sandbox git archive")?;
+    if !archive_output.status.success() {
+        bail!("git archive {revision} failed: {}", String::from_utf8_lossy(&archive_output.stderr));
+    }
+    if !output.status.success() {
+        bail!("extract sandbox base archive failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
+}
+
+fn init_sandbox_git(destination: &Path, branch: &str, message: &str) -> anyhow::Result<()> {
+    sandbox_git_ok(destination, &["init", "-q"])?;
+    sandbox_git_ok(destination, &["config", "--local", "user.name", "LazyTeam Sandbox"])?;
+    sandbox_git_ok(destination, &["config", "--local", "user.email", "sandbox@lazyteam.local"])?;
+    sandbox_git_ok(destination, &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])?;
+    sandbox_git_ok(destination, &["add", "-A"])?;
+    sandbox_git_ok(destination, &["commit", "-q", "-m", message])?;
+    Ok(())
+}
+
+fn sanitize_sandbox_git(destination: &Path) -> anyhow::Result<()> {
+    let git_dir = destination.join(".git");
+    let hooks = git_dir.join("hooks");
+    if hooks.exists() { std::fs::remove_dir_all(&hooks)?; }
+    std::fs::create_dir_all(&hooks)?;
+    for args in [
+        ["config", "--local", "core.hooksPath", "/dev/null"].as_slice(),
+        ["config", "--local", "credential.helper", ""].as_slice(),
+        ["config", "--local", "core.fsmonitor", "false"].as_slice(),
+        ["config", "--local", "protocol.allow", "never"].as_slice(),
+        ["config", "--local", "protocol.file.allow", "never"].as_slice(),
+    ] {
+        sandbox_git_ok(destination, args)?;
+    }
+    let remotes = sandbox_git_output(destination, &["remote"])?;
+    for remote in remotes.lines().filter(|line| !line.trim().is_empty()) {
+        sandbox_git_ok(destination, &["remote", "remove", remote.trim()])?;
+    }
+    Ok(())
+}
+
+fn sandbox_git_ok(path: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .current_dir(path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    if !output.status.success() {
+        bail!("sandbox git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
+}
+
+fn sandbox_git_output(path: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .current_dir(path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    if !output.status.success() {
+        bail!("sandbox git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+fn clear_worktree_except_git(path: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name() == OsStr::new(".git") { continue; }
+        remove_path(&entry.path())?;
+    }
     Ok(())
 }
 
@@ -942,7 +1091,7 @@ fn copy_tree(source: &Path, destination: &Path, skip_git: bool) -> anyhow::Resul
         if metadata.file_type().is_dir() {
             std::fs::create_dir_all(&dest_path)?;
             std::fs::set_permissions(&dest_path, metadata.permissions())?;
-            copy_tree(&source_path, &dest_path, false)?;
+            copy_tree(&source_path, &dest_path, skip_git)?;
         } else if metadata.file_type().is_file() {
             std::fs::copy(&source_path, &dest_path)?;
             std::fs::set_permissions(&dest_path, metadata.permissions())?;
@@ -1027,21 +1176,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_workspace_mirror_omits_git_and_local_build_artifacts() {
+    async fn agent_workspace_mirror_has_sanitized_git_and_omits_local_build_artifacts() {
         let root = std::env::temp_dir().join(format!("lazyteam-sandbox-test-{}", uuid::Uuid::new_v4()));
         let source = root.join("source");
         let dest = root.join("dest");
-        tokio::fs::create_dir_all(source.join(".git")).await.unwrap();
         tokio::fs::create_dir_all(source.join("target")).await.unwrap();
         tokio::fs::create_dir_all(source.join("src")).await.unwrap();
-        tokio::fs::write(source.join(".git").join("config"), b"secret git metadata").await.unwrap();
         tokio::fs::write(source.join("target").join("artifact"), b"artifact").await.unwrap();
         tokio::fs::write(source.join("src").join("lib.rs"), b"pub fn ok() {}\n").await.unwrap();
 
-        prepare_agent_workspace(&source, &dest).await.unwrap();
+        std::process::Command::new("git").args(["init", "-q"]).current_dir(&source).status().unwrap();
+        std::process::Command::new("git").args(["remote", "add", "origin", "https://user:secret@example.invalid/repo.git"]).current_dir(&source).status().unwrap();
+        std::process::Command::new("git").args(["config", "credential.helper", "store"]).current_dir(&source).status().unwrap();
+        std::process::Command::new("git").args(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "add", "src/lib.rs"]).current_dir(&source).status().unwrap();
+        std::process::Command::new("git").args(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "base"]).current_dir(&source).status().unwrap();
+        let base = String::from_utf8(std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&source).output().unwrap().stdout).unwrap();
+        tokio::fs::write(source.join("src").join("lib.rs"), b"pub fn changed() {}\n").await.unwrap();
+        tokio::fs::write(source.join("new.txt"), b"task change\n").await.unwrap();
+
+        prepare_agent_workspace(&source, &dest, Some(base.trim())).await.unwrap();
         assert!(dest.join("src").join("lib.rs").is_file());
-        assert!(!dest.join(".git").exists());
+        assert!(dest.join(".git").is_dir());
         assert!(!dest.join("target").exists());
+        let changed = sandbox_git_output(&dest, &["diff", "--name-only", "lazyteam-base..HEAD"]).unwrap();
+        assert!(changed.lines().any(|line| line == "src/lib.rs"));
+        assert!(changed.lines().any(|line| line == "new.txt"));
+        assert_eq!(sandbox_git_output(&dest, &["remote"]).unwrap(), "");
+        assert_eq!(sandbox_git_output(&dest, &["config", "--local", "core.hooksPath"]).unwrap(), "/dev/null");
+        assert_eq!(sandbox_git_output(&dest, &["config", "--local", "credential.helper"]).unwrap(), "");
+        assert!(!tokio::fs::read_to_string(dest.join(".git").join("config")).await.unwrap().contains("example.invalid"));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

@@ -12,6 +12,7 @@ shift
 ubuntu_version="${LAZYTEAM_UBUNTU_VERSION:-24.04.3}"
 preseed_archive="${LAZYTEAM_UBUNTU_BASE_ARCHIVE:-}"
 base_id="${LAZYTEAM_UBUNTU_BASE_ID:-$ubuntu_version}"
+rootfs_schema="${LAZYTEAM_AGENT_ROOTFS_SCHEMA:-intuitive-git-v1}"
 root="$state_dir/agent-rootfs"
 cache="$root/cache"
 generations="$root/generations"
@@ -31,13 +32,13 @@ for capability in "$@"; do
 done
 
 mapfile -t capabilities < <(printf '%s\n' "${!requested[@]}" | sed '/^$/d' | sort)
-cap_key="$(printf '%s\n' "$base_id" "$ubuntu_arch" "${capabilities[@]}" | sha256sum | cut -c1-20)"
+cap_key="$(printf '%s\n' "$base_id" "$ubuntu_arch" "$rootfs_schema" "${capabilities[@]}" | sha256sum | cut -c1-20)"
 generation="$generations/$ubuntu_version-$ubuntu_arch-$cap_key"
 rootfs="$generation/rootfs"
 ready="$generation/.ready"
 
 mkdir -p "$cache" "$generations"
-if [[ -f "$ready" && -x "$rootfs/bin/bash" ]]; then
+if [[ -f "$ready" && -x "$rootfs/bin/bash" && -f "$rootfs/.lazyteam-rootfs-schema" && "$(cat "$rootfs/.lazyteam-rootfs-schema")" == "$rootfs_schema" ]]; then
   ln -sfn "$rootfs" "$root/current.new"
   mv -Tf "$root/current.new" "$root/current"
   printf '%s\n' "$rootfs"
@@ -74,8 +75,9 @@ mkdir -p "$staging/rootfs"
 tar --no-same-owner -xzf "$archive" -C "$staging/rootfs"
 
 packages=()
+intuitive_packages=(bash ca-certificates coreutils curl diffutils file findutils gawk git grep gzip jq patch procps python3 ripgrep sed tar unzip)
 if [[ -z "$preseed_archive" ]]; then
-  packages+=(ca-certificates)
+  packages+=("${intuitive_packages[@]}")
 fi
 for capability in "${capabilities[@]}"; do
   case "$capability" in
@@ -92,9 +94,17 @@ for capability in "${capabilities[@]}"; do
     php) packages+=(php-cli php-mbstring php-xml) ;;
   esac
 done
-mapfile -t packages < <(printf '%s\n' "${packages[@]}" | sed '/^$/d' | sort -u)
 
 rootfs_stage="$staging/rootfs"
+if [[ -n "$preseed_archive" ]]; then
+  for required in git python3 rg jq patch diff curl; do
+    if [[ ! -x "$rootfs_stage/usr/bin/$required" && ! -x "$rootfs_stage/bin/$required" ]]; then
+      packages+=("${intuitive_packages[@]}")
+      break
+    fi
+  done
+fi
+mapfile -t packages < <(printf '%s\n' "${packages[@]}" | sed '/^$/d' | sort -u)
 mkdir -p "$rootfs_stage/proc" "$rootfs_stage/dev" "$rootfs_stage/etc" "$rootfs_stage/tmp"
 chmod 1777 "$rootfs_stage/tmp"
 rm -f "$rootfs_stage/etc/resolv.conf" "$rootfs_stage/etc/hosts"
@@ -127,6 +137,7 @@ fi
 
 printf '%s\n' "${capabilities[@]}" > "$rootfs_stage/.lazyteam-capabilities"
 printf '%s\n' "$base_id" > "$rootfs_stage/.lazyteam-ubuntu-version"
+printf '%s\n' "$rootfs_schema" > "$rootfs_stage/.lazyteam-rootfs-schema"
 rm -rf "$generation"
 mv "$staging" "$generation"
 touch "$ready"

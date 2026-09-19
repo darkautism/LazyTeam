@@ -20,7 +20,8 @@ const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
 const WORKER_PROTOCOL_VERSION: u32 = 6;
 const AGENT_ROOTFS_BUILD_SCRIPT: &str = include_str!("../../../scripts/agent-rootfs-build.sh");
-const AGENT_GIT_BOUNDARY: &str = "LazyTeam sandbox boundary: this workspace is a source snapshot and intentionally does not expose .git metadata, Git credentials, or necessarily the git executable. Do not run git commands or spend time looking for Git state. Do not probe for Git, Python, Docker/Podman, Cargo, or other tools merely to discover whether they exist; invoke a tool only when a concrete acceptance criterion requires it. Inspect, edit, and validate files directly. LazyTeam's trusted worker layer will diff, commit, and push your completed file changes after you finish. Work proportionally to task size: for a narrow config/file-only change, inspect only the target file and directly relevant references, use the smallest validation that proves the criterion, and stop once the evidence is sufficient.";
+const AGENT_ROOTFS_SCHEMA: &str = "intuitive-git-v1";
+const AGENT_GIT_BOUNDARY: &str = "LazyTeam sandbox Git: this workspace includes a task-scoped synthetic Git repository for familiar inspection. You may freely use read-oriented commands such as `git status`, `git diff`, `git diff lazyteam-base..HEAD`, `git log`, `git show`, and `git grep`. The synthetic repository contains only task snapshots, has no remotes or credentials, disables hooks and external Git transport, and its `.git` metadata is mounted read-only. Its local commit IDs are sandbox snapshots rather than upstream commit IDs. Edit normal working-tree files; LazyTeam's trusted worker layer ignores sandbox Git metadata and owns the real commit, push, and publication flow.";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -189,7 +190,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut local_installed_capabilities = load_local_installed_capabilities(&args.state_dir).await?;
     let mut agent_rootfs = build_agent_rootfs(&args.state_dir, &local_installed_capabilities).await?;
     let mut agent_sandbox = AgentSandbox::prepare(&args.state_dir, &args.pi_bin, Some(&agent_rootfs)).await?;
-    info!(rootfs = %agent_rootfs.display(), "agent Ubuntu rootfs + inner filesystem/seccomp sandbox ready");
+    info!(rootfs = %agent_rootfs.display(), schema = AGENT_ROOTFS_SCHEMA, "agent Ubuntu rootfs + intuitive tooling + sandboxed Git ready");
     if args.sandbox_diagnose {
         println!("LazyTeam agent sandbox {}", agent_sandbox.diagnostic_summary());
         return Ok(());
@@ -575,6 +576,7 @@ async fn build_agent_rootfs(state_dir: &Path, capabilities: &BTreeSet<String>) -
     let stderr_log = stdout_log.try_clone().context("clone capability build log")?;
 
     let mut command = Command::new("/bin/bash");
+    command.env("LAZYTEAM_AGENT_ROOTFS_SCHEMA", AGENT_ROOTFS_SCHEMA);
     command.arg(&script_path).arg(state_dir);
     for capability in capabilities {
         command.arg(capability);
@@ -685,7 +687,7 @@ async fn reconcile_managed_capabilities(
             session_dir: None,
             sandbox,
         };
-        info!(rootfs = %agent_rootfs.display(), ?local_installed, "agent rootfs rebuild activated");
+        info!(rootfs = %agent_rootfs.display(), schema = AGENT_ROOTFS_SCHEMA, ?local_installed, "agent rootfs rebuild activated");
     }
 
     if runtime_config.installed_capabilities != *local_installed
@@ -798,7 +800,7 @@ async fn execute_review_assignment(
     let outcome = match prepare_review_workspace(&workspace, &assignment, &auth).await {
         Ok(()) => {
             let agent_workspace = sandbox.reviewer_workspace(review_id);
-            prepare_agent_workspace(&workspace, &agent_workspace).await?;
+            prepare_agent_workspace(&workspace, &agent_workspace, assignment.checkout.base_sha.as_deref()).await?;
             let prompt = build_review_prompt(initial_prompt, &assignment)?;
             match runtime.run(&agent_workspace, &prompt, &review_id.to_string()).await {
                 Ok(agent) => {
@@ -859,7 +861,7 @@ fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> a
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     let result = serde_json::to_string_pretty(&assignment.execution.result).context("serialize implementation evidence")?;
     Ok(format!(
-        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nReview efficiently. Start with the supplied changed files/patch and acceptance criteria. If the candidate changes an unrelated file, reverts newer base behavior, or otherwise violates scope, return retry immediately with that evidence; do not broaden into a repository-wide audit after a decisive finding. For a trivial config-only task, inspect only directly relevant files and run only focused validation. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
+        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nThe sandbox branch `lazyteam-task` represents the candidate snapshot and `lazyteam-base` represents the supplied base when available, so `git diff lazyteam-base..HEAD` is the normal way to orient yourself. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
         assignment.checkout.repo_url,
         assignment.checkout.default_branch,
         assignment.checkout.review_ref,
@@ -961,7 +963,7 @@ async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dy
     let workspace = trusted_task_workspace(workspace_root, &assignment.project.slug, assignment.task.id);
     let base_sha = prepare_workspace(&workspace, assignment, git_auth).await?;
     let agent_workspace = sandbox.agent_workspace(assignment.task.id);
-    prepare_agent_workspace(&workspace, &agent_workspace).await?;
+    prepare_agent_workspace(&workspace, &agent_workspace, Some(&base_sha)).await?;
     let prompt = build_prompt(initial_prompt, assignment);
     let session_name = assignment.task.id.to_string();
     let agent = runtime.run(&agent_workspace, &prompt, &session_name).await?;
@@ -999,7 +1001,7 @@ fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
     let feedback = assignment.task.review_feedback.trim();
     if assignment.execution.attempt > 1 && !feedback.is_empty() {
         return format!(
-            "{}\n\n{}\n\nContinue the existing task session and repository workspace. Do not restart from a reconstructed task contract; rely on the conversation and source snapshot you already have. LazyTeam owns Git history outside your sandbox; do not try to inspect, amend, rebase, reset, rewrite, commit, or push it. Apply review corrections only by editing the requested files.\n\nReview feedback from the previous attempt:\n{}\n",
+            "{}\n\n{}\n\nContinue the existing task session and repository workspace. The sandbox Git view has been refreshed from the trusted task workspace; use `git status`, `git diff`, `git log`, or `git show` as useful to understand the current state, then apply the requested correction in normal working-tree files.\n\nReview feedback from the previous attempt:\n{}\n",
             initial_prompt,
             AGENT_GIT_BOUNDARY,
             feedback,
@@ -1099,7 +1101,7 @@ async fn git_status_external_worktree(repo: &Path, worktree: &Path) -> anyhow::R
     let output = trusted_git_command()
         .arg("--git-dir").arg(&git_dir)
         .arg("--work-tree").arg(worktree)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude).git"])
         .output().await?;
     if !output.status.success() {
         bail!("git external worktree status failed: {}", String::from_utf8_lossy(&output.stderr));
@@ -1346,7 +1348,8 @@ mod tests {
                 "started_at": "2026-01-01T00:00:00Z",
                 "finished_at": null,
                 "result": null
-            }
+            },
+            "lease_capability": "test-lease-capability"
         })).unwrap();
 
         auto_commit(&root, &assignment).await.unwrap();

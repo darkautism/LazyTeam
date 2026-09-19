@@ -1,6 +1,9 @@
 FROM ubuntu:24.04 AS agent-base
+ARG LAZYTEAM_AGENT_ROOTFS_SCHEMA=intuitive-git-v1
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates gzip tar \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates coreutils curl diffutils file findutils gawk git grep gzip jq patch procps python3 ripgrep sed tar unzip \
+    && printf '%s\n' "$LAZYTEAM_AGENT_ROOTFS_SCHEMA" > /.lazyteam-rootfs-schema \
     && rm -rf /var/lib/apt/lists/* \
     && tar --numeric-owner --one-file-system \
         --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run --exclude=./tmp \
