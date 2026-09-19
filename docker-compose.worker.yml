@@ -19,6 +19,7 @@ services:
       - CHOWN
       - DAC_OVERRIDE
       - SYS_ADMIN
+      - SYS_CHROOT
       - SETGID
       - SETUID
     security_opt:

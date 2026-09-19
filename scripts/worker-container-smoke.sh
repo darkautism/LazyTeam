@@ -14,6 +14,7 @@ output="$(
     --cap-add CHOWN \
     --cap-add DAC_OVERRIDE \
     --cap-add SYS_ADMIN \
+    --cap-add SYS_CHROOT \
     --cap-add SETGID \
     --cap-add SETUID \
     --security-opt no-new-privileges=true \
