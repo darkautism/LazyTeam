@@ -206,6 +206,7 @@ struct UpdateWorker {
     model: Option<String>,
     clear_model: Option<bool>,
     initial_prompt: Option<String>,
+    paused: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +216,7 @@ struct WorkerRuntimeConfig {
     slots: u32,
     managed_capabilities: BTreeSet<String>,
     installed_capabilities: BTreeSet<String>,
+    paused: bool,
 }
 
 #[derive(Deserialize)]
@@ -729,6 +731,9 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let current = worker_from_row(&row)?;
+    let currently_paused = matches!(current.state, WorkerState::Draining);
+    let paused = input.paused.unwrap_or(currently_paused);
+    let pause_requested = paused && !currently_paused;
     let authority_changed = input.role.as_ref().is_some_and(|value| value != &current.role)
         || input.allowed_projects.as_ref().is_some_and(|value| value != &current.allowed_projects);
     let role = input.role.unwrap_or_else(|| current.role.clone());
@@ -768,9 +773,11 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     let needs_build = !managed_capabilities.is_subset(&current.installed_capabilities);
     let recovering_capability_state = matches!(current.state, WorkerState::Pending)
         || (matches!(current.state, WorkerState::Degraded) && current.capability_error.is_some());
-    let next_state = if needs_build {
+    let next_state = if paused {
+        "draining"
+    } else if needs_build {
         "pending"
-    } else if recovering_capability_state {
+    } else if recovering_capability_state || currently_paused {
         if current.running_slots > 0 { "busy" } else { "idle" }
     } else {
         worker_state_str(&current.state)
@@ -785,7 +792,16 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
         .bind(capability_error).bind(capability_phase).bind(capability_log).bind(next_state).bind(json(&allowed_projects)?).bind(slots as i64)
         .bind(&agent_type).bind(&provider).bind(&model).bind(initial_prompt.trim()).bind(id.to_string())
         .execute(&mut *tx).await.map_err(db_error)?;
-    if authority_changed {
+    if pause_requested {
+        sqlx::query("UPDATE tasks SET state='queued',sticky_worker_id=NULL,updated_at=? WHERE state IN ('assigned','running') AND id IN (SELECT task_id FROM executions WHERE worker_id=? AND state IN ('assigned','running'))")
+            .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("UPDATE executions SET state='lost',finished_at=?,lease_capability_hash=NULL,lease_until=? WHERE worker_id=? AND state IN ('assigned','running')")
+            .bind(&now).bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("UPDATE reviews SET state='lost',finished_at=?,lease_capability_hash=NULL,lease_until=? WHERE reviewer_worker_id=? AND state IN ('assigned','running')")
+            .bind(&now).bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("UPDATE workers SET running_slots=0,state='draining' WHERE id=?")
+            .bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+    } else if authority_changed {
         sqlx::query("UPDATE executions SET lease_capability_hash=NULL,lease_until=? WHERE worker_id=? AND state IN ('assigned','running')")
             .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         sqlx::query("UPDATE reviews SET lease_capability_hash=NULL,lease_until=? WHERE reviewer_worker_id=? AND state IN ('assigned','running')")
@@ -807,6 +823,7 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
         slots: worker.slots.max(1),
         managed_capabilities: worker.managed_capabilities,
         installed_capabilities: worker.installed_capabilities,
+        paused: matches!(worker.state, WorkerState::Draining),
     }))
 }
 
@@ -909,7 +926,9 @@ async fn report_capability_build(
         return Err((StatusCode::CONFLICT, "managed tool builds are monotonic; installed capabilities cannot be removed".into()));
     }
     let ready = worker.managed_capabilities.is_subset(&report.installed_capabilities);
-    let next_state = if ready {
+    let next_state = if matches!(worker.state, WorkerState::Draining) {
+        "draining"
+    } else if ready {
         if worker.running_slots > 0 { "busy" } else { "idle" }
     } else {
         "pending"

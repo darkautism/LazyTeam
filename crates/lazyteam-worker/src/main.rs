@@ -77,6 +77,8 @@ struct WorkerRuntimeConfig {
     managed_capabilities: BTreeSet<String>,
     #[serde(default)]
     installed_capabilities: BTreeSet<String>,
+    #[serde(default)]
+    paused: bool,
 }
 
 fn default_runtime_slots() -> u32 { 1 }
@@ -96,6 +98,17 @@ struct WorkerCleanup {
 
 struct GitAuthContext {
     env: Vec<(String, String)>,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self { Self(handle) }
+    fn abort(&self) { self.0.abort(); }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 impl GitAuthContext {
@@ -350,6 +363,14 @@ async fn async_main() -> anyhow::Result<()> {
         match fetch_runtime_config(&client, &server, &worker_credential, worker_id).await {
             Ok(config) => runtime_config = config,
             Err(error) => warn!(%error, "worker runtime config refresh failed; using last known config"),
+        }
+        if runtime_config.paused {
+            if !active_jobs.is_empty() {
+                info!(active = active_jobs.len(), "worker stopped by control plane; cancelling active slots");
+                active_jobs.abort_all();
+            }
+            sleep(Duration::from_secs(1)).await;
+            continue;
         }
         if let Err(error) = reconcile_managed_capabilities(
             &client, &server, &worker_credential, worker_id, &args.state_dir, &args.pi_bin,
@@ -776,7 +797,7 @@ async fn execute_review_assignment(
     let renew_server = server.to_string();
     let renew_credential = worker_credential.to_string();
     let renew_capability = assignment.lease_capability.clone();
-    let renew = tokio::spawn(async move {
+    let renew = AbortOnDrop::new(tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         loop {
             tick.tick().await;
@@ -790,7 +811,7 @@ async fn execute_review_assignment(
                 Err(error) => warn!(%error, %review_id, "review lease renew failed"),
             }
         }
-    });
+    }));
 
     let workspace = workspace_root
         .join(".reviews")
@@ -932,7 +953,7 @@ async fn execute_assignment(
     let renew_server = server.to_string();
     let renew_credential = worker_credential.to_string();
     let renew_capability = assignment.lease_capability.clone();
-    let renew = tokio::spawn(async move {
+    let renew = AbortOnDrop::new(tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         loop {
             tick.tick().await;
@@ -946,7 +967,7 @@ async fn execute_assignment(
                 Err(error) => warn!(%error, %execution_id, "lease renew failed"),
             }
         }
-    });
+    }));
 
     let auth = GitAuthContext::broker(worker_credential, &assignment.lease_capability);
     let outcome = run_task(workspace_root, sandbox, runtime, initial_prompt, &assignment, &auth).await;
