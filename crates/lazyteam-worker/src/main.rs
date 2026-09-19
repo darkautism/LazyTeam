@@ -802,7 +802,7 @@ async fn execute_review_assignment(
             let agent_workspace = sandbox.reviewer_workspace(review_id);
             prepare_agent_workspace(&workspace, &agent_workspace, assignment.checkout.base_sha.as_deref()).await?;
             let prompt = build_review_prompt(initial_prompt, &assignment)?;
-            match runtime.run(&agent_workspace, &prompt, &review_id.to_string()).await {
+            match runtime.run_review(&agent_workspace, &prompt, &review_id.to_string()).await {
                 Ok(agent) => {
                     let dirty = git_status_external_worktree(&workspace, &agent_workspace)
                         .await

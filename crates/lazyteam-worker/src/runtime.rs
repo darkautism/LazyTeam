@@ -10,14 +10,38 @@ use tokio::time::{Duration, Instant};
 use crate::sandbox::AgentSandbox;
 
 const DEFAULT_AGENT_RUN_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_REVIEW_EVIDENCE_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_REVIEW_FINAL_TIMEOUT_SECS: u64 = 120;
 
-fn agent_run_timeout() -> Duration {
-    let seconds = std::env::var("LAZYTEAM_AGENT_TIMEOUT_SECS")
+fn bounded_timeout_from_env(name: &str, default_secs: u64, min_secs: u64, max_secs: u64) -> Duration {
+    let seconds = std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_AGENT_RUN_TIMEOUT_SECS)
-        .clamp(60, 3600);
+        .unwrap_or(default_secs)
+        .clamp(min_secs, max_secs);
     Duration::from_secs(seconds)
+}
+
+fn agent_run_timeout() -> Duration {
+    bounded_timeout_from_env("LAZYTEAM_AGENT_TIMEOUT_SECS", DEFAULT_AGENT_RUN_TIMEOUT_SECS, 60, 3600)
+}
+
+fn review_evidence_timeout() -> Duration {
+    bounded_timeout_from_env(
+        "LAZYTEAM_REVIEW_EVIDENCE_TIMEOUT_SECS",
+        DEFAULT_REVIEW_EVIDENCE_TIMEOUT_SECS,
+        60,
+        1800,
+    )
+}
+
+fn review_final_timeout() -> Duration {
+    bounded_timeout_from_env(
+        "LAZYTEAM_REVIEW_FINAL_TIMEOUT_SECS",
+        DEFAULT_REVIEW_FINAL_TIMEOUT_SECS,
+        30,
+        600,
+    )
 }
 
 #[derive(Debug)]
@@ -30,6 +54,9 @@ pub trait AgentRuntime: Send + Sync {
     fn kind(&self) -> &'static str;
     async fn capabilities(&self) -> AgentCapabilities;
     async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult>;
+    async fn run_review(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
+        self.run(workspace, prompt, session_name).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +86,116 @@ fn agent_model_from_pi(model: &Value) -> Option<AgentModel> {
 }
 
 impl PiRuntime {
+    async fn run_rpc(
+        &self,
+        workspace: &Path,
+        prompt: &str,
+        session_name: &str,
+        timeout: Duration,
+        no_tools: bool,
+    ) -> anyhow::Result<AgentRunResult> {
+        if let Some(session_dir) = &self.session_dir {
+            tokio::fs::create_dir_all(session_dir).await?;
+        }
+        let mut command = self.sandbox.command(&self.binary, workspace, self.session_dir.as_deref())?;
+        command.arg("--mode").arg("rpc").arg("--name").arg(session_name);
+        if no_tools { command.arg("--no-tools"); }
+        if let Some(session_dir) = &self.session_dir {
+            command.arg("--session-dir").arg(session_dir).arg("--session-id").arg(session_name);
+        } else {
+            command.arg("--no-session");
+        }
+        if let Some(provider) = &self.provider { command.arg("--provider").arg(provider); }
+        if let Some(model) = &self.model { command.arg("--model").arg(model); }
+        command.current_dir(workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
+
+        let mut child = command.spawn().with_context(|| format!("spawn {} --mode rpc", self.binary))?;
+        let mut stdin = child.stdin.take().context("Pi RPC stdin missing")?;
+        let stdout = child.stdout.take().context("Pi RPC stdout missing")?;
+        let stderr = child.stderr.take().context("Pi RPC stderr missing")?;
+
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(target: "pi", "{line}");
+            }
+        });
+
+        let request = json!({"id":"task-prompt","type":"prompt","message":prompt});
+        stdin.write_all(request.to_string().as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+
+        let mut lines = BufReader::new(stdout).lines();
+        let mut requested_final = false;
+        let mut summary = String::new();
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let line = match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    bail!("Pi RPC timed out after {} seconds without completing the agent run", timeout.as_secs());
+                }
+            };
+            let Some(line) = line else { break; };
+            let event: Value = match serde_json::from_str(&line) {
+                Ok(event) => event,
+                Err(_) => {
+                    tracing::debug!(target: "pi", raw = %line, "non-json Pi output");
+                    continue;
+                }
+            };
+            match event.get("type").and_then(Value::as_str) {
+                Some("message_update") => {
+                    if let Some(delta) = event
+                        .get("assistantMessageEvent")
+                        .and_then(|v| v.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        tracing::info!(target: "pi", delta = %delta, "assistant delta");
+                    }
+                }
+                Some("extension_ui_request") => {
+                    let _ = child.kill().await;
+                    bail!("Pi requested interactive extension UI; worker tasks must be unattended");
+                }
+                Some("agent_settled") if !requested_final => {
+                    requested_final = true;
+                    let request = json!({"id":"final-text","type":"get_last_assistant_text"});
+                    stdin.write_all(request.to_string().as_bytes()).await?;
+                    stdin.write_all(b"\n").await?;
+                    stdin.flush().await?;
+                }
+                Some("response") if event.get("id").and_then(Value::as_str) == Some("final-text") => {
+                    if event.get("success").and_then(Value::as_bool) == Some(true) {
+                        summary = event
+                            .get("data")
+                            .and_then(|v| v.get("text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        break;
+                    }
+                    let _ = child.kill().await;
+                    bail!("Pi failed to return final assistant text: {event}");
+                }
+                _ => {}
+            }
+        }
+
+        if !requested_final {
+            let status = child.wait().await?;
+            bail!("Pi RPC exited before agent_settled: {status}");
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        Ok(AgentRunResult { summary })
+    }
+
     fn pi_module_index(&self) -> anyhow::Result<PathBuf> {
         let binary = if Path::new(&self.binary).components().count() > 1 {
             PathBuf::from(&self.binary)
@@ -193,106 +330,29 @@ impl AgentRuntime for PiRuntime {
     }
 
     async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
-        if let Some(session_dir) = &self.session_dir {
-            tokio::fs::create_dir_all(session_dir).await?;
-        }
-        let mut command = self.sandbox.command(&self.binary, workspace, self.session_dir.as_deref())?;
-        command.arg("--mode").arg("rpc").arg("--name").arg(session_name);
-        if let Some(session_dir) = &self.session_dir {
-            command.arg("--session-dir").arg(session_dir).arg("--session-id").arg(session_name);
-        } else {
-            command.arg("--no-session");
-        }
-        if let Some(provider) = &self.provider { command.arg("--provider").arg(provider); }
-        if let Some(model) = &self.model { command.arg("--model").arg(model); }
-        command.current_dir(workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        command.kill_on_drop(true);
+        self.run_rpc(workspace, prompt, session_name, agent_run_timeout(), false).await
+    }
 
-        let mut child = command.spawn().with_context(|| format!("spawn {} --mode rpc", self.binary))?;
-        let mut stdin = child.stdin.take().context("Pi RPC stdin missing")?;
-        let stdout = child.stdout.take().context("Pi RPC stdout missing")?;
-        let stderr = child.stderr.take().context("Pi RPC stderr missing")?;
-
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::warn!(target: "pi", "{line}");
+    async fn run_review(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
+        let evidence_timeout = review_evidence_timeout();
+        match self.run_rpc(workspace, prompt, session_name, evidence_timeout, false).await {
+            Ok(result) => Ok(result),
+            Err(error) if error.to_string().contains("Pi RPC timed out after") => {
+                tracing::warn!(
+                    session = session_name,
+                    seconds = evidence_timeout.as_secs(),
+                    "review evidence phase exhausted; continuing the same session with tools disabled for final verdict"
+                );
+                self.run_rpc(
+                    workspace,
+                    "Return the final review verdict now using the evidence already gathered in this session. Output exactly one JSON object with this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[\"...\"]}.",
+                    session_name,
+                    review_final_timeout(),
+                    true,
+                ).await
             }
-        });
-
-        let request = json!({"id":"task-prompt","type":"prompt","message":prompt});
-        stdin.write_all(request.to_string().as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-
-        let mut lines = BufReader::new(stdout).lines();
-        let mut requested_final = false;
-        let mut summary = String::new();
-        let timeout = agent_run_timeout();
-        let deadline = Instant::now() + timeout;
-
-        loop {
-            let line = match tokio::time::timeout_at(deadline, lines.next_line()).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    bail!("Pi RPC timed out after {} seconds without completing the agent run", timeout.as_secs());
-                }
-            };
-            let Some(line) = line else { break; };
-            let event: Value = match serde_json::from_str(&line) {
-                Ok(event) => event,
-                Err(_) => {
-                    tracing::debug!(target: "pi", raw = %line, "non-json Pi output");
-                    continue;
-                }
-            };
-            match event.get("type").and_then(Value::as_str) {
-                Some("message_update") => {
-                    if let Some(delta) = event
-                        .get("assistantMessageEvent")
-                        .and_then(|v| v.get("delta"))
-                        .and_then(Value::as_str)
-                    {
-                        tracing::info!(target: "pi", delta = %delta, "assistant delta");
-                    }
-                }
-                Some("extension_ui_request") => {
-                    let _ = child.kill().await;
-                    bail!("Pi requested interactive extension UI; worker tasks must be unattended");
-                }
-                Some("agent_settled") if !requested_final => {
-                    requested_final = true;
-                    let request = json!({"id":"final-text","type":"get_last_assistant_text"});
-                    stdin.write_all(request.to_string().as_bytes()).await?;
-                    stdin.write_all(b"\n").await?;
-                    stdin.flush().await?;
-                }
-                Some("response") if event.get("id").and_then(Value::as_str) == Some("final-text") => {
-                    if event.get("success").and_then(Value::as_bool) == Some(true) {
-                        summary = event
-                            .get("data")
-                            .and_then(|v| v.get("text"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        break;
-                    }
-                    let _ = child.kill().await;
-                    bail!("Pi failed to return final assistant text: {event}");
-                }
-                _ => {}
-            }
+            Err(error) => Err(error),
         }
-
-        if !requested_final {
-            let status = child.wait().await?;
-            bail!("Pi RPC exited before agent_settled: {status}");
-        }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        Ok(AgentRunResult { summary })
     }
 }
 
