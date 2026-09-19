@@ -162,6 +162,36 @@ fn shell_quote(path: &Path) -> anyhow::Result<String> {
     Ok(format!("'{}'", raw.replace('\'', "'\"'\"'")))
 }
 
+fn git_repo_url_for_credential(repo_url: &str, credential: &GitCredential) -> anyhow::Result<String> {
+    if !matches!(credential, GitCredential::HttpsBasic { .. }) {
+        return Ok(repo_url.to_string());
+    }
+    if repo_url.starts_with("https://") || repo_url.starts_with("http://") {
+        return Ok(repo_url.to_string());
+    }
+    if let Some(rest) = repo_url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':').context("HTTPS Git auth requires an HTTPS URL or standard git@host:path SSH URL")?;
+        if host.is_empty() || path.trim_matches('/').is_empty() {
+            bail!("HTTPS Git auth cannot rewrite malformed SSH repository URL");
+        }
+        return Ok(format!("https://{host}/{}", path.trim_start_matches('/')));
+    }
+    if let Some(rest) = repo_url.strip_prefix("ssh://") {
+        let (authority, path) = rest.split_once('/').context("HTTPS Git auth cannot rewrite malformed ssh:// repository URL")?;
+        let host_port = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+        let host = match host_port.rsplit_once(':') {
+            Some((host, "22")) => host,
+            Some((_host, _port)) => bail!("HTTPS Git auth cannot safely rewrite an SSH repository URL using a non-default port"),
+            None => host_port,
+        };
+        if host.is_empty() || path.trim_matches('/').is_empty() {
+            bail!("HTTPS Git auth cannot rewrite malformed ssh:// repository URL");
+        }
+        return Ok(format!("https://{host}/{}", path.trim_start_matches('/')));
+    }
+    bail!("HTTPS Git auth requires an HTTPS repository URL or a standard SSH URL that can be rewritten safely")
+}
+
 async fn clear_stale_git_auth(state_dir: &Path) -> anyhow::Result<()> {
     let dir = state_dir.join("git-auth");
     match tokio::fs::remove_dir_all(&dir).await {
@@ -905,10 +935,11 @@ async fn execute_review_assignment(
 async fn prepare_review_workspace(path: &Path, assignment: &ReviewAssignment, git_auth: &GitAuthContext) -> anyhow::Result<()> {
     if path.exists() { tokio::fs::remove_dir_all(path).await?; }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
+    let repo_url = git_repo_url_for_credential(&assignment.checkout.repo_url, &assignment.git_credential)?;
     command_ok_with_auth(
         Path::new("."),
         "git",
-        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &assignment.checkout.repo_url, path.to_str().context("non-utf8 review workspace path")?],
+        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &repo_url, path.to_str().context("non-utf8 review workspace path")?],
         git_auth,
     ).await?;
     let review_ref = format!("refs/heads/{}", assignment.checkout.review_ref);
@@ -1119,10 +1150,11 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
         return git_output(path, &["rev-parse", &format!("refs/heads/{}", assignment.project.default_branch)]).await;
     }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
+    let repo_url = git_repo_url_for_credential(&assignment.project.repo_url, &assignment.git_credential)?;
     command_ok_with_auth(
         Path::new("."),
         "git",
-        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &assignment.project.repo_url, path.to_str().context("non-utf8 workspace path")?],
+        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &repo_url, path.to_str().context("non-utf8 workspace path")?],
         git_auth,
     ).await?;
     let base = git_output(path, &["rev-parse", "HEAD"]).await?;
@@ -1323,6 +1355,16 @@ mod tests {
         let wrapped = parse_review_verdict("Result:\n{\"verdict\":\"retry\",\"reason\":\"missing test\",\"validation\":[]}").unwrap();
         assert_eq!(wrapped.verdict, lazyteam_core::ReviewVerdictKind::Retry);
         assert!(parse_review_verdict(r#"{"verdict":"approve","reason":"","validation":[]}"#).is_err());
+    }
+
+    #[test]
+    fn https_git_auth_rewrites_standard_ssh_repo_urls() {
+        let credential = GitCredential::HttpsBasic { username: "x-access-token".into(), secret: "secret".into() };
+        assert_eq!(git_repo_url_for_credential("git@github.com:darkautism/LazyTeam.git", &credential).unwrap(), "https://github.com/darkautism/LazyTeam.git");
+        assert_eq!(git_repo_url_for_credential("ssh://git@github.com/darkautism/LazyTeam.git", &credential).unwrap(), "https://github.com/darkautism/LazyTeam.git");
+        assert_eq!(git_repo_url_for_credential("https://github.com/darkautism/LazyTeam.git", &credential).unwrap(), "https://github.com/darkautism/LazyTeam.git");
+        assert!(git_repo_url_for_credential("ssh://git@example.com:2222/repo.git", &credential).is_err());
+        assert_eq!(git_repo_url_for_credential("git@github.com:darkautism/LazyTeam.git", &GitCredential::Worker).unwrap(), "git@github.com:darkautism/LazyTeam.git");
     }
 
     #[tokio::test]

@@ -125,7 +125,19 @@ def main():
     expect("Advanced tags" not in ui and "project-worker-tags" not in ui and "project-task-tags" not in ui,
            "JSON Advanced tags UI must be removed")
 
-    # 10. Worker logs are separate from settings, paginated, and polling avoids rebuilding unchanged DOM.
+    # 10. Project Git credential source is explicit; server-managed tokens cannot be silently ignored.
+    expect('id="project-git-auth-mode"' in ui, "project Git auth selector missing")
+    expect('project-git-worker-managed' not in ui,
+           "ambiguous worker-managed Git checkbox must not coexist with server credential fields")
+    expect('<option value="worker">Worker-managed credentials</option>' in ui and
+           '<option value="https_basic">HTTPS username + token/password</option>' in ui,
+           "project Git auth selector must make worker-managed vs HTTPS token mutually exclusive")
+    expect('x-access-token' in ui and "github\\.com[:/]" in ui,
+           "GitHub token mode should supply a usable default username")
+    expect('Git credential was not stored; project remains unusable.' in ui,
+           "project save must fail visibly if a selected server-managed credential was not persisted")
+
+    # 11. Worker logs are separate from settings, paginated, and polling avoids rebuilding unchanged DOM.
     expect('id="worker-log-dialog"' in ui and 'id="worker-log-content"' in ui,
            "worker provisioning log must live in its own dialog")
     expect('worker-capability-log-details' not in ui,
@@ -139,7 +151,7 @@ def main():
     expect('signature===workerLogSignature' in ui and 'workerConfigCatalogSignature' in ui,
            "log/config polling must skip unchanged content to prevent flicker")
 
-    # 11. Fresh-worker provider auth uses Pi-reported capability data and a write-only API-key handoff.
+    # 12. Fresh-worker provider auth uses Pi-reported capability data and a write-only API-key handoff.
     expect('id="worker-provider-api-key"' in ui, "provider API-key input missing")
     expect("caps.providers||[]" in ui, "provider picker must use worker/Pi-reported provider metadata")
     expect("/provider-key" in ui, "provider API key must be sent through the dedicated write-only endpoint")
@@ -147,7 +159,7 @@ def main():
     expect("STATIC_PROVIDERS" not in ui and "STATIC_MODELS" not in ui,
            "UI must not contain mock/static provider or model catalogs")
 
-    # 12. Backend review scheduling/runtime files must be untouched by UI work
+    # 13. Backend review scheduling/runtime files must be untouched by UI work
     #     (guarded by task contract; informational only here).
     print("Management UI regression test passed")
 

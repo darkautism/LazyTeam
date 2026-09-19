@@ -164,10 +164,13 @@ mod tests {
         assert!(INDEX.contains("project-contributor-email"));
         assert!(INDEX.contains("contributor:{name:"));
         assert!(INDEX.contains("ChatGPT / MCP"));
-        assert!(INDEX.contains("project-git-worker-managed"));
+        assert!(!INDEX.contains("project-git-worker-managed"));
         assert!(INDEX.contains("project-git-auth-mode"));
+        assert!(INDEX.contains("<option value=\"worker\">Worker-managed credentials</option>"));
+        assert!(INDEX.contains("<option value=\"https_basic\">HTTPS username + token/password</option>"));
         assert!(INDEX.contains("project-git-secret"));
-        assert!(INDEX.contains("I will configure repository credentials on each worker"));
+        assert!(INDEX.contains("x-access-token"));
+        assert!(INDEX.contains("Git credential was not stored; project remains unusable."));
         assert!(INDEX.contains("merge_pending"));
         assert!(!INDEX.contains(">Approve</button>"));
         assert!(!INDEX.contains(">Retry</button>"));
