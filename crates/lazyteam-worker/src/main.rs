@@ -213,6 +213,11 @@ fn parse_tag(raw: &str) -> Result<(String, String), String> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Container workers enter their daemon user namespace before Tokio creates threads.
+    // The daemon is uid 0 only inside that namespace; uid 0 maps to the configured
+    // unprivileged container identity (normally 10001) outside it.
+    sandbox::maybe_enter_daemon_user_namespace()?;
+
     // The sandbox self-exec path must run before Tokio creates worker threads.  Linux user
     // namespaces reject unshare(CLONE_NEWUSER) from a multithreaded process on some kernels.
     if let Some(result) = sandbox::maybe_handle_entrypoint() {

@@ -147,8 +147,18 @@ if [ "$runtime_uid" -ne 0 ]; then
 
   export HOME="$HOME_DIR"
   umask 027
-  echo "lazyteam-entrypoint: running as $runtime_uid:$runtime_gid (auto source: $source)"
-  exec gosu "$runtime_uid:$runtime_gid" "$@"
+  case "${1:-}" in
+    lazyteam-worker|/usr/local/bin/lazyteam-worker)
+      export LAZYTEAM_DAEMON_USERNS_UID="$runtime_uid"
+      export LAZYTEAM_DAEMON_USERNS_GID="$runtime_gid"
+      echo "lazyteam-entrypoint: entering rootless daemon user namespace for $runtime_uid:$runtime_gid (auto source: $source)"
+      exec "$@"
+      ;;
+    *)
+      echo "lazyteam-entrypoint: running command as $runtime_uid:$runtime_gid (auto source: $source)"
+      exec gosu "$runtime_uid:$runtime_gid" "$@"
+      ;;
+  esac
 fi
 
 export HOME="$HOME_DIR"

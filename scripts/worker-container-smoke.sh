@@ -15,6 +15,7 @@ output="$(
     --cap-drop ALL \
     --cap-add CHOWN \
     --cap-add DAC_OVERRIDE \
+    --cap-add SYS_ADMIN \
     --cap-add SETGID \
     --cap-add SETUID \
     --security-opt no-new-privileges=true \

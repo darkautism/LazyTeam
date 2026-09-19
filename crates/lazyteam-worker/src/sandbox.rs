@@ -259,6 +259,42 @@ impl AgentSandbox {
     }
 }
 
+pub fn maybe_enter_daemon_user_namespace() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs;
+        let Some(uid_raw) = std::env::var_os("LAZYTEAM_DAEMON_USERNS_UID") else { return Ok(()); };
+        let gid_raw = std::env::var_os("LAZYTEAM_DAEMON_USERNS_GID")
+            .context("LAZYTEAM_DAEMON_USERNS_GID is required with LAZYTEAM_DAEMON_USERNS_UID")?;
+        let outer_uid: u32 = uid_raw.to_string_lossy().parse().context("parse daemon user namespace uid")?;
+        let outer_gid: u32 = gid_raw.to_string_lossy().parse().context("parse daemon user namespace gid")?;
+        if unsafe { libc::geteuid() } != 0 {
+            bail!("daemon user namespace bootstrap requires root entrypoint before remapping");
+        }
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            bail!("unshare daemon user namespace failed: {}", std::io::Error::last_os_error());
+        }
+        let map_gid = prepare_gid_mapping("daemon user namespace")?;
+        fs::write("/proc/self/uid_map", format!("0 {outer_uid} 1\n"))
+            .context("write daemon user namespace uid_map")?;
+        if map_gid {
+            fs::write("/proc/self/gid_map", format!("0 {outer_gid} 1\n"))
+                .context("write daemon user namespace gid_map")?;
+            if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+                bail!("setresgid inside daemon user namespace failed: {}", std::io::Error::last_os_error());
+            }
+        }
+        if unsafe { libc::setresuid(0, 0, 0) } != 0 {
+            bail!("setresuid inside daemon user namespace failed: {}", std::io::Error::last_os_error());
+        }
+        unsafe {
+            std::env::remove_var("LAZYTEAM_DAEMON_USERNS_UID");
+            std::env::remove_var("LAZYTEAM_DAEMON_USERNS_GID");
+        }
+    }
+    Ok(())
+}
+
 pub fn maybe_handle_entrypoint() -> Option<anyhow::Result<()>> {
     let mut args = std::env::args_os();
     let _ = args.next();
@@ -283,6 +319,7 @@ fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Resul
         enter_agent_container(&spec)?;
     }
     apply_policy(&spec)?;
+    drop_agent_capabilities()?;
 
     #[cfg(unix)]
     {
@@ -319,26 +356,40 @@ fn prepare_gid_mapping(context: &str) -> anyhow::Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
+fn root_in_outer_user_namespace() -> anyhow::Result<bool> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(false);
+    }
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map").context("read current user namespace uid_map")?;
+    let mut fields = uid_map.lines().next().unwrap_or_default().split_whitespace();
+    let inside = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let outside = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let length = fields.next().and_then(|value| value.parse::<u64>().ok());
+    Ok(matches!((inside, outside, length), (Some(0), Some(host), Some(span)) if host != 0 || span != u32::MAX as u64))
+}
+
+#[cfg(target_os = "linux")]
 fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
     use std::{ffi::CString, fs, os::unix::ffi::OsStrExt, ptr};
 
     let rootfs = spec.container_rootfs.as_ref().context("agent container rootfs is missing")?;
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
-
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-        bail!("unshare agent container user namespace failed: {}", std::io::Error::last_os_error());
-    }
-    let map_gid = prepare_gid_mapping("agent container")?;
-    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write agent container uid_map")?;
-    if map_gid {
-        fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write agent container gid_map")?;
-        if unsafe { libc::setresgid(0, 0, 0) } != 0 {
-            bail!("setresgid inside agent container failed: {}", std::io::Error::last_os_error());
+    if !root_in_outer_user_namespace()? {
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            bail!("unshare agent container user namespace failed: {}", std::io::Error::last_os_error());
         }
-    }
-    if unsafe { libc::setresuid(0, 0, 0) } != 0 {
-        bail!("setresuid inside agent container failed: {}", std::io::Error::last_os_error());
+        let map_gid = prepare_gid_mapping("agent container")?;
+        fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write agent container uid_map")?;
+        if map_gid {
+            fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).context("write agent container gid_map")?;
+            if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+                bail!("setresgid inside agent container failed: {}", std::io::Error::last_os_error());
+            }
+        }
+        if unsafe { libc::setresuid(0, 0, 0) } != 0 {
+            bail!("setresuid inside agent container failed: {}", std::io::Error::last_os_error());
+        }
     }
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         bail!("unshare agent container mount namespace failed: {}", std::io::Error::last_os_error());
@@ -481,6 +532,33 @@ fn bind_into_container(rootfs: &Path, source: &Path, read_only: bool) -> anyhow:
 fn enter_agent_container(_spec: &SandboxSpec) -> anyhow::Result<()> {
     bail!("agent container requires Linux")
 }
+
+#[cfg(target_os = "linux")]
+fn drop_agent_capabilities() -> anyhow::Result<()> {
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapHeader { version: u32, pid: i32 }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapData { effective: u32, permitted: u32, inheritable: u32 }
+
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let mut header = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_mut_ptr()) } != 0 {
+        bail!("drop agent process capabilities failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINVAL) {
+            bail!("clear agent ambient capabilities failed: {error}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_agent_capabilities() -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(target_os = "linux")]
 fn apply_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
