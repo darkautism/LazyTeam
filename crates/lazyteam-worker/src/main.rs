@@ -859,14 +859,11 @@ async fn prepare_review_workspace(path: &Path, assignment: &ReviewAssignment, gi
 
 fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> anyhow::Result<String> {
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
-    let result = serde_json::to_string_pretty(&assignment.execution.result).context("serialize implementation evidence")?;
+    let result = reviewer_evidence_for_prompt(assignment.execution.result.as_ref())?;
     Ok(format!(
-        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nThe sandbox branch `lazyteam-task` represents the candidate snapshot and `lazyteam-base` represents the supplied base when available, so `git diff lazyteam-base..HEAD` is the normal way to orient yourself. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
-        assignment.checkout.repo_url,
+        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned local review snapshot:\nProject: {}\nDefault branch context: {}\nCandidate: `HEAD` / `lazyteam-task`\nBase: `lazyteam-base`\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation report (untrusted):\n{}\n\nUse the local Git snapshot as the review source of truth. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
+        assignment.project.name,
         assignment.checkout.default_branch,
-        assignment.checkout.review_ref,
-        assignment.checkout.commit_sha,
-        assignment.checkout.base_sha.as_deref().unwrap_or("unknown"),
         assignment.implementation_worker.name,
         assignment.implementation_worker.os,
         assignment.implementation_worker.arch,
@@ -876,6 +873,23 @@ fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> a
         criteria,
         result,
     ))
+}
+
+fn reviewer_evidence_for_prompt(result: Option<&ExecutionResult>) -> anyhow::Result<String> {
+    let value = match result {
+        Some(result) => json!({
+            "status": result.status,
+            "summary": result.summary,
+            "workspace_clean": result.workspace_clean,
+            "changed_files": result.changed_files,
+            "validation": result.validation,
+            "warnings": result.warnings,
+            "artifacts": result.artifacts,
+            "patch_truncated": result.patch_truncated,
+        }),
+        None => json!(null),
+    };
+    serde_json::to_string_pretty(&value).context("serialize reviewer implementation report")
 }
 
 fn parse_review_verdict(raw: &str) -> anyhow::Result<ReviewVerdict> {
@@ -1010,11 +1024,10 @@ fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
 
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     format!(
-        "{}\n\n{}\n\nTask contract:\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n",
+        "{}\n\n{}\n\nTask contract:\nProject: {}\nBase branch context: {}\nLocal task branch: `lazyteam-task`\nLocal base snapshot: `lazyteam-base`\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n",
         initial_prompt,
         AGENT_GIT_BOUNDARY,
         assignment.project.name,
-        assignment.project.repo_url,
         assignment.project.default_branch,
         assignment.task.title,
         assignment.task.description,
@@ -1249,6 +1262,31 @@ mod tests {
             resolve_worker_path(startup, Path::new("/var/lib/lazyteam")),
             PathBuf::from("/var/lib/lazyteam")
         );
+    }
+
+    #[test]
+    fn reviewer_prompt_evidence_omits_upstream_git_identity() {
+        let result = ExecutionResult {
+            status: "completed".into(),
+            summary: "done".into(),
+            commit_sha: Some("candidate-secret-sha".into()),
+            base_sha: Some("base-secret-sha".into()),
+            patch: Some("diff containing implementation".into()),
+            patch_truncated: false,
+            workspace_clean: Some(true),
+            review_ref: Some("lazyteam/task-secret-ref".into()),
+            changed_files: vec!["src/lib.rs".into()],
+            validation: vec!["focused check".into()],
+            warnings: vec![],
+            artifacts: vec![],
+        };
+        let evidence = reviewer_evidence_for_prompt(Some(&result)).unwrap();
+        assert!(evidence.contains("src/lib.rs"));
+        assert!(evidence.contains("focused check"));
+        assert!(!evidence.contains("candidate-secret-sha"));
+        assert!(!evidence.contains("base-secret-sha"));
+        assert!(!evidence.contains("task-secret-ref"));
+        assert!(!evidence.contains("diff containing implementation"));
     }
 
     #[test]
