@@ -1,0 +1,10 @@
+# Scoped build-context excludes only.
+# Keep this file narrow: `COPY . .` plus compile-time inputs must stay in
+# context, notably Cargo.toml, crates/ (sources, build.rs, migrations,
+# src/ui.html), scripts/agent-rootfs-build.sh (embedded via include_str! in
+# lazyteam-worker), and deploy/docker-entrypoint.sh (copied into the runtime
+# image). Do not add broad patterns for those paths, *.toml, *.sql,
+# *.html, or *.sh.
+.git
+target
+**/target
