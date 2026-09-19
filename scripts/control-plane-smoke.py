@@ -82,6 +82,8 @@ def main():
     })
     git_probe = post_json(f"/api/projects/{project_a['id']}/git-probe", {})
     expect(git_probe["ok"] is True, f"Host Git probe failed for valid upstream: {git_probe}")
+    expect(git_probe["read_ok"] is True, f"Host Git probe did not verify read access: {git_probe}")
+    expect(git_probe["write_ok"] is True, f"Host Git probe did not verify dry-run write access: {git_probe}")
     expect("refs/heads/main" in git_probe["message"], "Host Git probe did not report the configured default branch")
 
     worker_id = str(uuid.uuid4())

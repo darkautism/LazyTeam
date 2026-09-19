@@ -174,7 +174,9 @@ mod tests {
         assert!(INDEX.contains("x-access-token"));
         assert!(INDEX.contains("Git credential was not stored; project remains unusable."));
         assert!(INDEX.contains("probe-dot"));
-        assert!(INDEX.contains("Git OK"));
+        assert!(INDEX.contains("Git R/W OK"));
+        assert!(INDEX.contains("Git read-only"));
+        assert!(INDEX.contains("credential revision"));
         assert!(INDEX.contains("Git failed"));
         assert!(INDEX.contains("/git-probe"));
         assert!(INDEX.contains("probeProjectGit"));

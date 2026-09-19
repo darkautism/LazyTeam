@@ -45,43 +45,83 @@ fn broker_url(state: &AppState, kind: &str, id: Uuid) -> Result<String, ApiError
     Ok(format!("{base}/git/{kind}/{id}/repo.git"))
 }
 
+pub(crate) struct GitProbeStatus {
+    pub(crate) read_ok: bool,
+    pub(crate) write_ok: bool,
+    pub(crate) message: String,
+}
+
 pub(crate) async fn probe_project(
     state: &AppState,
     project: &Project,
     credential: &GitCredential,
-) -> Result<(), String> {
+) -> Result<GitProbeStatus, String> {
     let upstream_url = upstream_repo_url(&project.repo_url, credential)
         .map_err(|error| error.to_string())?;
     let auth = HostGitAuth::prepare(state, credential)
         .await
         .map_err(|error| error.to_string())?;
     let default_ref = format!("refs/heads/{}", project.default_branch);
-    let mut command = Command::new("git");
+    let probe_root = state.git_root.join("probes");
+    tokio::fs::create_dir_all(&probe_root).await.map_err(|error| format!("create Host Git probe directory: {error}"))?;
+    let probe_repo = probe_root.join(format!("{}.git", Uuid::new_v4()));
+
+    let result = async {
+        let mut init = Command::new("git");
+        init.args(["init", "--bare"]).arg(&probe_repo);
+        probe_git_command(&HostGitAuth::none(), &mut init, "initialize Host Git probe").await?;
+
+        let refspec = format!("{default_ref}:{default_ref}");
+        let mut fetch = Command::new("git");
+        fetch.arg("-C").arg(&probe_repo).args(["fetch", "--no-tags", &upstream_url, &refspec]);
+        if let Err(error) = probe_git_command(&auth, &mut fetch, "read upstream default branch").await {
+            return Ok(GitProbeStatus {
+                read_ok: false,
+                write_ok: false,
+                message: format!("Host cannot read {default_ref}: {error}"),
+            });
+        }
+
+        let mut push = Command::new("git");
+        push.arg("-C").arg(&probe_repo).args(["push", "--dry-run", &upstream_url, &refspec]);
+        if let Err(error) = probe_git_command(&auth, &mut push, "dry-run upstream write").await {
+            return Ok(GitProbeStatus {
+                read_ok: true,
+                write_ok: false,
+                message: format!("Host can read {default_ref}, but upstream rejected dry-run write: {error}"),
+            });
+        }
+
+        Ok(GitProbeStatus {
+            read_ok: true,
+            write_ok: true,
+            message: format!("Host can read and dry-run write {default_ref}"),
+        })
+    }.await;
+
+    let _ = tokio::fs::remove_dir_all(&probe_repo).await;
+    auth.cleanup().await;
+    result
+}
+
+async fn probe_git_command(auth: &HostGitAuth, command: &mut Command, step: &str) -> Result<(), String> {
+    auth.apply(command);
     command
-        .args(["ls-remote", "--exit-code", &upstream_url, &default_ref])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    auth.apply(&mut command);
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0");
-    let result = match tokio::time::timeout(std::time::Duration::from_secs(12), command.output()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(12), command.output()).await {
         Ok(Ok(output)) if output.status.success() => Ok(()),
         Ok(Ok(output)) => {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(if message.is_empty() {
-                format!("upstream default branch {} was not found", project.default_branch)
-            } else {
-                message
-            })
+            Err(if message.is_empty() { format!("{step} failed") } else { message })
         }
-        Ok(Err(error)) => Err(format!("run Host Git probe: {error}")),
-        Err(_) => Err("Host Git probe timed out after 12 seconds".into()),
-    };
-    auth.cleanup().await;
-    result
+        Ok(Err(error)) => Err(format!("{step}: {error}")),
+        Err(_) => Err(format!("{step} timed out after 12 seconds")),
+    }
 }
 
 pub(crate) async fn prepare_task_repo(
@@ -234,7 +274,7 @@ async fn publish_reviewed_task_inner(
 
     if upstream_sha.trim() == base_sha {
         let destination = format!("{candidate_sha}:{default_ref}");
-        git_ok(
+        git_push_ok(
             auth,
             Command::new("git").arg("-C").arg(&task_repo).arg("push").arg(upstream_url).arg(destination),
         ).await?;
@@ -346,7 +386,7 @@ async fn merge_in_host_workspace(
             Command::new("git").arg("-C").arg(&workspace).args(["rev-parse", "HEAD"]),
         ).await?;
         let destination = format!("{}:refs/heads/{}", merged_sha.trim(), evidence.project.default_branch);
-        git_ok(
+        git_push_ok(
             auth,
             Command::new("git").arg("-C").arg(&workspace).arg("push").arg(upstream_url).arg(destination),
         ).await?;
@@ -700,6 +740,16 @@ async fn git_ok(auth: &HostGitAuth, command: &mut Command) -> Result<(), ApiErro
     Ok(())
 }
 
+async fn git_push_ok(auth: &HostGitAuth, command: &mut Command) -> Result<(), ApiError> {
+    match git_ok(auth, command).await {
+        Err((status, message)) if message.contains("403") || message.contains("denied to") => Err((
+            status,
+            format!("{message}. Host credential authenticated but upstream rejected write access; run Project Git Probe and compare the credential revision."),
+        )),
+        other => other,
+    }
+}
+
 async fn git_output(auth: &HostGitAuth, command: &mut Command) -> Result<String, ApiError> {
     let output = git_run(auth, command).await?;
     if !output.status.success() {
@@ -729,4 +779,56 @@ fn shell_quote(path: &Path) -> anyhow::Result<String> {
 
 fn internal(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dry_run_write_probe_does_not_mutate_upstream_ref() {
+        let root = std::env::temp_dir().join(format!("lazyteam-git-probe-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        let upstream = root.join("upstream.git");
+        let probe = root.join("probe.git");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let no_auth = HostGitAuth::none();
+
+        git_ok(&no_auth, Command::new("git").args(["init", "--bare"]).arg(&upstream)).await.unwrap();
+        git_ok(&no_auth, Command::new("git").args(["init"]).arg(&source)).await.unwrap();
+        tokio::fs::write(source.join("README.md"), "probe\n").await.unwrap();
+        git_ok(&no_auth, Command::new("git").arg("-C").arg(&source).args(["add", "README.md"])).await.unwrap();
+        git_ok(
+            &no_auth,
+            Command::new("git")
+                .arg("-C").arg(&source)
+                .args(["-c", "user.name=LazyTeam Probe", "-c", "user.email=probe@lazyteam.local", "commit", "-m", "probe"]),
+        ).await.unwrap();
+        git_ok(&no_auth, Command::new("git").arg("-C").arg(&source).args(["branch", "-M", "main"])).await.unwrap();
+        let upstream_url = upstream.to_string_lossy().to_string();
+        git_ok(
+            &no_auth,
+            Command::new("git").arg("-C").arg(&source).args(["push", &upstream_url, "refs/heads/main:refs/heads/main"]),
+        ).await.unwrap();
+        let before = git_output(
+            &no_auth,
+            Command::new("git").arg("-C").arg(&upstream).args(["rev-parse", "refs/heads/main"]),
+        ).await.unwrap();
+
+        git_ok(&no_auth, Command::new("git").args(["init", "--bare"]).arg(&probe)).await.unwrap();
+        let refspec = "refs/heads/main:refs/heads/main";
+        let mut fetch = Command::new("git");
+        fetch.arg("-C").arg(&probe).args(["fetch", "--no-tags", &upstream_url, refspec]);
+        probe_git_command(&no_auth, &mut fetch, "read test upstream").await.unwrap();
+        let mut push = Command::new("git");
+        push.arg("-C").arg(&probe).args(["push", "--dry-run", &upstream_url, refspec]);
+        probe_git_command(&no_auth, &mut push, "dry-run test upstream write").await.unwrap();
+
+        let after = git_output(
+            &no_auth,
+            Command::new("git").arg("-C").arg(&upstream).args(["rev-parse", "refs/heads/main"]),
+        ).await.unwrap();
+        assert_eq!(before.trim(), after.trim());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
 }
