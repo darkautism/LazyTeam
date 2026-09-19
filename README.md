@@ -232,7 +232,7 @@ LazyTeam separates three responsibilities:
 
 - **Worker** agents claim implementation tasks (`assigned`/`running`), edit code in the task workspace, and publish a stable review ref when the execution finishes.
 - **Reviewer** agents (protocol 6) claim pinned review leases for tasks in `review`, verify the exact candidate commit independently from the Host broker, and return an approve/retry JSON verdict. They never modify source, commit, push, or merge.
-- The **main agent** owns the merge decision, but not an external Git credential. A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`; `tasks_approve` remains only a fallback for a main-agent review. From `merge_pending`, the main agent calls `tasks_merge(task_id)`. The LazyTeam Host revalidates the reviewed base/candidate, pushes the exact candidate upstream using Host-only credentials, then moves the task to `done`.
+- The **main agent** owns the merge decision, but not an external Git credential. Only a reviewer-role worker's approve verdict moves a task `review -> merge_pending`; the main agent cannot approve a task itself. From `merge_pending`, the main agent calls `tasks_merge(task_id)`. The LazyTeam Host revalidates the reviewed base/candidate, pushes the exact candidate upstream using Host-only credentials, then moves the task to `done`.
 
 After a worker is enrolled, open **Workers → Configure** in the private UI. The server becomes the source of truth for the worker name, role, tags, allowed projects, slots, agent selection, provider/model selection, and initial prompt. A running worker fetches this configuration before claiming work, so changes apply to subsequent tasks without re-enrollment. The worker list shows each worker's role (`worker` or `reviewer`) as a pill next to its name.
 
@@ -258,7 +258,7 @@ Reviewer policy belongs to the **reviewer worker**, not the Project. Open **Work
 
 A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, pins implementation back to the worker that produced the reviewed attempt, and injects the feedback into the same persistent task session. The task workspace and Pi session are reused instead of being recreated, improving continuity and provider prompt-cache reuse. For the next review, LazyTeam also gives the previous successful reviewer a **soft affinity** while that reviewer is live, eligible for the project, and has capacity; otherwise another reviewer may claim immediately. Affinity never reuses authority: every review claim receives a new lease capability, and the previous review capability stays revoked.
 
-A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`; `tasks_approve` is only the fallback when the main agent reviews the candidate itself. Neither path releases dependencies or deletes worker state. The main agent then calls `tasks_merge(task_id)`. The Host re-fetches upstream and refuses to publish if the default branch no longer equals the reviewed `base_sha` or if the task ref no longer equals the reviewed candidate SHA. On success the Host pushes that exact candidate, marks the task `done`, unlocks dependencies, and queues cleanup. The worker deletes only its local task workspace/session; the Host owns broker-repository cleanup.
+A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`. No manual approval path exists. Approval does not release dependencies or delete worker state. The main agent then calls `tasks_merge(task_id)`. The Host re-fetches upstream and refuses to publish if the default branch no longer equals the reviewed `base_sha` or if the task ref no longer equals the reviewed candidate SHA. On success the Host pushes that exact candidate, marks the task `done`, unlocks dependencies, and queues cleanup. The worker deletes only its local task workspace/session; the Host owns broker-repository cleanup.
 
 The worker also captures up to 256 KiB of textual patch evidence and marks truncated patches explicitly. Full-context reviewer validation uses the worker-authenticated Host review broker rather than an upstream review branch.
 
@@ -274,7 +274,7 @@ queued -> assigned -> running -> review -> merge_pending -> done
 
 - Completed worker executions enter `review` and publish a stable review ref.
 - Review retry requires feedback and is sticky to the same worker so workspace/session state is reused.
-- A reviewer approve verdict moves `review -> merge_pending` directly (`tasks_approve` is only the main-agent self-review fallback); dependencies remain blocked.
+- A reviewer approve verdict moves `review -> merge_pending` directly; dependencies remain blocked.
 - `tasks_merge` performs Host-side upstream publish of the exact reviewed candidate, moves `merge_pending -> done`, releases dependencies, and queues worker cleanup. It refuses the publish if upstream or the candidate moved after review.
 - Every execution still gets its own UUID/attempt record, but attempts share the task workspace/session until merge.
 
@@ -296,7 +296,6 @@ projects_create
 tasks_list
 tasks_create
 reviews_get
-tasks_approve
 tasks_merge
 tasks_retry
 workers_list

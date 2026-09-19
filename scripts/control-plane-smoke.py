@@ -194,10 +194,11 @@ def main():
     renew = request(f"/api/executions/{execution_id}/renew", method="POST", headers=lease_headers(worker_headers, assignment_capability))
     expect(renew.status == 204, f"lease renew failed: {renew.status}")
 
+    parent_ref = f"lazyteam/task-{parent['id'].replace('-', '')}"
     finish = request(
         f"/api/executions/{execution_id}/finish",
         method="POST",
-        obj={"result": {"status": "completed", "summary": "parent done"}},
+        obj={"result": {"status": "completed", "summary": "parent done", "commit_sha": "parent-candidate", "base_sha": "parent-base", "review_ref": parent_ref}},
         headers=lease_headers(worker_headers, assignment_capability),
     )
     expect(finish.status == 204, f"finish failed: {finish.status}")
@@ -205,8 +206,43 @@ def main():
     blocked_claim = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
     expect(blocked_claim.status == 204, "child ran before parent review approval or foreign project was assigned")
 
-    approved = post_json(f"/api/tasks/{parent['id']}/approve", {}, expected=200)
-    expect(approved["state"] == "merge_pending", "parent approval did not enter merge_pending")
+    removed_approve = request(f"/api/tasks/{parent['id']}/approve", method="POST", obj={})
+    expect(removed_approve.status == 404, f"manual approval bypass still exists: {removed_approve.status}")
+    removed_approve.read()
+
+    dep_reviewer_id = str(uuid.uuid4())
+    dep_reviewer_registration = request("/api/workers/register", method="POST", obj={
+        "id": dep_reviewer_id,
+        "name": "smoke-dep-reviewer",
+        "os": "linux",
+        "arch": "x86_64",
+        "allowed_projects": [project_a["slug"]],
+        "slots": 1,
+        "worker_version": "smoke-dep-reviewer",
+        "protocol_version": 6,
+    })
+    expect(dep_reviewer_registration.status == 200, f"dependency reviewer registration failed: {dep_reviewer_registration.status}")
+    dep_reviewer_headers = {WORKER_CREDENTIAL_HEADER: dep_reviewer_registration.headers.get(WORKER_CREDENTIAL_HEADER)}
+    dep_reviewer_update = request(f"/api/workers/{dep_reviewer_id}", method="PATCH", obj={
+        "role": "reviewer",
+        "initial_prompt": "Dependency reviewer smoke prompt",
+    })
+    expect(dep_reviewer_update.status == 200, f"dependency reviewer role update failed: {dep_reviewer_update.status}")
+    dep_reviewer_update.read()
+
+    parent_review_claim = request(f"/api/workers/{dep_reviewer_id}/review-claim", method="POST", headers=dep_reviewer_headers)
+    expect(parent_review_claim.status == 200, f"reviewer could not claim parent review: {parent_review_claim.status}")
+    parent_review_assignment = read_json(parent_review_claim)
+    expect(parent_review_assignment["task"]["id"] == parent["id"], "reviewer claimed wrong parent task")
+    parent_review_done = request(
+        f"/api/reviews/{parent_review_assignment['review']['id']}/finish",
+        method="POST",
+        obj={"status": "completed", "verdict": {"verdict": "approve", "reason": "parent independently verified", "validation": []}},
+        headers=lease_headers(dep_reviewer_headers, parent_review_assignment["lease_capability"]),
+    )
+    expect(parent_review_done.status == 204, f"parent reviewer finish failed: {parent_review_done.status}")
+    parent_state = next(task for task in read_json(request("/api/tasks")) if task["id"] == parent["id"])
+    expect(parent_state["state"] == "merge_pending", "reviewer approval did not move parent to merge_pending")
 
     still_blocked = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
     expect(still_blocked.status == 204, "child unlocked before the approved parent was actually merged")
@@ -225,15 +261,27 @@ def main():
 
     child_execution = child_assignment["execution"]["id"]
     child_capability = child_assignment["lease_capability"]
+    child_ref = f"lazyteam/task-{child['id'].replace('-', '')}"
     finish_child = request(
         f"/api/executions/{child_execution}/finish",
         method="POST",
-        obj={"result": {"status": "completed", "summary": "child done"}},
+        obj={"result": {"status": "completed", "summary": "child done", "commit_sha": "child-candidate", "base_sha": "child-base", "review_ref": child_ref}},
         headers=lease_headers(worker_headers, child_capability),
     )
     expect(finish_child.status == 204, f"child finish failed: {finish_child.status}")
-    child_approved = post_json(f"/api/tasks/{child['id']}/approve", {}, expected=200)
-    expect(child_approved["state"] == "merge_pending", "child approval did not enter merge_pending")
+    child_review_claim = request(f"/api/workers/{dep_reviewer_id}/review-claim", method="POST", headers=dep_reviewer_headers)
+    expect(child_review_claim.status == 200, f"reviewer could not claim child review: {child_review_claim.status}")
+    child_review_assignment = read_json(child_review_claim)
+    expect(child_review_assignment["task"]["id"] == child["id"], "reviewer claimed wrong child task")
+    child_review_done = request(
+        f"/api/reviews/{child_review_assignment['review']['id']}/finish",
+        method="POST",
+        obj={"status": "completed", "verdict": {"verdict": "approve", "reason": "child independently verified", "validation": []}},
+        headers=lease_headers(dep_reviewer_headers, child_review_assignment["lease_capability"]),
+    )
+    expect(child_review_done.status == 204, f"child reviewer finish failed: {child_review_done.status}")
+    child_state = next(task for task in read_json(request("/api/tasks")) if task["id"] == child["id"])
+    expect(child_state["state"] == "merge_pending", "reviewer approval did not move child to merge_pending")
     post_json(f"/api/tasks/{child['id']}/merged", {"merge_commit_sha": "merge-child"}, expected=200)
     child_cleanup = read_json(request(f"/api/workers/{worker_id}/cleanup", headers=worker_headers))
     expect(any(item["task_id"] == child["id"] for item in child_cleanup), "merged child did not queue cleanup")
@@ -305,7 +353,8 @@ def main():
     expect(review_assignment["implementation_worker"]["id"] == worker_id, "review assignment lost implementation worker identity")
 
     raced_main = request(f"/api/tasks/{review_task['id']}/approve", method="POST", obj={})
-    expect(raced_main.status == 409, "active reviewer should block main approval")
+    expect(raced_main.status == 404, f"manual approval bypass still exists: {raced_main.status}")
+    raced_main.read()
 
     review_id = review_assignment["review"]["id"]
     review_capability = review_assignment["lease_capability"]

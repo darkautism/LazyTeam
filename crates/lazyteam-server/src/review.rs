@@ -31,16 +31,8 @@ struct MergedRequest {
 
 pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/tasks/{id}/approve", post(approve_task_http))
         .route("/api/tasks/{id}/retry", post(retry_task_http))
         .route("/api/tasks/{id}/merged", post(merged_task_http))
-}
-
-async fn approve_task_http(
-    Path(id): Path<Uuid>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<TaskTransition>, ApiError> {
-    approve_task(&state, id).await.map(Json)
 }
 
 async fn retry_task_http(
@@ -67,21 +59,6 @@ async fn merged_task_http(
         serde_json::from_slice(&body).map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid merged JSON: {error}")))?
     };
     merged_task(&state, id, &input.merge_commit_sha).await.map(Json)
-}
-
-pub(crate) async fn approve_task(state: &AppState, id: Uuid) -> Result<TaskTransition, ApiError> {
-    ensure_no_active_reviewer(state, id).await?;
-    let changed = sqlx::query("UPDATE tasks SET state='merge_pending', updated_at=? WHERE id=? AND state='review'")
-        .bind(Utc::now().to_rfc3339())
-        .bind(id.to_string())
-        .execute(&state.db)
-        .await
-        .map_err(internal)?
-        .rows_affected();
-    if changed == 0 {
-        return Err((StatusCode::CONFLICT, "task must be in review before approval".into()));
-    }
-    Ok(TaskTransition { task_id: id, state: "merge_pending".into() })
 }
 
 pub(crate) async fn merged_task(state: &AppState, id: Uuid, merge_commit_sha: &str) -> Result<TaskTransition, ApiError> {
