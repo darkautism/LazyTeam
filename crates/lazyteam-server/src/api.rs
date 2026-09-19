@@ -1421,7 +1421,7 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
 
 fn git_auth_mode_str(mode: &GitAuthMode) -> &'static str {
     match mode {
-        GitAuthMode::Worker => "worker",
+        GitAuthMode::Host => "host",
         GitAuthMode::SshKey => "ssh_key",
         GitAuthMode::HttpsBasic => "https_basic",
     }
@@ -1429,7 +1429,7 @@ fn git_auth_mode_str(mode: &GitAuthMode) -> &'static str {
 
 fn git_auth_mode(value: &str) -> Result<GitAuthMode, ApiError> {
     match value {
-        "worker" => Ok(GitAuthMode::Worker),
+        "host" => Ok(GitAuthMode::Host),
         "ssh_key" => Ok(GitAuthMode::SshKey),
         "https_basic" => Ok(GitAuthMode::HttpsBasic),
         _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid Git auth mode {value}"))),
@@ -1477,11 +1477,11 @@ fn nonempty_secret(value: Option<String>) -> Option<String> {
 
 fn resolve_new_git_auth(state: &AppState, input: ProjectGitAuthInput) -> Result<StoredGitAuth, ApiError> {
     match input.mode {
-        GitAuthMode::Worker => {
+        GitAuthMode::Host => {
             if nonempty_secret(input.secret).is_some() {
-                return Err((StatusCode::BAD_REQUEST, "worker-managed Git auth must not include a server-side secret".into()));
+                return Err((StatusCode::BAD_REQUEST, "host Git auth must not include a server-side secret".into()));
             }
-            Ok(StoredGitAuth { mode: GitAuthMode::Worker, username: None, encrypted_secret: None })
+            Ok(StoredGitAuth { mode: GitAuthMode::Host, username: None, encrypted_secret: None })
         }
         GitAuthMode::SshKey => {
             let secret = nonempty_secret(input.secret).ok_or((
@@ -1520,8 +1520,8 @@ fn resolve_updated_git_auth(
     let current = stored_git_auth_from_row(row)?;
     let Some(input) = input else { return Ok(current); };
     match input.mode {
-        GitAuthMode::Worker => Ok(StoredGitAuth {
-            mode: GitAuthMode::Worker,
+        GitAuthMode::Host => Ok(StoredGitAuth {
+            mode: GitAuthMode::Host,
             username: None,
             encrypted_secret: None,
         }),
@@ -1561,7 +1561,7 @@ fn resolve_updated_git_auth(
 pub(crate) fn git_credential_from_row(state: &AppState, row: &sqlx::sqlite::SqliteRow) -> Result<GitCredential, ApiError> {
     let stored = stored_git_auth_from_row(row)?;
     match stored.mode {
-        GitAuthMode::Worker => Ok(GitCredential::Worker),
+        GitAuthMode::Host => Ok(GitCredential::Host),
         GitAuthMode::SshKey => {
             let encrypted = stored.encrypted_secret.ok_or((
                 StatusCode::CONFLICT,

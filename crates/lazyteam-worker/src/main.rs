@@ -1403,7 +1403,7 @@ mod tests {
                 "required_worker_tags": {},
                 "default_task_tags": {},
                 "reviewer": {"mode": "mcp", "initial_prompt": "review"},
-                "git_auth": {"mode": "worker", "credential_configured": false},
+                "git_auth": {"mode": "host", "credential_configured": false},
                 "enabled": true,
                 "created_at": "2026-01-01T00:00:00Z",
                 "updated_at": "2026-01-01T00:00:00Z"

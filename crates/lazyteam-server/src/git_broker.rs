@@ -634,7 +634,7 @@ impl HostGitAuth {
     async fn prepare(state: &AppState, credential: &GitCredential) -> anyhow::Result<Self> {
         let mut auth = Self::none();
         match credential {
-            GitCredential::Worker => {}
+            GitCredential::Host => {}
             GitCredential::HttpsBasic { username, secret } => {
                 let encoded = STANDARD.encode(format!("{username}:{secret}"));
                 auth.env.extend([
