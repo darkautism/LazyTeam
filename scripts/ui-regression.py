@@ -125,7 +125,21 @@ def main():
     expect("Advanced tags" not in ui and "project-worker-tags" not in ui and "project-task-tags" not in ui,
            "JSON Advanced tags UI must be removed")
 
-    # 10. Fresh-worker provider auth uses Pi-reported capability data and a write-only API-key handoff.
+    # 10. Worker logs are separate from settings, paginated, and polling avoids rebuilding unchanged DOM.
+    expect('id="worker-log-dialog"' in ui and 'id="worker-log-content"' in ui,
+           "worker provisioning log must live in its own dialog")
+    expect('worker-capability-log-details' not in ui,
+           "worker provisioning log must not be embedded in Configure worker")
+    expect('aria-label="Configure worker"' in ui and 'aria-label="Worker log"' in ui,
+           "worker row must expose separate settings/log icon actions")
+    expect('WORKER_LOG_PAGE_LINES=100' in ui and 'changeWorkerLogPage' in ui,
+           "worker log must provide 100-line pagination")
+    expect('workerListSignature' in ui and 'if(html!==workerListSignature)' in ui,
+           "worker list polling must not replace unchanged DOM")
+    expect('signature===workerLogSignature' in ui and 'workerConfigCatalogSignature' in ui,
+           "log/config polling must skip unchanged content to prevent flicker")
+
+    # 11. Fresh-worker provider auth uses Pi-reported capability data and a write-only API-key handoff.
     expect('id="worker-provider-api-key"' in ui, "provider API-key input missing")
     expect("caps.providers||[]" in ui, "provider picker must use worker/Pi-reported provider metadata")
     expect("/provider-key" in ui, "provider API key must be sent through the dedicated write-only endpoint")
@@ -133,7 +147,7 @@ def main():
     expect("STATIC_PROVIDERS" not in ui and "STATIC_MODELS" not in ui,
            "UI must not contain mock/static provider or model catalogs")
 
-    # 11. Backend review scheduling/runtime files must be untouched by UI work
+    # 12. Backend review scheduling/runtime files must be untouched by UI work
     #     (guarded by task contract; informational only here).
     print("Management UI regression test passed")
 

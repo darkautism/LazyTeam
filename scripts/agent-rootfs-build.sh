@@ -95,7 +95,8 @@ done
 mapfile -t packages < <(printf '%s\n' "${packages[@]}" | sed '/^$/d' | sort -u)
 
 rootfs_stage="$staging/rootfs"
-mkdir -p "$rootfs_stage/proc" "$rootfs_stage/dev" "$rootfs_stage/etc"
+mkdir -p "$rootfs_stage/proc" "$rootfs_stage/dev" "$rootfs_stage/etc" "$rootfs_stage/tmp"
+chmod 1777 "$rootfs_stage/tmp"
 rm -f "$rootfs_stage/etc/resolv.conf" "$rootfs_stage/etc/hosts"
 cp -L /etc/resolv.conf "$rootfs_stage/etc/resolv.conf"
 cp -L /etc/hosts "$rootfs_stage/etc/hosts"
