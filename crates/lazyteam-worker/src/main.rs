@@ -20,6 +20,7 @@ const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
 const WORKER_PROTOCOL_VERSION: u32 = 6;
 const AGENT_ROOTFS_BUILD_SCRIPT: &str = include_str!("../../../scripts/agent-rootfs-build.sh");
+const AGENT_GIT_BOUNDARY: &str = "LazyTeam sandbox boundary: this workspace is a source snapshot and intentionally does not expose .git metadata, Git credentials, or necessarily the git executable. Do not run git commands or spend time looking for Git state. Inspect, edit, and validate the files directly. LazyTeam's trusted worker layer will diff, commit, and push your completed file changes after you finish.";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -858,7 +859,7 @@ fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> a
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     let result = serde_json::to_string_pretty(&assignment.execution.result).context("serialize implementation evidence")?;
     Ok(format!(
-        "{initial_prompt}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nReview the checkout at the exact candidate commit. You may inspect files and run validation, but do not edit, commit, push, or merge. Return only the required JSON verdict object.\n",
+        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nReview the checkout at the exact candidate commit. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
         assignment.checkout.repo_url,
         assignment.checkout.default_branch,
         assignment.checkout.review_ref,
@@ -998,16 +999,18 @@ fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
     let feedback = assignment.task.review_feedback.trim();
     if assignment.execution.attempt > 1 && !feedback.is_empty() {
         return format!(
-            "{}\n\nContinue the existing task session and repository workspace. Do not restart from a reconstructed task contract; rely on the conversation and working tree you already have. The task branch may already be published: preserve its existing commit history. Never amend, rebase, reset, rewrite, or force-push previously published task commits; apply review corrections as new commits on top.\n\nReview feedback from the previous attempt:\n{}\n",
+            "{}\n\n{}\n\nContinue the existing task session and repository workspace. Do not restart from a reconstructed task contract; rely on the conversation and source snapshot you already have. LazyTeam owns Git history outside your sandbox; do not try to inspect, amend, rebase, reset, rewrite, commit, or push it. Apply review corrections only by editing the requested files.\n\nReview feedback from the previous attempt:\n{}\n",
             initial_prompt,
+            AGENT_GIT_BOUNDARY,
             feedback,
         );
     }
 
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     format!(
-        "{}\n\nTask contract:\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n",
+        "{}\n\n{}\n\nTask contract:\nProject: {}\nRepository: {}\nBase branch: {}\nTask: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n",
         initial_prompt,
+        AGENT_GIT_BOUNDARY,
         assignment.project.name,
         assignment.project.repo_url,
         assignment.project.default_branch,
