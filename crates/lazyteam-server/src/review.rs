@@ -103,8 +103,16 @@ pub(crate) async fn merged_task(state: &AppState, id: Uuid, merge_commit_sha: &s
         tx.rollback().await.map_err(internal)?;
         return Err((StatusCode::CONFLICT, "task must be merge_pending before it can be marked merged".into()));
     }
+    // Legacy implementation cleanup remains populated during rollout so an older
+    // implementation worker can still clean its task workspace.
     sqlx::query("INSERT INTO task_cleanup(task_id,worker_id,created_at) VALUES(?,?,?) ON CONFLICT(task_id) DO UPDATE SET worker_id=excluded.worker_id,created_at=excluded.created_at")
-        .bind(id.to_string()).bind(worker_id).bind(&now).execute(&mut *tx).await.map_err(internal)?;
+        .bind(id.to_string()).bind(&worker_id).bind(&now).execute(&mut *tx).await.map_err(internal)?;
+    // Logical sessions are retained across implementation/review retries. Release
+    // every worker that ever owned one only after the task is merged.
+    sqlx::query("INSERT OR IGNORE INTO agent_session_cleanup(task_id,worker_id,role,created_at) SELECT ?,worker_id,'implementation',? FROM executions WHERE task_id=?")
+        .bind(id.to_string()).bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(internal)?;
+    sqlx::query("INSERT OR IGNORE INTO agent_session_cleanup(task_id,worker_id,role,created_at) SELECT ?,reviewer_worker_id,'review',? FROM reviews WHERE task_id=?")
+        .bind(id.to_string()).bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(internal)?;
     tx.commit().await.map_err(internal)?;
     Ok(TaskTransition { task_id: id, state: "done".into() })
 }
@@ -122,17 +130,18 @@ pub(crate) async fn retry_task(state: &AppState, id: Uuid, reason: Option<&str>)
     if review_retry && reason.is_none() {
         return Err((StatusCode::BAD_REQUEST, "review retry requires a reason for the next worker attempt".into()));
     }
-    let sticky_worker_id: Option<String> = if review_retry {
-        sqlx::query_scalar("SELECT worker_id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
-            .bind(id.to_string()).fetch_optional(&state.db).await.map_err(internal)?
-    } else { None };
+    // Keep the latest implementation owner for every retry state. The scheduler
+    // may release that ownership later if the worker is gone or the affinity TTL
+    // expires, but a manual retry should not discard a reusable backend session.
+    let sticky_worker_id: Option<String> = sqlx::query_scalar("SELECT worker_id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(internal)?;
     let changed = if let Some(reason) = reason {
         sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
             .bind(reason).bind(sticky_worker_id).bind(Utc::now().to_rfc3339()).bind(id.to_string()).bind(&current)
             .execute(&state.db).await.map_err(internal)?.rows_affected()
     } else {
-        sqlx::query("UPDATE tasks SET state='queued',updated_at=? WHERE id=? AND state=?")
-            .bind(Utc::now().to_rfc3339()).bind(id.to_string()).bind(&current)
+        sqlx::query("UPDATE tasks SET state='queued',sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
+            .bind(sticky_worker_id).bind(Utc::now().to_rfc3339()).bind(id.to_string()).bind(&current)
             .execute(&state.db).await.map_err(internal)?.rows_affected()
     };
     if changed == 0 { return Err((StatusCode::CONFLICT, "task changed while retrying".into())); }

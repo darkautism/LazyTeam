@@ -27,6 +27,7 @@ use uuid::Uuid;
 pub(crate) const PROTOCOL_VERSION: u32 = 6;
 const MIN_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
+const DEFAULT_SESSION_AFFINITY_SECONDS: i64 = 15 * 60;
 const REVIEW_FAILURE_LIMIT: i64 = 3;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 
@@ -147,6 +148,7 @@ pub(crate) struct ReviewEvidence {
 struct WorkerCleanup {
     task_id: Uuid,
     project_slug: String,
+    role: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,7 +378,8 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
         .route("/api/workers/{id}/cleanup", get(worker_cleanup))
-        .route("/api/workers/{id}/cleanup/{task_id}", post(worker_cleanup_ack))
+        .route("/api/workers/{id}/cleanup/{task_id}", post(worker_cleanup_ack_legacy))
+        .route("/api/workers/{id}/cleanup/{task_id}/{role}", post(worker_cleanup_ack))
         .route("/api/workers/{id}/claim", post(claim_task))
         .route("/api/workers/{id}/review-claim", post(claim_review))
         .route("/api/executions/{id}/renew", post(renew_execution))
@@ -598,6 +601,10 @@ pub(crate) async fn delete_task(Path(id): Path<Uuid>, State(state): State<Arc<Ap
         sqlx::query("INSERT INTO task_cleanup(task_id,worker_id,created_at) VALUES(?,?,?) ON CONFLICT(task_id) DO UPDATE SET worker_id=excluded.worker_id,created_at=excluded.created_at")
             .bind(&task_id).bind(worker_id).bind(&now).execute(&mut *tx).await.map_err(db_error)?;
     }
+    sqlx::query("INSERT OR IGNORE INTO agent_session_cleanup(task_id,worker_id,role,created_at) SELECT ?,worker_id,'implementation',? FROM executions WHERE task_id=?")
+        .bind(&task_id).bind(&now).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+    sqlx::query("INSERT OR IGNORE INTO agent_session_cleanup(task_id,worker_id,role,created_at) SELECT ?,reviewer_worker_id,'review',? FROM reviews WHERE task_id=?")
+        .bind(&task_id).bind(&now).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -953,27 +960,46 @@ async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState
 
 async fn worker_cleanup(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Vec<WorkerCleanup>> {
     require_worker(&state.db, id, &headers).await?;
-    let rows = sqlx::query("SELECT c.task_id,p.slug FROM task_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
+    let rows = sqlx::query("SELECT c.task_id,c.role,p.slug FROM agent_session_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
         .bind(id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         items.push(WorkerCleanup {
             task_id: uuid(row.try_get("task_id").map_err(internal)?)?,
             project_slug: row.try_get("slug").map_err(internal)?,
+            role: row.try_get("role").map_err(internal)?,
         });
     }
     Ok(Json(items))
 }
 
-async fn worker_cleanup_ack(Path((id, task_id)): Path<(Uuid, Uuid)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+async fn worker_cleanup_ack_legacy(Path((id, task_id)): Path<(Uuid, Uuid)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
     require_worker(&state.db, id, &headers).await?;
     let execution_id: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
         .bind(task_id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
-    if let Some(execution_id) = execution_id {
-        crate::git_broker::remove_task_repo(&state, uuid(execution_id)?).await?;
-    }
-    let changed = sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
+    if let Some(execution_id) = execution_id { crate::git_broker::remove_task_repo(&state, uuid(execution_id)?).await?; }
+    sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
+        .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
+    let changed = sqlx::query("DELETE FROM agent_session_cleanup WHERE task_id=? AND worker_id=? AND role='implementation'")
         .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
+    if changed == 0 { return Err((StatusCode::NOT_FOUND, "cleanup item not found".into())); }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn worker_cleanup_ack(Path((id, task_id, role)): Path<(Uuid, Uuid, String)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    if !matches!(role.as_str(), "implementation" | "review") {
+        return Err((StatusCode::BAD_REQUEST, "invalid session cleanup role".into()));
+    }
+    if role == "implementation" {
+        let execution_id: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+            .bind(task_id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
+        if let Some(execution_id) = execution_id { crate::git_broker::remove_task_repo(&state, uuid(execution_id)?).await?; }
+        sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
+            .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
+    }
+    let changed = sqlx::query("DELETE FROM agent_session_cleanup WHERE task_id=? AND worker_id=? AND role=?")
+        .bind(task_id.to_string()).bind(id.to_string()).bind(&role).execute(&state.db).await.map_err(db_error)?.rows_affected();
     if changed == 0 { return Err((StatusCode::NOT_FOUND, "cleanup item not found".into())); }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -989,9 +1015,9 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
     if worker.running_slots >= worker.slots || !matches!(worker.state, WorkerState::Idle | WorkerState::Busy) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    let rows = sqlx::query("SELECT * FROM tasks WHERE state='queued' ORDER BY priority DESC, created_at ASC LIMIT 100")
-        .fetch_all(&state.db).await.map_err(db_error)?;
     let worker_id_text = worker.id.to_string();
+    let rows = sqlx::query("SELECT * FROM tasks WHERE state='queued' ORDER BY CASE WHEN sticky_worker_id=? THEN 0 WHEN sticky_worker_id IS NULL THEN 1 ELSE 2 END, priority DESC, created_at ASC LIMIT 100")
+        .bind(&worker_id_text).fetch_all(&state.db).await.map_err(db_error)?;
     for row in rows {
         let sticky_worker_id: Option<String> = row.try_get("sticky_worker_id").map_err(internal)?;
         let task = task_from_row(&row)?;
@@ -1024,8 +1050,8 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
         worker_project.git_auth = GitAuthConfig::default();
 
         let mut tx = state.db.begin().await.map_err(db_error)?;
-        let claimed = sqlx::query("UPDATE tasks SET state='assigned',updated_at=? WHERE id=? AND state='queued'")
-            .bind(ts(now)).bind(task.id.to_string()).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+        let claimed = sqlx::query("UPDATE tasks SET state='assigned',sticky_worker_id=COALESCE(sticky_worker_id,?),updated_at=? WHERE id=? AND state='queued'")
+            .bind(worker.id.to_string()).bind(ts(now)).bind(task.id.to_string()).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
         if claimed == 0 {
             tx.rollback().await.map_err(db_error)?;
             crate::git_broker::remove_task_repo(&state, execution.id).await?;
@@ -1055,8 +1081,8 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
-    let rows = sqlx::query("SELECT * FROM tasks WHERE state='review' ORDER BY priority DESC, updated_at ASC LIMIT 100")
-        .fetch_all(&state.db).await.map_err(db_error)?;
+    let rows = sqlx::query("SELECT * FROM tasks WHERE state='review' ORDER BY CASE WHEN (SELECT reviewer_worker_id FROM reviews r0 WHERE r0.task_id=tasks.id ORDER BY r0.created_at DESC LIMIT 1)=? THEN 0 ELSE 1 END, priority DESC, updated_at ASC LIMIT 100")
+        .bind(worker.id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
     for row in rows {
         let task = task_from_row(&row)?;
         let project_row = sqlx::query("SELECT * FROM projects WHERE id=? AND enabled=1")
@@ -1182,6 +1208,9 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
             );
             sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
                 .bind(feedback).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+        } else {
+            sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
+                .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
         }
     } else {
         let verdict = input.verdict.ok_or((StatusCode::BAD_REQUEST, "completed review requires a verdict".into()))?;
@@ -1320,9 +1349,9 @@ async fn sticky_worker_reservation_active(
     let fresh_after = Utc::now() - chrono::Duration::seconds(45);
     Ok(preferred.role == AgentRole::Worker
         && preferred.protocol_version >= PROTOCOL_VERSION
-        && preferred.running_slots < preferred.slots
         && matches!(preferred.state, WorkerState::Idle | WorkerState::Busy)
         && preferred.last_heartbeat_at >= fresh_after
+        && session_affinity_fresh(task.updated_at)
         && worker_matches_task(&preferred, project, task))
 }
 
@@ -1333,7 +1362,7 @@ async fn review_reserved_for_live_preferred_reviewer(
     claimant_id: Uuid,
 ) -> Result<bool, ApiError> {
     let preferred_id: Option<String> = sqlx::query_scalar(
-        "SELECT reviewer_worker_id FROM reviews WHERE task_id=? AND state='completed' ORDER BY created_at DESC LIMIT 1",
+        "SELECT reviewer_worker_id FROM reviews WHERE task_id=? ORDER BY created_at DESC LIMIT 1",
     )
     .bind(task.id.to_string())
     .fetch_optional(db)
@@ -1351,11 +1380,23 @@ async fn review_reserved_for_live_preferred_reviewer(
     let fresh_after = Utc::now() - chrono::Duration::seconds(45);
     let live = preferred.role == AgentRole::Reviewer
         && preferred.protocol_version >= PROTOCOL_VERSION
-        && preferred.running_slots < preferred.slots
         && matches!(preferred.state, WorkerState::Idle | WorkerState::Busy)
         && preferred.last_heartbeat_at >= fresh_after
+        && session_affinity_fresh(task.updated_at)
         && worker_can_run_project(&preferred, project);
     Ok(live)
+}
+
+fn session_affinity_seconds() -> i64 {
+    std::env::var("LAZYTEAM_SESSION_AFFINITY_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SESSION_AFFINITY_SECONDS)
+        .clamp(60, 24 * 60 * 60)
+}
+
+fn session_affinity_fresh(since: DateTime<Utc>) -> bool {
+    since >= Utc::now() - chrono::Duration::seconds(session_affinity_seconds())
 }
 
 async fn dependencies_satisfied(db: &SqlitePool, task: &Task) -> Result<bool, ApiError> {
@@ -1402,15 +1443,18 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
         tx.commit().await?;
     }
 
-    let expired_reviews = sqlx::query("SELECT id,reviewer_worker_id FROM reviews WHERE state IN ('assigned','running') AND lease_until < ?")
+    let expired_reviews = sqlx::query("SELECT id,task_id,reviewer_worker_id FROM reviews WHERE state IN ('assigned','running') AND lease_until < ?")
         .bind(&now).fetch_all(db).await?;
     for row in expired_reviews {
         let id: String = row.try_get("id")?;
+        let task_id: String = row.try_get("task_id")?;
         let reviewer_worker_id: String = row.try_get("reviewer_worker_id")?;
         let mut tx = db.begin().await?;
         let changed = sqlx::query("UPDATE reviews SET state='lost',finished_at=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running')")
             .bind(&now).bind(&id).execute(&mut *tx).await?.rows_affected();
         if changed > 0 {
+            sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
+                .bind(&now).bind(&task_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
                 .bind(&reviewer_worker_id).execute(&mut *tx).await?;
         }
@@ -1705,5 +1749,10 @@ mod tests {
         assert!(!review_failures_exhausted(REVIEW_FAILURE_LIMIT - 1));
         assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT));
         assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT + 1));
+    }
+
+    #[test]
+    fn default_session_affinity_window_is_fifteen_minutes() {
+        assert_eq!(DEFAULT_SESSION_AFFINITY_SECONDS, 15 * 60);
     }
 }
