@@ -131,9 +131,11 @@ struct TaskBoardItem {
 /// Conservative review-hell signal for Home task cards.
 ///
 /// Only durable history counts: the latest implementation attempt number and
-/// completed reviewer `retry` verdicts. Runtime `failed`/`lost` reviews and
-/// free-form `review_feedback` prose (including Host merge-conflict text) must
-/// never trigger this signal; those belong to the structured-outcome/Insights work.
+/// completed reviewer `retry` verdicts. Runtime `failed`/`lost` review rows
+/// stay in the total round count but must never count as reviewer
+/// disagreement, and free-form `review_feedback` prose (including Host
+/// merge-conflict text) must never trigger this signal; those belong to the
+/// structured-outcome/Insights work.
 fn task_board_looping(attempt: u32, reviewer_retries: i64) -> bool {
     attempt >= 4 || reviewer_retries >= 3
 }
@@ -660,7 +662,7 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
 }
 
 async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
-    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state, COALESCE((SELECT MAX(e2.attempt) FROM executions e2 WHERE e2.task_id=t.id),0) AS board_attempt, (SELECT COUNT(*) FROM reviews r2 WHERE r2.task_id=t.id AND r2.state='completed') AS board_review_rounds, (SELECT COUNT(*) FROM reviews r3 WHERE r3.task_id=t.id AND r3.state='completed' AND (r3.verdict LIKE '%\"verdict\":\"retry\"%' OR r3.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_reviewer_retries FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
+    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state, COALESCE((SELECT MAX(e2.attempt) FROM executions e2 WHERE e2.task_id=t.id),0) AS board_attempt, (SELECT COUNT(*) FROM reviews r2 WHERE r2.task_id=t.id) AS board_review_rounds, (SELECT COUNT(*) FROM reviews r3 WHERE r3.task_id=t.id AND r3.state='completed' AND (r3.verdict LIKE '%\"verdict\":\"retry\"%' OR r3.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_reviewer_retries FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
         .fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(|row| {
         let task = task_from_row(row)?;
@@ -1869,9 +1871,10 @@ mod tests {
                 .bind(&execution_id).bind(&task_id).bind(&worker_id).bind(attempt).bind("completed").bind(&now).bind(&now)
                 .execute(&db).await.unwrap();
             if attempt == 2 {
-                // Two completed review rounds on the latest execution: one
-                // approve and one retry, plus runtime noise that must not
-                // count as reviewer disagreement.
+                // Four review rows on the latest execution: one completed
+                // approve and one completed retry, plus one runtime `failed`
+                // and one `lost` row. The failed/lost rows stay in the total
+                // round count but must not count as reviewer disagreement.
                 for (verdict, state) in [
                     (r#"{"verdict":"approve","reason":"ok","validation":[]}"#, "completed"),
                     (r#"{"verdict":"retry","reason":"fix it","validation":[]}"#, "completed"),
@@ -1899,7 +1902,7 @@ mod tests {
         let board = task_board(State(state)).await.unwrap().0;
         assert_eq!(board.len(), 1);
         assert_eq!(board[0].attempt, 2);
-        assert_eq!(board[0].review_rounds, 2);
+        assert_eq!(board[0].review_rounds, 4);
         assert_eq!(board[0].reviewer_retries, 1);
         assert!(!task_board_looping(board[0].attempt, board[0].reviewer_retries));
     }
