@@ -129,7 +129,7 @@ def main():
     expect('id="project-git-auth-mode"' in ui, "project Git auth selector missing")
     expect('project-git-worker-managed' not in ui,
            "ambiguous worker-managed Git checkbox must not coexist with server credential fields")
-    expect('<option value="worker">Host environment / public repository</option>' in ui and
+    expect('<option value="host">Host environment / public repository</option>' in ui and
            '<option value="https_basic">Host HTTPS username + token/password</option>' in ui,
            "project Git auth selector must make Host environment vs Host HTTPS token mutually exclusive")
     expect('Upstream Git access (Host only)' in ui and 'workers never access upstream directly' in ui,

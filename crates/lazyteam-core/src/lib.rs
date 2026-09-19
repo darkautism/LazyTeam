@@ -113,7 +113,7 @@ impl Default for AgentConfig {
 #[serde(rename_all = "snake_case")]
 pub enum GitAuthMode {
     #[default]
-    Worker,
+    Host,
     SshKey,
     HttpsBasic,
 }
@@ -134,7 +134,7 @@ pub struct GitAuthConfig {
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum GitCredential {
     #[default]
-    Worker,
+    Host,
     SshKey { private_key: String },
     HttpsBasic { username: String, secret: String },
 }
@@ -142,7 +142,7 @@ pub enum GitCredential {
 impl fmt::Debug for GitCredential {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Worker => formatter.write_str("GitCredential::Worker"),
+            Self::Host => formatter.write_str("GitCredential::Host"),
             Self::SshKey { .. } => formatter.write_str("GitCredential::SshKey { private_key: [REDACTED] }"),
             Self::HttpsBasic { username, .. } => formatter
                 .debug_struct("GitCredential::HttpsBasic")

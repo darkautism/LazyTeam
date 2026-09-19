@@ -170,7 +170,7 @@ mod tests {
         assert!(!INDEX.contains("ChatGPT / MCP reviewer prompt"));
         assert!(!INDEX.contains("project-git-worker-managed"));
         assert!(INDEX.contains("project-git-auth-mode"));
-        assert!(INDEX.contains("<option value=\"worker\">Host environment / public repository</option>"));
+        assert!(INDEX.contains("<option value=\"host\">Host environment / public repository</option>"));
         assert!(INDEX.contains("Upstream Git access (Host only)"));
         assert!(INDEX.contains("workers never access upstream directly"));
         assert!(INDEX.contains("<option value=\"https_basic\">Host HTTPS username + token/password</option>"));
