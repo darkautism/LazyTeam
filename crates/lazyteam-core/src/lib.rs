@@ -153,6 +153,8 @@ pub struct GitAuthConfig {
     pub credential_configured: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_revision: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

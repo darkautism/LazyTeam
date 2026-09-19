@@ -162,7 +162,21 @@ Each project chooses how the Host reaches upstream:
 - **Host SSH private key**: store a project-scoped private key in LazyTeam. The Host materializes it only for the upstream Git command and removes the temporary key afterward.
 - **Host HTTPS username + token/password**: store a project-scoped HTTPS credential. The Host applies it only to its upstream fetch/publish command.
 
+#### GitHub fine-grained PAT: least privilege
+
+For normal LazyTeam Host fetch/publish over HTTPS, a GitHub fine-grained personal access token should be restricted to the required repository or repositories and needs only:
+
+- **Repository permissions → Contents: Read and write** — required to fetch and push Git objects/refs.
+- **Metadata: Read-only** — GitHub adds this required permission automatically.
+- **Workflows: Read and write** — add this only if LazyTeam must publish commits that modify files under `.github/workflows/`.
+
+**Administration is not required** for ordinary Git fetch/push. It controls repository settings and does not replace `Contents: Read and write`. Actions, Pull requests, Issues, and other repository permissions are also unnecessary unless a separate LazyTeam feature explicitly uses those APIs. Repository rules or branch protection can still reject a push independently of token permissions.
+
 Stored project secrets are write-only from the Project UI/API and encrypted at rest with AES-256-GCM. On first boot LazyTeam generates a random master key at `LAZYTEAM_GIT_ROOT/credential.key` (normally `/app/data/git/credential.key` in the container) with private permissions and reuses it across restarts. `LAZYTEAM_GIT_CREDENTIAL_KEY` remains only as an optional compatibility override; normal deployments do not need to provide it.
+
+Each stored Host credential also has an opaque `credential_revision`. It is not derived from the secret and does not reveal any token material. The revision changes when a new secret is submitted and remains stable when an edit leaves the secret blank, so operators can verify that a replacement credential reached persistent storage without exposing the credential itself.
+
+The Project **Git Probe** validates both directions. It fetches the configured default branch into a temporary Host bare repository, then runs a `git push --dry-run` of the same ref back to upstream. The dry run exercises upstream receive/write authorization without changing any upstream ref. The UI distinguishes **Git R/W OK**, **Git read-only**, and **Git failed**, and reports the credential revision used for the probe.
 
 For execution, the Host maintains a project mirror and creates a bare repository scoped to the execution. Assignments contain a Host URL such as `https://lazyteam.example.com/git/task/<execution-id>/repo.git`, never the upstream URL plus credentials. Every implementation or review claim also mints a fresh opaque **lease capability**. Broker access and lease renew/finish calls require both the worker identity credential and that exact lease capability, so two slots on the same worker cannot authorize each other's execution/review. Only a hash of the lease capability is stored by the Host. The capability is revoked immediately when the execution/review finishes or is marked lost, and an expired lease cannot be renewed. Workers may push only the stable task ref allowed by the Host pre-receive hook; reviewer broker endpoints are read-only. After approval, `tasks_merge` makes the Host re-fetch upstream, verifies that the reviewed base and candidate have not moved, and publishes the exact reviewed candidate upstream with the Host-only project credential.
 
@@ -232,7 +246,7 @@ LazyTeam separates three responsibilities:
 
 - **Worker** agents claim implementation tasks (`assigned`/`running`), edit code in the task workspace, and publish a stable review ref when the execution finishes.
 - **Reviewer** agents (protocol 6) claim pinned review leases for tasks in `review`, verify the exact candidate commit independently from the Host broker, and return an approve/retry JSON verdict. They never modify source, commit, push, or merge.
-- The **main agent** owns the merge decision, but not an external Git credential. A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`; `tasks_approve` remains only a fallback for a main-agent review. From `merge_pending`, the main agent calls `tasks_merge(task_id)`. The LazyTeam Host revalidates the reviewed base/candidate, pushes the exact candidate upstream using Host-only credentials, then moves the task to `done`.
+- The **main agent** owns the merge decision, but not an external Git credential. Only a reviewer-role worker's approve verdict moves a task `review -> merge_pending`; the main agent cannot approve a task itself. From `merge_pending`, the main agent calls `tasks_merge(task_id)`. The LazyTeam Host revalidates the reviewed base/candidate, pushes the exact candidate upstream using Host-only credentials, then moves the task to `done`.
 
 After a worker is enrolled, open **Workers → Configure** in the private UI. The server becomes the source of truth for the worker name, role, tags, allowed projects, slots, agent selection, provider/model selection, and initial prompt. A running worker fetches this configuration before claiming work, so changes apply to subsequent tasks without re-enrollment. The worker list shows each worker's role (`worker` or `reviewer`) as a pill next to its name.
 
@@ -248,7 +262,7 @@ The default worker initial prompt is deliberately agent-independent:
 You are an autonomous LazyTeam coding worker. Execute only the assigned task in the provided repository workspace. Treat the task description and acceptance criteria as the contract. Inspect before editing, make the smallest correct change, preserve unrelated behavior, and follow repository instructions. Run relevant validation and never wait for interactive input. Do not broaden scope. If blocked, stop and report the concrete blocker. Do not expose secrets or modify external systems unless the task explicitly requires it. Finish with a concise summary of what changed, validation performed, and any remaining risks.
 ```
 
-A task keeps one stable worker workspace and one stable agent session across review retries. Pi sessions are keyed by task ID, and review retries are pinned to the same worker so the existing conversation/cache and repository state can be reused. The worker publishes a stable `lazyteam/task-<task-id>` review branch after every successful attempt. The workspace and agent session are retained through review and merge; they are deleted only after LazyTeam receives an explicit merged signal.
+Each task has backend-neutral logical agent sessions keyed by `(task_id, role)`: one implementation session and one review session. The worker maps that logical session to the backend-specific handle (Pi today; other backends can supply their own session IDs later). A retained session does not consume a running slot: workers may fill the rest of their slots with new tasks/sessions. If implementation or review work returns, LazyTeam reserves it for the live owner and gives it first claim priority when that worker has a free slot. Ownership is not transferred merely because the worker is currently full. The default affinity window is 15 minutes (`LAZYTEAM_SESSION_AFFINITY_SECS` can override it); dead/paused/retired/ineligible workers release affinity immediately. Backend session data is retained until the task is merged or explicitly abandoned, then the Host queues cleanup to every implementation/reviewer worker that owned a session.
 
 ### Reviewer configuration
 
@@ -256,9 +270,9 @@ Reviewer policy belongs to the **reviewer worker**, not the Project. Open **Work
 
 `reviews_get(task_id)` exposes pinned execution metadata and evidence for the main agent: implementation worker, candidate SHA, base SHA, stable review ref, patch/summary, and Host repository metadata. The actual reviewer worker gets a worker-authenticated read-only Host broker checkout and performs its independent inspection there; no upstream credential is involved.
 
-A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, pins implementation back to the worker that produced the reviewed attempt, and injects the feedback into the same persistent task session. The task workspace and Pi session are reused instead of being recreated, improving continuity and provider prompt-cache reuse. For the next review, LazyTeam also gives the previous successful reviewer a **soft affinity** while that reviewer is live, eligible for the project, and has capacity; otherwise another reviewer may claim immediately. Affinity never reuses authority: every review claim receives a new lease capability, and the previous review capability stays revoked.
+A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, reserves implementation return work for the worker that owns the logical implementation session, and injects the feedback into that retained session. Review work follows the same rule: the latest reviewer owns the logical review session and receives return review work first. Busy/full owners keep the reservation without holding a physical slot; another eligible worker may take over only when the owner is unavailable/ineligible or the affinity window expires. Affinity never reuses authority: every execution/review claim receives a fresh lease capability, and the previous capability stays revoked.
 
-A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`; `tasks_approve` is only the fallback when the main agent reviews the candidate itself. Neither path releases dependencies or deletes worker state. The main agent then calls `tasks_merge(task_id)`. The Host re-fetches upstream and refuses to publish if the default branch no longer equals the reviewed `base_sha` or if the task ref no longer equals the reviewed candidate SHA. On success the Host pushes that exact candidate, marks the task `done`, unlocks dependencies, and queues cleanup. The worker deletes only its local task workspace/session; the Host owns broker-repository cleanup.
+A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`. No manual approval path exists. Approval does not release dependencies or delete worker state. The main agent then calls `tasks_merge(task_id)`. The Host re-fetches upstream and refuses to publish if the default branch no longer equals the reviewed `base_sha` or if the task ref no longer equals the reviewed candidate SHA. On success the Host pushes that exact candidate, marks the task `done`, unlocks dependencies, and queues cleanup. The worker deletes only its local task workspace/session; the Host owns broker-repository cleanup.
 
 The worker also captures up to 256 KiB of textual patch evidence and marks truncated patches explicitly. Full-context reviewer validation uses the worker-authenticated Host review broker rather than an upstream review branch.
 
@@ -274,7 +288,7 @@ queued -> assigned -> running -> review -> merge_pending -> done
 
 - Completed worker executions enter `review` and publish a stable review ref.
 - Review retry requires feedback and is sticky to the same worker so workspace/session state is reused.
-- A reviewer approve verdict moves `review -> merge_pending` directly (`tasks_approve` is only the main-agent self-review fallback); dependencies remain blocked.
+- A reviewer approve verdict moves `review -> merge_pending` directly; dependencies remain blocked.
 - `tasks_merge` performs Host-side upstream publish of the exact reviewed candidate, moves `merge_pending -> done`, releases dependencies, and queues worker cleanup. It refuses the publish if upstream or the candidate moved after review.
 - Every execution still gets its own UUID/attempt record, but attempts share the task workspace/session until merge.
 
@@ -296,7 +310,6 @@ projects_create
 tasks_list
 tasks_create
 reviews_get
-tasks_approve
 tasks_merge
 tasks_retry
 workers_list
