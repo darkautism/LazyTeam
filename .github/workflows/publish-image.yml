@@ -53,10 +53,6 @@ jobs:
           VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: docker build -f Dockerfile.worker --build-arg LAZYTEAM_GIT_SHA="$VALIDATED_SHA" -t lazyteam-worker:release-candidate .
 
-      - name: Verify worker container sandbox
-        if: steps.current.outputs.publish == 'true'
-        run: sh scripts/worker-container-smoke.sh lazyteam-worker:release-candidate
-
       - name: Set up QEMU
         if: steps.current.outputs.publish == 'true'
         uses: docker/setup-qemu-action@v3
@@ -134,3 +130,7 @@ jobs:
             ' >/dev/null
             echo "verified amd64+arm64: $image"
           done
+
+      - name: Verify worker container sandbox
+        if: steps.current.outputs.publish == 'true'
+        run: sh scripts/worker-container-smoke.sh lazyteam-worker:release-candidate
