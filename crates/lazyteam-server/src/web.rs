@@ -163,7 +163,7 @@ mod tests {
         assert!(INDEX.contains("project-contributor-name"));
         assert!(INDEX.contains("project-contributor-email"));
         assert!(INDEX.contains("contributor:{name:"));
-        assert!(INDEX.contains("ChatGPT / MCP"));
+        assert!(!INDEX.contains("ChatGPT / MCP reviewer prompt"));
         assert!(!INDEX.contains("project-git-worker-managed"));
         assert!(INDEX.contains("project-git-auth-mode"));
         assert!(INDEX.contains("<option value=\"worker\">Host environment / public repository</option>"));
@@ -173,6 +173,11 @@ mod tests {
         assert!(INDEX.contains("project-git-secret"));
         assert!(INDEX.contains("x-access-token"));
         assert!(INDEX.contains("Git credential was not stored; project remains unusable."));
+        assert!(INDEX.contains("probe-dot"));
+        assert!(INDEX.contains("Git OK"));
+        assert!(INDEX.contains("Git failed"));
+        assert!(INDEX.contains("/git-probe"));
+        assert!(INDEX.contains("probeProjectGit"));
         assert!(INDEX.contains("merge_pending"));
         assert!(!INDEX.contains(">Approve</button>"));
         assert!(!INDEX.contains(">Retry</button>"));

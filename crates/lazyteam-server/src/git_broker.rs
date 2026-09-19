@@ -45,6 +45,45 @@ fn broker_url(state: &AppState, kind: &str, id: Uuid) -> Result<String, ApiError
     Ok(format!("{base}/git/{kind}/{id}/repo.git"))
 }
 
+pub(crate) async fn probe_project(
+    state: &AppState,
+    project: &Project,
+    credential: &GitCredential,
+) -> Result<(), String> {
+    let upstream_url = upstream_repo_url(&project.repo_url, credential)
+        .map_err(|error| error.to_string())?;
+    let auth = HostGitAuth::prepare(state, credential)
+        .await
+        .map_err(|error| error.to_string())?;
+    let default_ref = format!("refs/heads/{}", project.default_branch);
+    let mut command = Command::new("git");
+    command
+        .args(["ls-remote", "--exit-code", &upstream_url, &default_ref])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    auth.apply(&mut command);
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(12), command.output()).await {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if message.is_empty() {
+                format!("upstream default branch {} was not found", project.default_branch)
+            } else {
+                message
+            })
+        }
+        Ok(Err(error)) => Err(format!("run Host Git probe: {error}")),
+        Err(_) => Err("Host Git probe timed out after 12 seconds".into()),
+    };
+    auth.cleanup().await;
+    result
+}
+
 pub(crate) async fn prepare_task_repo(
     state: &AppState,
     project: &Project,

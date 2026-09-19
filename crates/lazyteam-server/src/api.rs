@@ -344,11 +344,19 @@ struct WorkerJoinCode {
     expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize)]
+struct GitProbeResult {
+    ok: bool,
+    message: String,
+    checked_at: DateTime<Utc>,
+}
+
 pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/{id}", axum::routing::patch(update_project).delete(delete_project))
+        .route("/api/projects/{id}/git-probe", post(probe_project_git))
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/tasks/{id}", axum::routing::delete(delete_task))
         .route("/api/tasks/{id}/review", get(review_evidence))
@@ -434,6 +442,30 @@ pub(crate) async fn create_project(State(state): State<Arc<AppState>>, Json(inpu
 pub(crate) async fn list_projects(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Project>> {
     let rows = sqlx::query("SELECT * FROM projects ORDER BY slug").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(project_from_row).collect::<Result<Vec<_>,_>>().map(Json)
+}
+
+async fn probe_project_git(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> ApiResult<GitProbeResult> {
+    let row = sqlx::query("SELECT * FROM projects WHERE id=?")
+        .bind(id.to_string())
+        .fetch_optional(&state.db)
+        .await
+        .map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    let project = project_from_row(&row)?;
+    let credential = git_credential_from_row(&state, &row)?;
+    let checked_at = Utc::now();
+    let result = crate::git_broker::probe_project(&state, &project, &credential).await;
+    let (ok, message) = match result {
+        Ok(()) => (true, format!("Host can read refs/heads/{}", project.default_branch)),
+        Err(error) => {
+            let mut message = error.replace(['\r', '\n'], " ");
+            if message.chars().count() > 600 {
+                message = message.chars().take(600).collect::<String>() + "…";
+            }
+            (false, message)
+        }
+    };
+    Ok(Json(GitProbeResult { ok, message, checked_at }))
 }
 
 async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, Json(input): Json<UpdateProject>) -> ApiResult<Project> {
