@@ -27,6 +27,7 @@ use uuid::Uuid;
 pub(crate) const PROTOCOL_VERSION: u32 = 6;
 const MIN_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
+const REVIEW_FAILURE_LIMIT: i64 = 3;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 
 pub(crate) type ApiError = (StatusCode, String);
@@ -1152,6 +1153,15 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
         let error = input.error.unwrap_or_else(|| "reviewer failed without an error message".into());
         sqlx::query("UPDATE reviews SET state='failed',finished_at=?,verdict=?,lease_capability_hash=NULL WHERE id=?")
             .bind(ts(now)).bind(json(&serde_json::json!({"error": error}))?).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        let failed_reviews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
+            .bind(&task_id).bind(&execution_id).fetch_one(&mut *tx).await.map_err(db_error)?;
+        if review_failures_exhausted(failed_reviews) {
+            let feedback = format!(
+                "Reviewer runtime failed {failed_reviews} times for this implementation; automatic review retries stopped. Last error: {error}"
+            );
+            sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
+                .bind(feedback).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+        }
     } else {
         let verdict = input.verdict.ok_or((StatusCode::BAD_REQUEST, "completed review requires a verdict".into()))?;
         let reason = verdict.reason.trim();
@@ -1659,4 +1669,20 @@ fn internal(error: impl std::fmt::Display) -> ApiError { (StatusCode::INTERNAL_S
 fn db_error(error: sqlx::Error) -> ApiError { internal(error) }
 fn db_conflict(error: sqlx::Error) -> ApiError {
     if matches!(error, sqlx::Error::Database(ref e) if e.is_unique_violation()) { (StatusCode::CONFLICT, error.to_string()) } else { db_error(error) }
+}
+
+fn review_failures_exhausted(failed_reviews: i64) -> bool {
+    failed_reviews >= REVIEW_FAILURE_LIMIT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reviewer_runtime_failures_are_bounded() {
+        assert!(!review_failures_exhausted(REVIEW_FAILURE_LIMIT - 1));
+        assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT));
+        assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT + 1));
+    }
 }
