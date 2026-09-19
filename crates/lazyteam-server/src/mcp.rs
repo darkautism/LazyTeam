@@ -70,7 +70,10 @@ pub struct TaskIdParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskRetryParams {
+    /// Task to send back to implementation.
     pub task_id: String,
+    /// Concise rejection reason delivered to the next worker attempt. Required when
+    /// retrying from review or merge_pending (merge-gate rejection).
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -136,7 +139,6 @@ impl LazyTeamMcp {
                 contributor: lazyteam_core::ContributorIdentity { name: input.contributor_name, email: input.contributor_email },
                 required_worker_tags: input.required_worker_tags,
                 default_task_tags: input.default_task_tags,
-                reviewer: lazyteam_core::ReviewerConfig::default(),
                 git_auth: crate::api::ProjectGitAuthInput::default(),
             }),
         ).await.map_err(api_to_mcp)?;
@@ -202,7 +204,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "reviews_get",
         title = "Get review evidence",
-        description = "Get the latest pinned execution evidence for a task in review, including the implementation worker, candidate commit, base commit, review ref, patch/summary evidence, and Host repository metadata.",
+        description = "Get the latest pinned execution evidence for a task in review or merge_pending, including the implementation worker, candidate commit, base commit, review ref, patch/summary evidence, and Host repository metadata. Inspect this evidence before deciding to merge or reject a merge_pending candidate.",
         annotations(
             title = "Get review evidence",
             read_only_hint = true,
@@ -288,7 +290,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "tasks_retry",
         title = "Retry task",
-        description = "Re-dispatch an unclaimed/draft, review, failed, or blocked task. A review retry requires a concise reason, which is delivered to the next worker attempt",
+        description = "Re-dispatch a draft, review, merge_pending, failed, or blocked task back to implementation. A review or merge-gate (merge_pending) rejection requires a concise reason, which is delivered to the next worker attempt. Inspect a stale or unsafe merge_pending candidate first, then call tasks_retry with a concrete reason instead of attempting an unsafe merge.",
         annotations(
             title = "Retry task",
             read_only_hint = false,
@@ -377,7 +379,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. Only a completed independent reviewer-worker approve verdict moves a review task to merge_pending. For a merge_pending task, call tasks_merge: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review retries stay pinned to the implementation worker workspace/session when applicable.".to_string(),
+                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. Only a completed independent reviewer-worker approve verdict moves a review task to merge_pending. For a merge_pending task, inspect the candidate with reviews_get, then call tasks_merge when the candidate is acceptable: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. When the merge_pending candidate is stale or unsafe, do not merge; call tasks_retry with a concrete reason to send it back through implementation + independent review instead of attempting an unsafe merge or inventing another recovery path. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review and merge-gate (merge_pending) retries require a concise reason and stay pinned to the implementation worker workspace/session when applicable.".to_string(),
             )
     }
 }
@@ -398,4 +400,90 @@ fn json_result(value: &impl serde::Serialize) -> Result<CallToolResult, McpError
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_mcp() -> LazyTeamMcp {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("sqlite::memory:")
+            .expect("in-memory pool");
+        let state = Arc::new(AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: std::path::PathBuf::from("/tmp/lazyteam-mcp-test-git"),
+            agent_auth_updates: Default::default(),
+        });
+        LazyTeamMcp::new(state)
+    }
+
+    #[tokio::test]
+    async fn tasks_retry_description_advertises_merge_pending_with_reason() {
+        let mcp = test_mcp();
+        let tool = mcp
+            .tool_router
+            .get("tasks_retry")
+            .expect("tasks_retry tool must be registered");
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("merge_pending"),
+            "tasks_retry description must explicitly include merge_pending: {description}"
+        );
+        let lowered = description.to_lowercase();
+        assert!(
+            lowered.contains("reason"),
+            "tasks_retry description must state a reason is required/expected: {description}"
+        );
+        assert!(
+            lowered.contains("requir") || lowered.contains("expected"),
+            "tasks_retry description must state the reason is required/expected for review or merge-gate rejection: {description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_instructions_explain_merge_gate_retry_path() {
+        let mcp = test_mcp();
+        let instructions = mcp.get_info().instructions.unwrap_or_default();
+        let lowered = instructions.to_lowercase();
+        assert!(
+            lowered.contains("merge_pending"),
+            "server instructions must mention merge_pending: {instructions}"
+        );
+        assert!(
+            lowered.contains("reviews_get") || lowered.contains("inspect"),
+            "server instructions must tell the agent to inspect the merge_pending candidate: {instructions}"
+        );
+        assert!(
+            instructions.contains("tasks_merge"),
+            "server instructions must mention tasks_merge for acceptable candidates: {instructions}"
+        );
+        assert!(
+            instructions.contains("tasks_retry"),
+            "server instructions must mention tasks_retry for rejected candidates: {instructions}"
+        );
+        assert!(
+            lowered.contains("concrete reason") || lowered.contains("concise reason"),
+            "server instructions must require a concrete/concise tasks_retry reason: {instructions}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_pending_review_evidence_is_advertised_for_inspection() {
+        let mcp = test_mcp();
+        let tool = mcp
+            .tool_router
+            .get("reviews_get")
+            .expect("reviews_get tool must be registered");
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("merge_pending"),
+            "reviews_get description must advertise merge_pending inspection: {description}"
+        );
+    }
 }
