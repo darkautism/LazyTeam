@@ -23,7 +23,6 @@ services:
       - SETGID
       - SETUID
     security_opt:
-      - no-new-privileges:true
       - seccomp=unconfined
       - apparmor=unconfined
 

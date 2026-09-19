@@ -17,7 +17,6 @@ output="$(
     --cap-add SYS_CHROOT \
     --cap-add SETGID \
     --cap-add SETUID \
-    --security-opt no-new-privileges=true \
     --security-opt seccomp=unconfined \
     --security-opt apparmor=unconfined \
     "$image" lazyteam-worker --sandbox-diagnose 2>&1

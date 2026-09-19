@@ -328,6 +328,7 @@ fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Resul
     if enter_container {
         enter_agent_container(&spec)?;
     }
+    enable_agent_no_new_privs()?;
     apply_policy(&spec)?;
     drop_agent_capabilities()?;
 
@@ -468,7 +469,13 @@ fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
     bind_into_container(rootfs, &spec.namespace_root_base, false)?;
 
     if unsafe { libc::chroot(rootfs_c.as_ptr()) } != 0 {
-        bail!("chroot agent container failed: {}", std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let security = status.lines()
+            .filter(|line| line.starts_with("CapEff:") || line.starts_with("CapBnd:") || line.starts_with("NoNewPrivs:") || line.starts_with("Seccomp:"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("chroot agent container failed: {error}; euid={}; {security}", unsafe { libc::geteuid() });
     }
     std::env::set_current_dir("/").context("chdir inside agent container")?;
     Ok(())
@@ -546,6 +553,17 @@ fn bind_into_container(rootfs: &Path, source: &Path, read_only: bool) -> anyhow:
 fn enter_agent_container(_spec: &SandboxSpec) -> anyhow::Result<()> {
     bail!("agent container requires Linux")
 }
+
+#[cfg(target_os = "linux")]
+fn enable_agent_no_new_privs() -> anyhow::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        bail!("set agent no_new_privs failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_agent_no_new_privs() -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(target_os = "linux")]
 fn drop_agent_capabilities() -> anyhow::Result<()> {
