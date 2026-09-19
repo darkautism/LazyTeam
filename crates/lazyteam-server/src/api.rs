@@ -120,6 +120,32 @@ struct TaskBoardItem {
     worker: Option<WorkerRef>,
     reviewer: Option<WorkerRef>,
     result: Option<ExecutionResult>,
+    #[serde(default)]
+    attempt: u32,
+    #[serde(default)]
+    review_rounds: i64,
+    #[serde(default)]
+    reviewer_retries: i64,
+}
+
+/// Conservative review-hell signal for Home task cards.
+///
+/// Only durable history counts: the latest implementation attempt number and
+/// completed reviewer `retry` verdicts. Runtime `failed`/`lost` reviews and
+/// free-form `review_feedback` prose (including Host merge-conflict text) must
+/// never trigger this signal; those belong to the structured-outcome/Insights work.
+fn task_board_looping(attempt: u32, reviewer_retries: i64) -> bool {
+    attempt >= 4 || reviewer_retries >= 3
+}
+
+/// True when a durable completed-review verdict row is a reviewer `retry`.
+/// Inspects only the stored verdict JSON, never `review_feedback` prose, so a
+/// reason that merely mentions "retry" or "merge conflict" cannot qualify.
+fn is_reviewer_retry_verdict(verdict_json: Option<&str>) -> bool {
+    let Some(raw) = verdict_json else { return false; };
+    // Compact serde form is `{"verdict":"retry",...}`; accept one optional
+    // space after the colon for robustness without parsing prose.
+    raw.contains("\"verdict\":\"retry\"") || raw.contains("\"verdict\": \"retry\"")
 }
 
 #[derive(Debug, Serialize)]
@@ -634,7 +660,7 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
 }
 
 async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
-    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
+    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state, COALESCE((SELECT MAX(e2.attempt) FROM executions e2 WHERE e2.task_id=t.id),0) AS board_attempt, (SELECT COUNT(*) FROM reviews r2 WHERE r2.task_id=t.id AND r2.state='completed') AS board_review_rounds, (SELECT COUNT(*) FROM reviews r3 WHERE r3.task_id=t.id AND r3.state='completed' AND (r3.verdict LIKE '%\"verdict\":\"retry\"%' OR r3.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_reviewer_retries FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
         .fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(|row| {
         let task = task_from_row(row)?;
@@ -667,7 +693,10 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
         };
         let result: Option<String> = row.try_get("board_result").map_err(internal)?;
         let result = result.map(dejson).transpose()?;
-        Ok(TaskBoardItem { task, worker, reviewer, result })
+        let attempt: i64 = row.try_get("board_attempt").map_err(internal)?;
+        let review_rounds: i64 = row.try_get("board_review_rounds").map_err(internal)?;
+        let reviewer_retries: i64 = row.try_get("board_reviewer_retries").map_err(internal)?;
+        Ok(TaskBoardItem { task, worker, reviewer, result, attempt: attempt.max(0) as u32, review_rounds: review_rounds.max(0), reviewer_retries: reviewer_retries.max(0) })
     }).collect::<Result<Vec<_>, ApiError>>().map(Json)
 }
 
@@ -1733,6 +1762,7 @@ fn review_failures_exhausted(failed_reviews: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     #[test]
     fn reviewer_runtime_failures_are_bounded() {
@@ -1744,5 +1774,133 @@ mod tests {
     #[test]
     fn default_session_affinity_window_is_fifteen_minutes() {
         assert_eq!(DEFAULT_SESSION_AFFINITY_SECONDS, 15 * 60);
+    }
+
+    #[test]
+    fn review_loop_badge_stays_quiet_on_first_pass() {
+        assert!(!task_board_looping(1, 0));
+        assert!(!task_board_looping(2, 0));
+        assert!(!task_board_looping(3, 2));
+        assert!(!task_board_looping(0, 0));
+    }
+
+    #[test]
+    fn review_loop_badge_triggers_on_conservative_threshold() {
+        assert!(task_board_looping(4, 0));
+        assert!(task_board_looping(9, 0));
+        assert!(task_board_looping(1, 3));
+        assert!(task_board_looping(2, 5));
+    }
+
+    #[test]
+    fn reviewer_retry_verdict_uses_durable_verdict_json_only() {
+        assert!(is_reviewer_retry_verdict(Some(r#"{"verdict":"retry","reason":"fix it"}"#)));
+        assert!(is_reviewer_retry_verdict(Some(r#"{"verdict": "retry","reason":"fix it"}"#)));
+        assert!(!is_reviewer_retry_verdict(Some(r#"{"verdict":"approve","reason":"looks good"}"#)));
+        assert!(!is_reviewer_retry_verdict(Some(r#"{"error":"runtime exploded"}"#)));
+        assert!(!is_reviewer_retry_verdict(None));
+        // Prose that merely mentions retry/merge conflict must not qualify.
+        assert!(!is_reviewer_retry_verdict(Some("please retry, Host merge conflict in main gate")));
+    }
+
+    #[test]
+    fn task_board_item_serializes_attempt_and_review_counts() {
+        let item = TaskBoardItem {
+            task: Task {
+                id: Uuid::new_v4(),
+                project_id: Uuid::new_v4(),
+                title: "t".into(),
+                description: String::new(),
+                expected_outcome: String::new(),
+                acceptance_criteria: vec![],
+                required_tags: Default::default(),
+                preferred_tags: Default::default(),
+                dependencies: vec![],
+                review_feedback: "Host merge conflict in main gate overturned".into(),
+                priority: 0,
+                state: TaskState::Review,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            worker: None,
+            reviewer: None,
+            result: None,
+            attempt: 3,
+            review_rounds: 2,
+            reviewer_retries: 1,
+        };
+        let value = serde_json::to_value(&item).unwrap();
+        assert_eq!(value["attempt"], 3);
+        assert_eq!(value["review_rounds"], 2);
+        assert_eq!(value["reviewer_retries"], 1);
+    }
+
+    #[tokio::test]
+    async fn task_board_counts_come_from_database_history() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for (id, role) in [(&worker_id, "worker"), (&reviewer_id, "reviewer")] {
+            sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(role).bind(role).bind("idle").bind("linux").bind("x86_64")
+                .bind(PROTOCOL_VERSION as i64).bind("test").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,review_feedback,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("looping task").bind("").bind("").bind("review")
+            .bind("Host merge conflict in main gate; please retry")
+            .bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        // Two implementation attempts; latest attempt number must be 2.
+        for attempt in [1_i64, 2_i64] {
+            let execution_id = Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+                .bind(&execution_id).bind(&task_id).bind(&worker_id).bind(attempt).bind("completed").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+            if attempt == 2 {
+                // Two completed review rounds on the latest execution: one
+                // approve and one retry, plus runtime noise that must not
+                // count as reviewer disagreement.
+                for (verdict, state) in [
+                    (r#"{"verdict":"approve","reason":"ok","validation":[]}"#, "completed"),
+                    (r#"{"verdict":"retry","reason":"fix it","validation":[]}"#, "completed"),
+                    (r#"{"error":"runner crashed"}"#, "failed"),
+                ] {
+                    sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+                        .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
+                        .bind(state).bind(&now).bind(&now).bind(verdict)
+                        .execute(&db).await.unwrap();
+                }
+                sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+                    .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
+                    .bind("lost").bind(&now).bind(&now)
+                    .execute(&db).await.unwrap();
+            }
+        }
+        let state = Arc::new(AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: std::env::temp_dir(),
+            agent_auth_updates: Default::default(),
+        });
+        let board = task_board(State(state)).await.unwrap().0;
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].attempt, 2);
+        assert_eq!(board[0].review_rounds, 2);
+        assert_eq!(board[0].reviewer_retries, 1);
+        assert!(!task_board_looping(board[0].attempt, board[0].reviewer_retries));
     }
 }
