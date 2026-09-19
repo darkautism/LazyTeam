@@ -220,28 +220,6 @@ impl LazyTeamMcp {
     }
 
     #[tool(
-        name = "tasks_approve",
-        title = "Approve task",
-        description = "Approve a task after main-agent review when no reviewer worker has already decided it. Moves review to merge_pending; dependencies remain blocked until tasks_merge performs Host-side publish.",
-        annotations(
-            title = "Approve task",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn tasks_approve(
-        &self,
-        Parameters(input): Parameters<TaskIdParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let task_id = parse_task_id(&input.task_id)?;
-        let _ = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        let transition = review::approve_task(&self.state, task_id).await.map_err(api_to_mcp)?;
-        json_result(&transition)
-    }
-
-    #[tool(
         name = "tasks_merge",
         title = "Merge reviewed task",
         description = "Publish an approved reviewed candidate from the LazyTeam Host using Host-only Git credentials. Fast-forwards when possible; if upstream moved, merges in a private Host scratch workspace. Merge conflicts are re-dispatched to the implementation worker for resolution and re-review, never to the main agent's filesystem.",
@@ -398,7 +376,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. Reviewer workers normally move approved tasks to merge_pending automatically. For a merge_pending task, call tasks_merge: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review retries stay pinned to the implementation worker workspace/session when applicable.".to_string(),
+                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. Only a completed independent reviewer-worker approve verdict moves a review task to merge_pending. For a merge_pending task, call tasks_merge: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review retries stay pinned to the implementation worker workspace/session when applicable.".to_string(),
             )
     }
 }

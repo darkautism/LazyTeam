@@ -95,7 +95,6 @@ EXPECTED_TOOL_ANNOTATIONS = {
     "tasks_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
     "tasks_create": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "reviews_get": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
-    "tasks_approve": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     "tasks_merge": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     "tasks_merged": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     "tasks_retry": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
@@ -201,7 +200,7 @@ def main():
     expect(tokens["token_type"] == "Bearer", "wrong token type")
     expect(tokens.get("refresh_token"), "refresh token missing")
 
-    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_create", "reviews_get", "tasks_approve", "tasks_merge", "tasks_retry", "workers_list"}
+    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_create", "reviews_get", "tasks_merge", "tasks_retry", "workers_list"}
 
     legacy_initialize = mcp_call(tokens["access_token"], "initialize", {
         "protocolVersion": MCP_LEGACY_VERSION,
@@ -239,6 +238,7 @@ def main():
     legacy_tools = legacy_tool_result.get("result", {}).get("tools", [])
     legacy_names = {tool.get("name") for tool in legacy_tools}
     expect(required_tools.issubset(legacy_names), f"legacy tools/list missing tools: {sorted(required_tools - legacy_names)}")
+    expect("tasks_approve" not in legacy_names, "legacy tools/list still advertises removed tasks_approve bypass")
     validate_tool_schemas(legacy_tools)
 
     legacy_call = mcp_call(
@@ -266,6 +266,7 @@ def main():
     modern_tools = tool_result.get("result", {}).get("tools", [])
     names = {tool.get("name") for tool in modern_tools}
     expect(required_tools.issubset(names), f"tools/list missing tools: {sorted(required_tools - names)}")
+    expect("tasks_approve" not in names, "tools/list still advertises removed tasks_approve bypass")
     validate_tool_schemas(modern_tools)
 
     refresh_resp = request("/mcp/oauth/token", method="POST", data={

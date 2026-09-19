@@ -121,6 +121,10 @@ mod tests {
         assert!(!INDEX.contains("if(w){renderManagedCapabilities(w);renderAgentCatalog(w)}"));
         assert!(INDEX.contains("Adding tools rebuilds the agent container"));
         assert!(INDEX.contains("pending and will not claim tasks or reviews"));
+        // Protocol v6 only: no legacy protocol<5 managed-tool compatibility branch/message.
+        assert!(!INDEX.contains("Update/restart this worker before changing managed tools"));
+        assert!(!INDEX.contains("(w.protocol_version||0)<5"));
+        assert!(!INDEX.contains("input.disabled=old"));
         assert!(INDEX.contains("worker-config-agent"));
         assert!(INDEX.contains("worker-agent-status"));
         assert!(INDEX.contains("worker-config-prompt"));
@@ -174,7 +178,9 @@ mod tests {
         assert!(INDEX.contains("x-access-token"));
         assert!(INDEX.contains("Git credential was not stored; project remains unusable."));
         assert!(INDEX.contains("probe-dot"));
-        assert!(INDEX.contains("Git OK"));
+        assert!(INDEX.contains("Git R/W OK"));
+        assert!(INDEX.contains("Git read-only"));
+        assert!(INDEX.contains("credential revision"));
         assert!(INDEX.contains("Git failed"));
         assert!(INDEX.contains("/git-probe"));
         assert!(INDEX.contains("probeProjectGit"));

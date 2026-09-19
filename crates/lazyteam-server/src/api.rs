@@ -25,8 +25,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub(crate) const PROTOCOL_VERSION: u32 = 6;
-const MIN_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
+const DEFAULT_SESSION_AFFINITY_SECONDS: i64 = 15 * 60;
 const REVIEW_FAILURE_LIMIT: i64 = 3;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 
@@ -92,6 +92,7 @@ struct StoredGitAuth {
     mode: GitAuthMode,
     username: Option<String>,
     encrypted_secret: Option<String>,
+    credential_revision: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +145,7 @@ pub(crate) struct ReviewEvidence {
 struct WorkerCleanup {
     task_id: Uuid,
     project_slug: String,
+    role: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,6 +349,9 @@ struct WorkerJoinCode {
 #[derive(Debug, Serialize)]
 struct GitProbeResult {
     ok: bool,
+    read_ok: bool,
+    write_ok: bool,
+    credential_revision: Option<String>,
     message: String,
     checked_at: DateTime<Utc>,
 }
@@ -373,7 +378,8 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
         .route("/api/workers/{id}/cleanup", get(worker_cleanup))
-        .route("/api/workers/{id}/cleanup/{task_id}", post(worker_cleanup_ack))
+        .route("/api/workers/{id}/cleanup/{task_id}", post(worker_cleanup_ack_legacy))
+        .route("/api/workers/{id}/cleanup/{task_id}/{role}", post(worker_cleanup_ack))
         .route("/api/workers/{id}/claim", post(claim_task))
         .route("/api/workers/{id}/review-claim", post(claim_review))
         .route("/api/executions/{id}/renew", post(renew_execution))
@@ -425,11 +431,11 @@ pub(crate) async fn create_project(State(state): State<Arc<AppState>>, Json(inpu
         default_task_tags: input.default_task_tags,
         git_auth: git_auth_summary(&stored_git_auth), enabled: true, created_at: now, updated_at: now,
     };
-    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,contributor_name,contributor_email,required_worker_tags,default_task_tags,git_auth_mode,git_auth_username,git_auth_secret,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,contributor_name,contributor_email,required_worker_tags,default_task_tags,git_auth_mode,git_auth_username,git_auth_secret,git_auth_revision,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(project.id.to_string()).bind(&project.slug).bind(&project.name).bind(&project.repo_url)
         .bind(&project.default_branch).bind(&project.contributor.name).bind(&project.contributor.email)
         .bind(json(&project.required_worker_tags)?).bind(json(&project.default_task_tags)?)
-        .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret)
+        .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret).bind(&stored_git_auth.credential_revision)
         .bind(1_i64).bind(ts(project.created_at)).bind(ts(project.updated_at))
         .execute(&state.db).await.map_err(db_conflict)?;
     Ok(Json(project))
@@ -451,17 +457,23 @@ async fn probe_project_git(Path(id): Path<Uuid>, State(state): State<Arc<AppStat
     let credential = git_credential_from_row(&state, &row)?;
     let checked_at = Utc::now();
     let result = crate::git_broker::probe_project(&state, &project, &credential).await;
-    let (ok, message) = match result {
-        Ok(()) => (true, format!("Host can read refs/heads/{}", project.default_branch)),
-        Err(error) => {
-            let mut message = error.replace(['\r', '\n'], " ");
-            if message.chars().count() > 600 {
-                message = message.chars().take(600).collect::<String>() + "…";
-            }
-            (false, message)
-        }
+    let (read_ok, write_ok, mut message) = match result {
+        Ok(status) => (status.read_ok, status.write_ok, status.message),
+        Err(error) => (false, false, error),
     };
-    Ok(Json(GitProbeResult { ok, message, checked_at }))
+    message = message.replace(['\r', '\n'], " ");
+    if message.chars().count() > 600 {
+        message = message.chars().take(600).collect::<String>() + "…";
+    }
+    let credential_revision = project.git_auth.credential_revision.clone();
+    Ok(Json(GitProbeResult {
+        ok: read_ok && write_ok,
+        read_ok,
+        write_ok,
+        credential_revision,
+        message,
+        checked_at,
+    }))
 }
 
 async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, Json(input): Json<UpdateProject>) -> ApiResult<Project> {
@@ -485,12 +497,12 @@ async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
     let stored_git_auth = resolve_updated_git_auth(&state, &row, input.git_auth)?;
     let now = ts(Utc::now());
     let mut tx = state.db.begin().await.map_err(db_error)?;
-    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,contributor_name=?,contributor_email=?,required_worker_tags=?,default_task_tags=?,git_auth_mode=?,git_auth_username=?,git_auth_secret=?,enabled=?,updated_at=? WHERE id=?")
+    sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,contributor_name=?,contributor_email=?,required_worker_tags=?,default_task_tags=?,git_auth_mode=?,git_auth_username=?,git_auth_secret=?,git_auth_revision=?,enabled=?,updated_at=? WHERE id=?")
         .bind(&slug).bind(name.trim()).bind(repo_url.trim()).bind(default_branch.trim())
         .bind(&contributor.name).bind(&contributor.email)
         .bind(json(&input.required_worker_tags.unwrap_or(current.required_worker_tags))?)
         .bind(json(&input.default_task_tags.unwrap_or(current.default_task_tags))?)
-        .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret)
+        .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret).bind(&stored_git_auth.credential_revision)
         .bind(if enabled { 1_i64 } else { 0_i64 })
         .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_conflict)?;
     if disabling {
@@ -586,6 +598,10 @@ pub(crate) async fn delete_task(Path(id): Path<Uuid>, State(state): State<Arc<Ap
         sqlx::query("INSERT INTO task_cleanup(task_id,worker_id,created_at) VALUES(?,?,?) ON CONFLICT(task_id) DO UPDATE SET worker_id=excluded.worker_id,created_at=excluded.created_at")
             .bind(&task_id).bind(worker_id).bind(&now).execute(&mut *tx).await.map_err(db_error)?;
     }
+    sqlx::query("INSERT OR IGNORE INTO agent_session_cleanup(task_id,worker_id,role,created_at) SELECT ?,worker_id,'implementation',? FROM executions WHERE task_id=?")
+        .bind(&task_id).bind(&now).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+    sqlx::query("INSERT OR IGNORE INTO agent_session_cleanup(task_id,worker_id,role,created_at) SELECT ?,reviewer_worker_id,'review',? FROM reviews WHERE task_id=?")
+        .bind(&task_id).bind(&now).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -656,8 +672,8 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
 }
 
 async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<RegisterWorker>) -> Result<Response, ApiError> {
-    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&input.protocol_version) {
-        return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol {}; supported {}..={}", input.protocol_version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION)));
+    if input.protocol_version != PROTOCOL_VERSION {
+        return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol {}; upgrade to worker protocol {PROTOCOL_VERSION} or enroll as a new worker", input.protocol_version)));
     }
     let id = input.id.unwrap_or_else(Uuid::new_v4);
     let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workers WHERE id=? AND retired_at IS NOT NULL")
@@ -755,9 +771,6 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     validate_user_tags(&tags)?;
     let managed_capabilities = input.managed_capabilities.unwrap_or_else(|| current.managed_capabilities.clone());
     validate_managed_capabilities(&managed_capabilities)?;
-    if managed_capabilities != current.managed_capabilities && current.protocol_version < 5 {
-        return Err((StatusCode::CONFLICT, "update/restart this worker with protocol 5 before changing managed tools".into()));
-    }
     let allowed_projects = input.allowed_projects.unwrap_or_else(|| current.allowed_projects.clone());
     let slots = input.slots.unwrap_or(current.slots).max(1);
     let needs_build = !managed_capabilities.is_subset(&current.installed_capabilities);
@@ -830,9 +843,6 @@ async fn queue_worker_provider_key(
         .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&row)?;
-    if worker.protocol_version < 4 {
-        return Err((StatusCode::CONFLICT, "update/restart this worker with protocol 4 before configuring provider credentials".into()));
-    }
     let candidate = worker.agent_capabilities.providers.iter()
         .find(|candidate| candidate.id == provider)
         .ok_or((StatusCode::BAD_REQUEST, "provider is not reported by this worker's Pi runtime".into()))?;
@@ -874,8 +884,8 @@ async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Ar
         .map(str::parse::<u32>)
         .transpose()
         .map_err(|_| (StatusCode::BAD_REQUEST, "invalid worker protocol version header".into()))?;
-    if protocol_version.is_some_and(|version| !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)) {
-        return Err((StatusCode::BAD_REQUEST, "unsupported worker protocol version".into()));
+    if protocol_version.is_some_and(|version| version != PROTOCOL_VERSION) {
+        return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol version; upgrade to worker protocol {PROTOCOL_VERSION} or enroll as a new worker")));
     }
     let worker_version = headers
         .get("x-lazyteam-worker-version")
@@ -902,9 +912,6 @@ async fn report_capability_build(
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&row)?;
-    if worker.protocol_version < 5 {
-        return Err((StatusCode::CONFLICT, "worker protocol 5 is required for managed tool builds".into()));
-    }
     let log_tail = bounded_capability_log(report.log_tail.as_deref());
     if let Some(error) = report.error.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         let phase = report.phase.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("failed");
@@ -941,27 +948,46 @@ async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState
 
 async fn worker_cleanup(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Vec<WorkerCleanup>> {
     require_worker(&state.db, id, &headers).await?;
-    let rows = sqlx::query("SELECT c.task_id,p.slug FROM task_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
+    let rows = sqlx::query("SELECT c.task_id,c.role,p.slug FROM agent_session_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
         .bind(id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         items.push(WorkerCleanup {
             task_id: uuid(row.try_get("task_id").map_err(internal)?)?,
             project_slug: row.try_get("slug").map_err(internal)?,
+            role: row.try_get("role").map_err(internal)?,
         });
     }
     Ok(Json(items))
 }
 
-async fn worker_cleanup_ack(Path((id, task_id)): Path<(Uuid, Uuid)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+async fn worker_cleanup_ack_legacy(Path((id, task_id)): Path<(Uuid, Uuid)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
     require_worker(&state.db, id, &headers).await?;
     let execution_id: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
         .bind(task_id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
-    if let Some(execution_id) = execution_id {
-        crate::git_broker::remove_task_repo(&state, uuid(execution_id)?).await?;
-    }
-    let changed = sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
+    if let Some(execution_id) = execution_id { crate::git_broker::remove_task_repo(&state, uuid(execution_id)?).await?; }
+    sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
+        .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
+    let changed = sqlx::query("DELETE FROM agent_session_cleanup WHERE task_id=? AND worker_id=? AND role='implementation'")
         .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
+    if changed == 0 { return Err((StatusCode::NOT_FOUND, "cleanup item not found".into())); }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn worker_cleanup_ack(Path((id, task_id, role)): Path<(Uuid, Uuid, String)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    if !matches!(role.as_str(), "implementation" | "review") {
+        return Err((StatusCode::BAD_REQUEST, "invalid session cleanup role".into()));
+    }
+    if role == "implementation" {
+        let execution_id: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+            .bind(task_id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
+        if let Some(execution_id) = execution_id { crate::git_broker::remove_task_repo(&state, uuid(execution_id)?).await?; }
+        sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
+            .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
+    }
+    let changed = sqlx::query("DELETE FROM agent_session_cleanup WHERE task_id=? AND worker_id=? AND role=?")
+        .bind(task_id.to_string()).bind(id.to_string()).bind(&role).execute(&state.db).await.map_err(db_error)?.rows_affected();
     if changed == 0 { return Err((StatusCode::NOT_FOUND, "cleanup item not found".into())); }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -977,9 +1003,9 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
     if worker.running_slots >= worker.slots || !matches!(worker.state, WorkerState::Idle | WorkerState::Busy) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    let rows = sqlx::query("SELECT * FROM tasks WHERE state='queued' ORDER BY priority DESC, created_at ASC LIMIT 100")
-        .fetch_all(&state.db).await.map_err(db_error)?;
     let worker_id_text = worker.id.to_string();
+    let rows = sqlx::query("SELECT * FROM tasks WHERE state='queued' ORDER BY CASE WHEN sticky_worker_id=? THEN 0 WHEN sticky_worker_id IS NULL THEN 1 ELSE 2 END, priority DESC, created_at ASC LIMIT 100")
+        .bind(&worker_id_text).fetch_all(&state.db).await.map_err(db_error)?;
     for row in rows {
         let sticky_worker_id: Option<String> = row.try_get("sticky_worker_id").map_err(internal)?;
         let task = task_from_row(&row)?;
@@ -1012,8 +1038,8 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
         worker_project.git_auth = GitAuthConfig::default();
 
         let mut tx = state.db.begin().await.map_err(db_error)?;
-        let claimed = sqlx::query("UPDATE tasks SET state='assigned',updated_at=? WHERE id=? AND state='queued'")
-            .bind(ts(now)).bind(task.id.to_string()).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+        let claimed = sqlx::query("UPDATE tasks SET state='assigned',sticky_worker_id=COALESCE(sticky_worker_id,?),updated_at=? WHERE id=? AND state='queued'")
+            .bind(worker.id.to_string()).bind(ts(now)).bind(task.id.to_string()).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
         if claimed == 0 {
             tx.rollback().await.map_err(db_error)?;
             crate::git_broker::remove_task_repo(&state, execution.id).await?;
@@ -1043,8 +1069,8 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
-    let rows = sqlx::query("SELECT * FROM tasks WHERE state='review' ORDER BY priority DESC, updated_at ASC LIMIT 100")
-        .fetch_all(&state.db).await.map_err(db_error)?;
+    let rows = sqlx::query("SELECT * FROM tasks WHERE state='review' ORDER BY CASE WHEN (SELECT reviewer_worker_id FROM reviews r0 WHERE r0.task_id=tasks.id ORDER BY r0.created_at DESC LIMIT 1)=? THEN 0 ELSE 1 END, priority DESC, updated_at ASC LIMIT 100")
+        .bind(worker.id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
     for row in rows {
         let task = task_from_row(&row)?;
         let project_row = sqlx::query("SELECT * FROM projects WHERE id=? AND enabled=1")
@@ -1170,6 +1196,9 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
             );
             sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
                 .bind(feedback).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+        } else {
+            sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
+                .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
         }
     } else {
         let verdict = input.verdict.ok_or((StatusCode::BAD_REQUEST, "completed review requires a verdict".into()))?;
@@ -1308,9 +1337,9 @@ async fn sticky_worker_reservation_active(
     let fresh_after = Utc::now() - chrono::Duration::seconds(45);
     Ok(preferred.role == AgentRole::Worker
         && preferred.protocol_version >= PROTOCOL_VERSION
-        && preferred.running_slots < preferred.slots
         && matches!(preferred.state, WorkerState::Idle | WorkerState::Busy)
         && preferred.last_heartbeat_at >= fresh_after
+        && session_affinity_fresh(task.updated_at)
         && worker_matches_task(&preferred, project, task))
 }
 
@@ -1321,7 +1350,7 @@ async fn review_reserved_for_live_preferred_reviewer(
     claimant_id: Uuid,
 ) -> Result<bool, ApiError> {
     let preferred_id: Option<String> = sqlx::query_scalar(
-        "SELECT reviewer_worker_id FROM reviews WHERE task_id=? AND state='completed' ORDER BY created_at DESC LIMIT 1",
+        "SELECT reviewer_worker_id FROM reviews WHERE task_id=? ORDER BY created_at DESC LIMIT 1",
     )
     .bind(task.id.to_string())
     .fetch_optional(db)
@@ -1339,11 +1368,23 @@ async fn review_reserved_for_live_preferred_reviewer(
     let fresh_after = Utc::now() - chrono::Duration::seconds(45);
     let live = preferred.role == AgentRole::Reviewer
         && preferred.protocol_version >= PROTOCOL_VERSION
-        && preferred.running_slots < preferred.slots
         && matches!(preferred.state, WorkerState::Idle | WorkerState::Busy)
         && preferred.last_heartbeat_at >= fresh_after
+        && session_affinity_fresh(task.updated_at)
         && worker_can_run_project(&preferred, project);
     Ok(live)
+}
+
+fn session_affinity_seconds() -> i64 {
+    std::env::var("LAZYTEAM_SESSION_AFFINITY_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SESSION_AFFINITY_SECONDS)
+        .clamp(60, 24 * 60 * 60)
+}
+
+fn session_affinity_fresh(since: DateTime<Utc>) -> bool {
+    since >= Utc::now() - chrono::Duration::seconds(session_affinity_seconds())
 }
 
 async fn dependencies_satisfied(db: &SqlitePool, task: &Task) -> Result<bool, ApiError> {
@@ -1390,15 +1431,18 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
         tx.commit().await?;
     }
 
-    let expired_reviews = sqlx::query("SELECT id,reviewer_worker_id FROM reviews WHERE state IN ('assigned','running') AND lease_until < ?")
+    let expired_reviews = sqlx::query("SELECT id,task_id,reviewer_worker_id FROM reviews WHERE state IN ('assigned','running') AND lease_until < ?")
         .bind(&now).fetch_all(db).await?;
     for row in expired_reviews {
         let id: String = row.try_get("id")?;
+        let task_id: String = row.try_get("task_id")?;
         let reviewer_worker_id: String = row.try_get("reviewer_worker_id")?;
         let mut tx = db.begin().await?;
         let changed = sqlx::query("UPDATE reviews SET state='lost',finished_at=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running')")
             .bind(&now).bind(&id).execute(&mut *tx).await?.rows_affected();
         if changed > 0 {
+            sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
+                .bind(&now).bind(&task_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
                 .bind(&reviewer_worker_id).execute(&mut *tx).await?;
         }
@@ -1430,6 +1474,7 @@ fn stored_git_auth_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<StoredGitAu
         mode: git_auth_mode(&mode)?,
         username: row.try_get("git_auth_username").map_err(internal)?,
         encrypted_secret: row.try_get("git_auth_secret").map_err(internal)?,
+        credential_revision: row.try_get("git_auth_revision").map_err(internal)?,
     })
 }
 
@@ -1438,6 +1483,7 @@ fn git_auth_summary(stored: &StoredGitAuth) -> GitAuthConfig {
         mode: stored.mode.clone(),
         credential_configured: stored.encrypted_secret.is_some(),
         username: stored.username.clone(),
+        credential_revision: stored.credential_revision.clone(),
     }
 }
 
@@ -1469,7 +1515,7 @@ fn resolve_new_git_auth(state: &AppState, input: ProjectGitAuthInput) -> Result<
             if nonempty_secret(input.secret).is_some() {
                 return Err((StatusCode::BAD_REQUEST, "worker-managed Git auth must not include a server-side secret".into()));
             }
-            Ok(StoredGitAuth { mode: GitAuthMode::Worker, username: None, encrypted_secret: None })
+            Ok(StoredGitAuth { mode: GitAuthMode::Worker, username: None, encrypted_secret: None, credential_revision: None })
         }
         GitAuthMode::SshKey => {
             let secret = nonempty_secret(input.secret).ok_or((
@@ -1480,6 +1526,7 @@ fn resolve_new_git_auth(state: &AppState, input: ProjectGitAuthInput) -> Result<
                 mode: GitAuthMode::SshKey,
                 username: None,
                 encrypted_secret: Some(encrypt_git_secret(state, &secret)?),
+                credential_revision: Some(Uuid::new_v4().to_string()),
             })
         }
         GitAuthMode::HttpsBasic => {
@@ -1495,6 +1542,7 @@ fn resolve_new_git_auth(state: &AppState, input: ProjectGitAuthInput) -> Result<
                 mode: GitAuthMode::HttpsBasic,
                 username: Some(username),
                 encrypted_secret: Some(encrypt_git_secret(state, &secret)?),
+                credential_revision: Some(Uuid::new_v4().to_string()),
             })
         }
     }
@@ -1512,17 +1560,24 @@ fn resolve_updated_git_auth(
             mode: GitAuthMode::Worker,
             username: None,
             encrypted_secret: None,
+            credential_revision: None,
         }),
         GitAuthMode::SshKey => {
-            let encrypted_secret = match nonempty_secret(input.secret) {
-                Some(secret) => Some(encrypt_git_secret(state, &secret)?),
-                None if current.mode == GitAuthMode::SshKey && current.encrypted_secret.is_some() => current.encrypted_secret,
+            let (encrypted_secret, credential_revision) = match nonempty_secret(input.secret) {
+                Some(secret) => (
+                    Some(encrypt_git_secret(state, &secret)?),
+                    Some(Uuid::new_v4().to_string()),
+                ),
+                None if current.mode == GitAuthMode::SshKey && current.encrypted_secret.is_some() => {
+                    (current.encrypted_secret, current.credential_revision)
+                }
                 None => return Err((StatusCode::BAD_REQUEST, "switching to SSH key mode requires a private key".into())),
             };
             Ok(StoredGitAuth {
                 mode: GitAuthMode::SshKey,
                 username: None,
                 encrypted_secret,
+                credential_revision,
             })
         }
         GitAuthMode::HttpsBasic => {
@@ -1532,15 +1587,21 @@ fn resolve_updated_git_auth(
                 .filter(|value| !value.is_empty())
                 .or_else(|| (current.mode == GitAuthMode::HttpsBasic).then(|| current.username.clone()).flatten())
                 .ok_or((StatusCode::BAD_REQUEST, "HTTPS username + password/token mode requires a username".into()))?;
-            let encrypted_secret = match nonempty_secret(input.secret) {
-                Some(secret) => Some(encrypt_git_secret(state, &secret)?),
-                None if current.mode == GitAuthMode::HttpsBasic && current.encrypted_secret.is_some() => current.encrypted_secret,
+            let (encrypted_secret, credential_revision) = match nonempty_secret(input.secret) {
+                Some(secret) => (
+                    Some(encrypt_git_secret(state, &secret)?),
+                    Some(Uuid::new_v4().to_string()),
+                ),
+                None if current.mode == GitAuthMode::HttpsBasic && current.encrypted_secret.is_some() => {
+                    (current.encrypted_secret, current.credential_revision)
+                }
                 None => return Err((StatusCode::BAD_REQUEST, "switching to HTTPS auth requires a password or token".into())),
             };
             Ok(StoredGitAuth {
                 mode: GitAuthMode::HttpsBasic,
                 username: Some(username),
                 encrypted_secret,
+                credential_revision,
             })
         }
     }
@@ -1678,5 +1739,10 @@ mod tests {
         assert!(!review_failures_exhausted(REVIEW_FAILURE_LIMIT - 1));
         assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT));
         assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT + 1));
+    }
+
+    #[test]
+    fn default_session_affinity_window_is_fifteen_minutes() {
+        assert_eq!(DEFAULT_SESSION_AFFINITY_SECONDS, 15 * 60);
     }
 }

@@ -13,8 +13,10 @@ use uuid::Uuid;
 
 mod runtime;
 mod sandbox;
+mod session;
 use runtime::{AgentRuntime, PiRuntime};
 use sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
+use session::{SessionManager, SessionRole};
 
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
@@ -94,6 +96,8 @@ struct AgentAuthDelivery {
 struct WorkerCleanup {
     task_id: Uuid,
     project_slug: String,
+    #[serde(default)]
+    role: SessionRole,
 }
 
 struct GitAuthContext {
@@ -319,6 +323,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
     let mut next_capability_probe = Instant::now() + Duration::from_secs(60);
     let mut active_jobs = JoinSet::<anyhow::Result<()>>::new();
+    let session_manager = SessionManager::new(&args.state_dir);
 
     loop {
         while let Some(result) = active_jobs.try_join_next() {
@@ -333,7 +338,7 @@ async fn async_main() -> anyhow::Result<()> {
             sleep(Duration::from_secs(5)).await;
             continue;
         }
-        if let Err(error) = process_cleanup(&client, &server, &worker_credential, worker_id, &args.workspace_dir, &args.state_dir).await {
+        if let Err(error) = process_cleanup(&client, &server, &worker_credential, worker_id, &args.workspace_dir, &args.state_dir, &session_manager).await {
             warn!(%error, "post-merge cleanup poll failed");
         }
         match poll_agent_auth(&client, &server, &worker_credential, worker_id).await {
@@ -398,13 +403,19 @@ async fn async_main() -> anyhow::Result<()> {
                         let execution_id = assignment.execution.id;
                         let project_slug = assignment.project.slug.clone();
                         info!(task = %task_id, execution = %execution_id, project = %project_slug, active = active_jobs.len() + 1, slots = max_slots, "claimed implementation slot");
-                        let session_dir = args.state_dir.join("sessions").join(task_id.to_string());
+                        let session = match session_manager.acquire(task_id, SessionRole::Implementation, &runtime_config.agent.agent_type).await {
+                            Ok(session) => session,
+                            Err(error) => {
+                                error!(%error, %execution_id, %task_id, "failed to acquire implementation agent session");
+                                break;
+                            }
+                        };
                         let runtime = match runtime_for_config(
                             &runtime_config.agent,
                             &pi_bin,
                             legacy_provider.as_deref(),
                             legacy_model.as_deref(),
-                            session_dir,
+                            session.data_dir.clone(),
                             agent_sandbox.clone(),
                         ) {
                             Ok(runtime) => runtime,
@@ -420,6 +431,7 @@ async fn async_main() -> anyhow::Result<()> {
                         let slot_workspace_root = args.workspace_dir.clone();
                         let slot_sandbox = agent_sandbox.clone();
                         let slot_prompt = runtime_config.agent.initial_prompt.clone();
+                        let slot_session_name = session.backend_session_id.clone();
                         active_jobs.spawn(async move {
                             execute_assignment(
                                 &slot_client,
@@ -429,6 +441,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 &slot_sandbox,
                                 runtime,
                                 &slot_prompt,
+                                &slot_session_name,
                                 assignment,
                             ).await.with_context(|| format!("execution {execution_id} task {task_id} project {project_slug}"))
                         });
@@ -446,13 +459,19 @@ async fn async_main() -> anyhow::Result<()> {
                         let review_id = assignment.review.id;
                         let project_slug = assignment.project.slug.clone();
                         info!(task = %task_id, review = %review_id, project = %project_slug, active = active_jobs.len() + 1, slots = max_slots, "claimed review slot");
-                        let session_dir = args.state_dir.join("review-sessions").join(review_id.to_string());
+                        let session = match session_manager.acquire(task_id, SessionRole::Review, &runtime_config.agent.agent_type).await {
+                            Ok(session) => session,
+                            Err(error) => {
+                                error!(%error, %review_id, %task_id, "failed to acquire reviewer agent session");
+                                break;
+                            }
+                        };
                         let runtime = match runtime_for_config(
                             &runtime_config.agent,
                             &pi_bin,
                             legacy_provider.as_deref(),
                             legacy_model.as_deref(),
-                            session_dir.clone(),
+                            session.data_dir.clone(),
                             agent_sandbox.clone(),
                         ) {
                             Ok(runtime) => runtime,
@@ -468,8 +487,9 @@ async fn async_main() -> anyhow::Result<()> {
                         let slot_workspace_root = args.workspace_dir.clone();
                         let slot_sandbox = agent_sandbox.clone();
                         let slot_prompt = runtime_config.agent.initial_prompt.clone();
+                        let slot_session_name = session.backend_session_id.clone();
                         active_jobs.spawn(async move {
-                            let result = execute_review_assignment(
+                            execute_review_assignment(
                                 &slot_client,
                                 &slot_server,
                                 &slot_credential,
@@ -477,10 +497,9 @@ async fn async_main() -> anyhow::Result<()> {
                                 &slot_sandbox,
                                 runtime,
                                 &slot_prompt,
+                                &slot_session_name,
                                 assignment,
-                            ).await.with_context(|| format!("review {review_id} task {task_id} project {project_slug}"));
-                            if session_dir.exists() { let _ = tokio::fs::remove_dir_all(session_dir).await; }
-                            result
+                            ).await.with_context(|| format!("review {review_id} task {task_id} project {project_slug}"))
                         });
                         true
                     }
@@ -743,21 +762,37 @@ fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option
     }))
 }
 
-async fn process_cleanup(client: &Client, server: &str, credential: &str, worker_id: Uuid, workspace_root: &Path, state_dir: &Path) -> anyhow::Result<()> {
+async fn process_cleanup(client: &Client, server: &str, credential: &str, worker_id: Uuid, workspace_root: &Path, state_dir: &Path, session_manager: &SessionManager) -> anyhow::Result<()> {
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/cleanup")), credential).send().await?;
     let items: Vec<WorkerCleanup> = ensure_success(response).await?.json().await?;
     for item in items {
-        let workspace = workspace_root.join(&item.project_slug).join(item.task_id.to_string());
-        if workspace.exists() {
-            tokio::fs::remove_dir_all(&workspace).await?;
+        match item.role {
+            SessionRole::Implementation => {
+                let workspace = workspace_root.join(&item.project_slug).join(item.task_id.to_string());
+                if workspace.exists() { tokio::fs::remove_dir_all(&workspace).await?; }
+                let agent_workspace = state_dir.join("agent-workspaces").join(item.task_id.to_string());
+                if agent_workspace.exists() { tokio::fs::remove_dir_all(&agent_workspace).await?; }
+            }
+            SessionRole::Review => {
+                let agent_workspace = state_dir.join("agent-review-workspaces").join(item.task_id.to_string());
+                if agent_workspace.exists() { tokio::fs::remove_dir_all(&agent_workspace).await?; }
+            }
         }
-        let session_dir = state_dir.join("sessions").join(item.task_id.to_string());
-        if session_dir.exists() { tokio::fs::remove_dir_all(&session_dir).await?; }
-        let agent_workspace = state_dir.join("agent-workspaces").join(item.task_id.to_string());
-        if agent_workspace.exists() { tokio::fs::remove_dir_all(&agent_workspace).await?; }
-        let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/cleanup/{}", item.task_id)), credential).send().await?;
-        ensure_success(response).await?;
-        info!(task = %item.task_id, "merged task workspace and agent session cleaned up");
+        session_manager.release(item.task_id, item.role).await?;
+        let response = worker_auth(
+            client.post(format!("{server}/api/workers/{worker_id}/cleanup/{}/{}", item.task_id, item.role.as_str())),
+            credential,
+        ).send().await?;
+        if response.status() == StatusCode::NOT_FOUND && item.role == SessionRole::Implementation {
+            let legacy = worker_auth(
+                client.post(format!("{server}/api/workers/{worker_id}/cleanup/{}", item.task_id)),
+                credential,
+            ).send().await?;
+            ensure_success(legacy).await?;
+        } else {
+            ensure_success(response).await?;
+        }
+        info!(task = %item.task_id, role = item.role.as_str(), "merged task logical agent session cleaned up");
     }
     Ok(())
 }
@@ -790,6 +825,7 @@ async fn execute_review_assignment(
     sandbox: &AgentSandbox,
     runtime: Arc<dyn AgentRuntime>,
     initial_prompt: &str,
+    session_name: &str,
     assignment: ReviewAssignment,
 ) -> anyhow::Result<()> {
     let review_id = assignment.review.id;
@@ -813,6 +849,7 @@ async fn execute_review_assignment(
         }
     }));
 
+    let task_id = assignment.task.id;
     let workspace = workspace_root
         .join(".reviews")
         .join(&assignment.project.slug)
@@ -820,10 +857,10 @@ async fn execute_review_assignment(
     let auth = GitAuthContext::broker(worker_credential, &assignment.lease_capability);
     let outcome = match prepare_review_workspace(&workspace, &assignment, &auth).await {
         Ok(()) => {
-            let agent_workspace = sandbox.reviewer_workspace(review_id);
+            let agent_workspace = sandbox.reviewer_workspace(task_id);
             prepare_agent_workspace(&workspace, &agent_workspace, assignment.checkout.base_sha.as_deref()).await?;
             let prompt = build_review_prompt(initial_prompt, &assignment)?;
-            match runtime.run_review(&agent_workspace, &prompt, &review_id.to_string()).await {
+            match runtime.run_review(&agent_workspace, &prompt, session_name).await {
                 Ok(agent) => {
                     let dirty = git_status_external_worktree(&workspace, &agent_workspace)
                         .await
@@ -859,8 +896,9 @@ async fn execute_review_assignment(
     ensure_success(response).await?;
     info!(%review_id, "server accepted review finish");
     if workspace.exists() { let _ = tokio::fs::remove_dir_all(&workspace).await; }
-    let agent_workspace = sandbox.reviewer_workspace(review_id);
+    let agent_workspace = sandbox.reviewer_workspace(task_id);
     if agent_workspace.exists() { let _ = tokio::fs::remove_dir_all(&agent_workspace).await; }
+    // The backend session itself is retained by SessionManager until merged.
     Ok(())
 }
 
@@ -946,6 +984,7 @@ async fn execute_assignment(
     sandbox: &AgentSandbox,
     runtime: Arc<dyn AgentRuntime>,
     initial_prompt: &str,
+    session_name: &str,
     assignment: Assignment,
 ) -> anyhow::Result<()> {
     let execution_id = assignment.execution.id;
@@ -970,7 +1009,7 @@ async fn execute_assignment(
     }));
 
     let auth = GitAuthContext::broker(worker_credential, &assignment.lease_capability);
-    let outcome = run_task(workspace_root, sandbox, runtime, initial_prompt, &assignment, &auth).await;
+    let outcome = run_task(workspace_root, sandbox, runtime, initial_prompt, session_name, &assignment, &auth).await;
     renew.abort();
 
     let result = match outcome {
@@ -1001,14 +1040,13 @@ async fn execute_assignment(
     Ok(())
 }
 
-async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
+async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, session_name: &str, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
     let workspace = trusted_task_workspace(workspace_root, &assignment.project.slug, assignment.task.id);
     let base_sha = prepare_workspace(&workspace, assignment, git_auth).await?;
     let agent_workspace = sandbox.agent_workspace(assignment.task.id);
     prepare_agent_workspace(&workspace, &agent_workspace, Some(&base_sha)).await?;
     let prompt = build_prompt(initial_prompt, assignment);
-    let session_name = assignment.task.id.to_string();
-    let agent = runtime.run(&agent_workspace, &prompt, &session_name).await?;
+    let agent = runtime.run(&agent_workspace, &prompt, session_name).await?;
     sync_agent_workspace(&agent_workspace, &workspace).await?;
     auto_commit(&workspace, assignment).await?;
     let head_sha = git_output(&workspace, &["rev-parse", "HEAD"]).await?;
