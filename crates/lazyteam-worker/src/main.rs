@@ -1093,6 +1093,22 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
         let base = git_output(path, &["rev-parse", "FETCH_HEAD"]).await?;
         command_ok(path, "git", &["update-ref", &default_ref, &base]).await?;
         command_ok(path, "git", &["checkout", &branch]).await?;
+        let already_based = trusted_git_command().args(["merge-base", "--is-ancestor", &base, "HEAD"]).current_dir(path).status().await?;
+        if !already_based.success() {
+            let merge = trusted_git_command()
+                .args(["-c", &format!("user.name={}", assignment.project.contributor.name)])
+                .args(["-c", &format!("user.email={}", assignment.project.contributor.email)])
+                .args(["merge", "--no-edit", &base])
+                .current_dir(path)
+                .output().await?;
+            if !merge.status.success() {
+                let conflicts = git_output(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+                if conflicts.trim().is_empty() {
+                    bail!("merge current base into task branch failed: {}", String::from_utf8_lossy(&merge.stderr));
+                }
+                warn!(%conflicts, "task retry opened with merge conflicts for the agent to resolve");
+            }
+        }
         return Ok(base);
     }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
@@ -1125,7 +1141,11 @@ async fn install_workspace_excludes(path: &Path) -> anyhow::Result<()> {
 }
 
 async fn auto_commit(path: &Path, assignment: &Assignment) -> anyhow::Result<()> {
-    command_ok(path, "git", &["reset"]).await?;
+    let git_dir = git_output(path, &["rev-parse", "--git-dir"]).await?;
+    let git_dir = if Path::new(&git_dir).is_absolute() { PathBuf::from(git_dir) } else { path.join(git_dir) };
+    if !git_dir.join("MERGE_HEAD").exists() {
+        command_ok(path, "git", &["reset"]).await?;
+    }
     command_ok(path, "git", &["add", "-A"]).await?;
     let status = trusted_git_command().args(["diff", "--cached", "--quiet"]).current_dir(path).status().await?;
     if status.success() { return Ok(()); }

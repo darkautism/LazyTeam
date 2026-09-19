@@ -8,7 +8,7 @@ output="$(
   docker run --rm \
     --read-only \
     --tmpfs /tmp:size=64m,mode=1777 \
-    --tmpfs /app/state:size=2g,mode=0755 \
+    --tmpfs /app/state:rw,exec,size=2g,mode=0755 \
     --tmpfs /app/workspaces:size=512m,mode=0755 \
     --cap-drop ALL \
     --cap-add CHOWN \

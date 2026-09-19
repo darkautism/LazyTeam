@@ -672,6 +672,11 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
         return Err((StatusCode::BAD_REQUEST, format!("unsupported worker protocol {}; supported {}..={}", input.protocol_version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION)));
     }
     let id = input.id.unwrap_or_else(Uuid::new_v4);
+    let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workers WHERE id=? AND retired_at IS NOT NULL")
+        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    if retired != 0 {
+        return Err((StatusCode::CONFLICT, "retired worker IDs cannot be re-registered; enroll as a new worker".into()));
+    }
     let now = Utc::now();
     let credential = format!("ltw_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let credential_hash = hash_secret(&credential);
@@ -699,31 +704,28 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
 }
 
 pub(crate) async fn list_workers(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Worker>> {
-    let rows = sqlx::query("SELECT * FROM workers ORDER BY name").fetch_all(&state.db).await.map_err(db_error)?;
+    let rows = sqlx::query("SELECT * FROM workers WHERE retired_at IS NULL ORDER BY name").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(worker_from_row).collect::<Result<Vec<_>,_>>().map(Json)
 }
 
 pub(crate) async fn delete_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
     let worker_id = id.to_string();
-    let row = sqlx::query("SELECT running_slots FROM workers WHERE id=?")
+    let row = sqlx::query("SELECT running_slots,retired_at FROM workers WHERE id=?")
         .bind(&worker_id).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let running_slots: i64 = row.try_get("running_slots").map_err(internal)?;
+    let retired_at: Option<String> = row.try_get("retired_at").map_err(internal)?;
+    if retired_at.is_some() { return Ok(StatusCode::NO_CONTENT); }
     if running_slots != 0 {
-        return Err((StatusCode::CONFLICT, "worker has active slots and cannot be deleted".into()));
+        return Err((StatusCode::CONFLICT, "worker has active slots; Stop it before retiring it".into()));
     }
-    let execution_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM executions WHERE worker_id=?")
-        .bind(&worker_id).fetch_one(&state.db).await.map_err(db_error)?;
-    let review_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE reviewer_worker_id=?")
-        .bind(&worker_id).fetch_one(&state.db).await.map_err(db_error)?;
-    if execution_count != 0 || review_count != 0 {
-        return Err((StatusCode::CONFLICT, "worker has task/review history and cannot be deleted without erasing audit history".into()));
-    }
-    let changed = sqlx::query("DELETE FROM workers WHERE id=? AND running_slots=0")
-        .bind(&worker_id).execute(&state.db).await.map_err(db_error)?.rows_affected();
+    let now = ts(Utc::now());
+    let changed = sqlx::query("UPDATE workers SET retired_at=?,credential_hash=NULL,state='draining',running_slots=0 WHERE id=? AND retired_at IS NULL AND running_slots=0")
+        .bind(&now).bind(&worker_id).execute(&state.db).await.map_err(db_error)?.rows_affected();
     if changed == 0 {
-        return Err((StatusCode::CONFLICT, "worker changed while deleting".into()));
+        return Err((StatusCode::CONFLICT, "worker changed while retiring".into()));
     }
+    state.agent_auth_updates.lock().await.remove(&id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1276,7 +1278,7 @@ pub(crate) async fn require_worker(db: &SqlitePool, worker_id: Uuid, headers: &H
         .get(WORKER_CREDENTIAL_HEADER)
         .and_then(|value| value.to_str().ok())
         .ok_or((StatusCode::UNAUTHORIZED, "worker credential required".into()))?;
-    let stored: Option<String> = sqlx::query_scalar("SELECT credential_hash FROM workers WHERE id=?")
+    let stored: Option<String> = sqlx::query_scalar("SELECT credential_hash FROM workers WHERE id=? AND retired_at IS NULL")
         .bind(worker_id.to_string())
         .fetch_optional(db)
         .await

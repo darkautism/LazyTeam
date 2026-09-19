@@ -80,6 +80,12 @@ pub struct WorkerIdParams {
     pub worker_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MergedTaskParams {
+    pub task_id: String,
+    pub merge_commit_sha: String,
+}
+
 
 #[tool_router]
 impl LazyTeamMcp {
@@ -239,7 +245,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "tasks_merge",
         title = "Merge reviewed task",
-        description = "Publish an approved reviewed candidate from the LazyTeam Host to the project's upstream default branch using Host-only Git credentials, then mark the task done and queue worker cleanup. Refuses to publish if the reviewed base or candidate moved.",
+        description = "Publish an approved reviewed candidate from the LazyTeam Host using Host-only Git credentials. Fast-forwards when possible; if upstream moved, merges in a private Host scratch workspace. Merge conflicts are re-dispatched to the implementation worker for resolution and re-review, never to the main agent's filesystem.",
         annotations(
             title = "Merge reviewed task",
             read_only_hint = false,
@@ -257,13 +263,48 @@ impl LazyTeamMcp {
         if evidence.task.state != lazyteam_core::TaskState::MergePending {
             return Err(McpError::internal_error("task must be merge_pending before Host publish", None));
         }
-        let merge_commit_sha = crate::git_broker::publish_reviewed_task(&self.state, &evidence).await.map_err(api_to_mcp)?;
+        let merge_commit_sha = match crate::git_broker::publish_reviewed_task(&self.state, &evidence).await {
+            Ok(sha) => sha,
+            Err((StatusCode::CONFLICT, message)) if message.starts_with("merge conflict with current ") => {
+                let reason = format!("Host merge could not be completed cleanly. {message}. Resolve the merge conflicts against the current default branch, preserve the reviewed task intent, validate the result, and resubmit for review.");
+                let transition = review::retry_task(&self.state, task_id, Some(&reason)).await.map_err(api_to_mcp)?;
+                return json_result(&serde_json::json!({
+                    "task_id": transition.task_id,
+                    "state": transition.state,
+                    "merge_conflict": message,
+                }));
+            }
+            Err(error) => return Err(api_to_mcp(error)),
+        };
         let transition = review::merged_task(&self.state, task_id, &merge_commit_sha).await.map_err(api_to_mcp)?;
         json_result(&serde_json::json!({
             "task_id": transition.task_id,
             "state": transition.state,
             "merge_commit_sha": merge_commit_sha,
         }))
+    }
+
+    #[tool(
+        name = "tasks_merged",
+        title = "Confirm externally merged task",
+        description = "Compatibility recovery for an approved task already merged outside tasks_merge. Verifies the upstream commit contains the exact reviewed file content before marking the task done and queuing cleanup.",
+        annotations(
+            title = "Confirm externally merged task",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn tasks_merged(
+        &self,
+        Parameters(input): Parameters<MergedTaskParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        crate::git_broker::verify_external_merge(&self.state, &evidence, &input.merge_commit_sha).await.map_err(api_to_mcp)?;
+        let transition = review::merged_task(&self.state, task_id, &input.merge_commit_sha).await.map_err(api_to_mcp)?;
+        json_result(&transition)
     }
 
     #[tool(
@@ -332,7 +373,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "workers_delete",
         title = "Delete inactive worker",
-        description = "Delete an inactive LazyTeam worker registration only when it has no execution/review history. Active workers and historical audit records are protected.",
+        description = "Retire an inactive LazyTeam worker from the active pool while preserving execution/review audit history. Active workers must be stopped first.",
         annotations(
             title = "Delete inactive worker",
             read_only_hint = false,
@@ -348,7 +389,7 @@ impl LazyTeamMcp {
         let worker_id = Uuid::parse_str(&input.worker_id)
             .map_err(|e| McpError::invalid_params("invalid worker_id", Some(serde_json::json!({"error": e.to_string()}))))?;
         delete_worker(Path(worker_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        json_result(&serde_json::json!({"worker_id": worker_id, "deleted": true}))
+        json_result(&serde_json::json!({"worker_id": worker_id, "retired": true}))
     }
 }
 

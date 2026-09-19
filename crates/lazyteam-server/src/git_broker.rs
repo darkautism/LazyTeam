@@ -222,74 +222,190 @@ async fn publish_reviewed_task_inner(
     if !mirror.exists() {
         return Err((StatusCode::CONFLICT, "Host project mirror is missing; retry the task to rebuild it".into()));
     }
-    git_ok(
-        auth,
-        Command::new("git")
-            .arg("-C").arg(&mirror)
-            .args(["remote", "set-url", "origin", upstream_url]),
-    ).await?;
-    git_ok(
-        auth,
-        Command::new("git")
-            .arg("-C").arg(&mirror)
-            .args(["fetch", "--prune", "origin"]),
-    ).await?;
+    refresh_project_mirror(&mirror, upstream_url, auth).await?;
     let default_ref = format!("refs/heads/{}", evidence.project.default_branch);
     let upstream_sha = git_output(
         auth,
-        Command::new("git")
-            .arg("-C").arg(&mirror)
-            .args(["rev-parse", "--verify", &default_ref]),
+        Command::new("git").arg("-C").arg(&mirror).args(["rev-parse", "--verify", &default_ref]),
     ).await?;
-    if upstream_sha.trim() != base_sha {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "upstream {} moved after review: reviewed base {}, current {}; retry/rebase before publishing",
-                evidence.project.default_branch,
-                base_sha,
-                upstream_sha.trim(),
-            ),
-        ));
-    }
 
     let task_repo = task_repo_path(state, evidence.execution.id);
+    verify_reviewed_candidate(&task_repo, review_ref, candidate_sha, base_sha).await?;
+
+    if upstream_sha.trim() == base_sha {
+        let destination = format!("{candidate_sha}:{default_ref}");
+        git_ok(
+            auth,
+            Command::new("git").arg("-C").arg(&task_repo).arg("push").arg(upstream_url).arg(destination),
+        ).await?;
+        return Ok(candidate_sha.to_string());
+    }
+
+    merge_in_host_workspace(
+        state,
+        evidence,
+        &mirror,
+        &task_repo,
+        review_ref,
+        upstream_sha.trim(),
+        upstream_url,
+        auth,
+    ).await
+}
+
+async fn refresh_project_mirror(mirror: &Path, upstream_url: &str, auth: &HostGitAuth) -> Result<(), ApiError> {
+    git_ok(
+        auth,
+        Command::new("git").arg("-C").arg(mirror).args(["remote", "set-url", "origin", upstream_url]),
+    ).await?;
+    git_ok(
+        auth,
+        Command::new("git").arg("-C").arg(mirror).args(["fetch", "--prune", "origin"]),
+    ).await
+}
+
+async fn verify_reviewed_candidate(task_repo: &Path, review_ref: &str, candidate_sha: &str, base_sha: &str) -> Result<(), ApiError> {
     if !task_repo.exists() {
         return Err((StatusCode::CONFLICT, "Host task repository is missing".into()));
     }
     let candidate_ref = format!("refs/heads/{review_ref}");
     let actual_candidate = git_output(
         &HostGitAuth::none(),
-        Command::new("git")
-            .arg("-C").arg(&task_repo)
-            .args(["rev-parse", "--verify", &candidate_ref]),
+        Command::new("git").arg("-C").arg(task_repo).args(["rev-parse", "--verify", &candidate_ref]),
     ).await?;
     if actual_candidate.trim() != candidate_sha {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("candidate ref moved after review: expected {candidate_sha}, found {}", actual_candidate.trim()),
-        ));
+        return Err((StatusCode::CONFLICT, format!("candidate ref moved after review: expected {candidate_sha}, found {}", actual_candidate.trim())));
     }
     let merge_base = git_output(
         &HostGitAuth::none(),
-        Command::new("git")
-            .arg("-C").arg(&task_repo)
-            .args(["merge-base", base_sha, candidate_sha]),
+        Command::new("git").arg("-C").arg(task_repo).args(["merge-base", base_sha, candidate_sha]),
     ).await?;
     if merge_base.trim() != base_sha {
         return Err((StatusCode::CONFLICT, "reviewed candidate is not based on the pinned upstream commit".into()));
     }
+    Ok(())
+}
 
-    let destination = format!("{candidate_sha}:refs/heads/{}", evidence.project.default_branch);
-    git_ok(
-        auth,
-        Command::new("git")
-            .arg("-C").arg(&task_repo)
-            .arg("push")
-            .arg(upstream_url)
-            .arg(destination),
+async fn merge_in_host_workspace(
+    state: &AppState,
+    evidence: &api::ReviewEvidence,
+    mirror: &Path,
+    task_repo: &Path,
+    review_ref: &str,
+    upstream_sha: &str,
+    upstream_url: &str,
+    auth: &HostGitAuth,
+) -> Result<String, ApiError> {
+    let merge_root = state.git_root.join("merges");
+    tokio::fs::create_dir_all(&merge_root).await.map_err(internal)?;
+    let workspace = merge_root.join(evidence.task.id.to_string());
+    if workspace.exists() { tokio::fs::remove_dir_all(&workspace).await.map_err(internal)?; }
+
+    let result = async {
+        git_ok(
+            &HostGitAuth::none(),
+            Command::new("git").args(["clone", "--no-checkout"]).arg(mirror).arg(&workspace),
+        ).await?;
+        git_ok(
+            &HostGitAuth::none(),
+            Command::new("git").arg("-C").arg(&workspace).args(["checkout", "-B", "lazyteam-merge", upstream_sha]),
+        ).await?;
+        let candidate_ref = format!("refs/heads/{review_ref}:refs/lazyteam/candidate");
+        git_ok(
+            &HostGitAuth::none(),
+            Command::new("git").arg("-C").arg(&workspace).arg("fetch").arg(task_repo).arg(candidate_ref),
+        ).await?;
+
+        let merge_output = git_run(
+            &HostGitAuth::none(),
+            Command::new("git")
+                .arg("-C").arg(&workspace)
+                .args(["-c", &format!("user.name={}", evidence.project.contributor.name)])
+                .args(["-c", &format!("user.email={}", evidence.project.contributor.email)])
+                .args(["merge", "--no-edit", "refs/lazyteam/candidate"]),
+        ).await?;
+        if !merge_output.status.success() {
+            let conflicts = git_output(
+                &HostGitAuth::none(),
+                Command::new("git").arg("-C").arg(&workspace).args(["diff", "--name-only", "--diff-filter=U"]),
+            ).await.unwrap_or_default();
+            let detail = if conflicts.trim().is_empty() {
+                String::from_utf8_lossy(&merge_output.stderr).trim().to_string()
+            } else {
+                conflicts.lines().collect::<Vec<_>>().join(", ")
+            };
+            return Err((StatusCode::CONFLICT, format!("merge conflict with current {} {}: {detail}", evidence.project.default_branch, upstream_sha)));
+        }
+        let merged_sha = git_output(
+            &HostGitAuth::none(),
+            Command::new("git").arg("-C").arg(&workspace).args(["rev-parse", "HEAD"]),
+        ).await?;
+        let destination = format!("{}:refs/heads/{}", merged_sha.trim(), evidence.project.default_branch);
+        git_ok(
+            auth,
+            Command::new("git").arg("-C").arg(&workspace).arg("push").arg(upstream_url).arg(destination),
+        ).await?;
+        Ok(merged_sha.trim().to_string())
+    }.await;
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    result
+}
+
+pub(crate) async fn verify_external_merge(
+    state: &AppState,
+    evidence: &api::ReviewEvidence,
+    merge_commit_sha: &str,
+) -> Result<(), ApiError> {
+    let candidate_sha = evidence.checkout.commit_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate commit".into()))?;
+    let base_sha = evidence.checkout.base_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no pinned base commit".into()))?;
+    let review_ref = evidence.checkout.review_ref.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate ref".into()))?;
+    let task_repo = task_repo_path(state, evidence.execution.id);
+    verify_reviewed_candidate(&task_repo, review_ref, candidate_sha, base_sha).await?;
+
+    let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
+        .bind(evidence.project.id.to_string()).fetch_one(&state.db).await.map_err(internal)?;
+    let credential = api::git_credential_from_row(state, &project_row)?;
+    let upstream_url = upstream_repo_url(&evidence.project.repo_url, &credential).map_err(internal)?;
+    let auth = HostGitAuth::prepare(state, &credential).await.map_err(internal)?;
+    let result = async {
+        let mirror = project_mirror(state, evidence.project.id);
+        refresh_project_mirror(&mirror, &upstream_url, &auth).await?;
+        let default_ref = format!("refs/heads/{}", evidence.project.default_branch);
+        let ancestor = git_run(
+            &HostGitAuth::none(),
+            Command::new("git").arg("-C").arg(&mirror).args(["merge-base", "--is-ancestor", merge_commit_sha, &default_ref]),
+        ).await?;
+        if !ancestor.status.success() {
+            return Err((StatusCode::CONFLICT, format!("merge commit {merge_commit_sha} is not on current {}", evidence.project.default_branch)));
+        }
+        let changed = git_output(
+            &HostGitAuth::none(),
+            Command::new("git").arg("-C").arg(&task_repo).args(["diff", "--name-only", base_sha, candidate_sha]),
+        ).await?;
+        for path in changed.lines().filter(|path| !path.is_empty()) {
+            let candidate = git_object_id(&task_repo, &format!("{candidate_sha}:{path}")).await?;
+            let merged = git_object_id(&mirror, &format!("{merge_commit_sha}:{path}")).await?;
+            if candidate != merged {
+                return Err((StatusCode::CONFLICT, format!("external merge does not preserve reviewed content for {path}")));
+            }
+        }
+        Ok(())
+    }.await;
+    auth.cleanup().await;
+    result
+}
+
+async fn git_object_id(repo: &Path, spec: &str) -> Result<Option<String>, ApiError> {
+    let output = git_run(
+        &HostGitAuth::none(),
+        Command::new("git").arg("-C").arg(repo).args(["rev-parse", "--verify", spec]),
     ).await?;
-    Ok(candidate_sha.to_string())
+    if output.status.success() {
+        Ok(Some(String::from_utf8(output.stdout).map_err(internal)?.trim().to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) async fn remove_task_repo(state: &AppState, execution_id: Uuid) -> Result<(), ApiError> {
