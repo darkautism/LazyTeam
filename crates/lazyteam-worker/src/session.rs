@@ -1,10 +1,16 @@
-use std::{path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRole {
     Implementation,
@@ -35,62 +41,116 @@ pub struct AgentSession {
     pub last_used_at_unix: u64,
 }
 
+/// RAII guard serializing all metadata updates for one logical
+/// (task, role). The scheduler holds it across acquire → run → bind so
+/// concurrent first runs cannot create duplicate backend sessions and orphan
+/// one; direct `acquire` / `bind_backend_session` / `release` calls take it
+/// internally for their read-modify-write critical sections.
+#[derive(Debug)]
+pub struct SessionLock {
+    key: (Uuid, SessionRole),
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     state_dir: PathBuf,
+    locks: Arc<Mutex<HashMap<(Uuid, SessionRole), Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl SessionManager {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
-        Self { state_dir: state_dir.into() }
+        Self {
+            state_dir: state_dir.into(),
+            locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Hold the (task, role) lock across a full acquire → run → bind sequence
+    /// to prevent concurrent retries from creating duplicate backend sessions.
+    pub async fn lock_session(&self, task_id: Uuid, role: SessionRole) -> SessionLock {
+        let entry = {
+            let mut table = self
+                .locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table
+                .entry((task_id, role))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let guard = entry.lock_owned().await;
+        SessionLock {
+            key: (task_id, role),
+            _guard: guard,
+        }
+    }
+
+    fn check_lock(lock: &SessionLock, task_id: Uuid, role: SessionRole) -> anyhow::Result<()> {
+        if lock.key == (task_id, role) {
+            Ok(())
+        } else {
+            bail!("session lock covers a different (task, role)");
+        }
     }
 
     pub async fn acquire(&self, task_id: Uuid, role: SessionRole, backend: &str) -> anyhow::Result<AgentSession> {
+        let guard = self.lock_session(task_id, role).await;
+        self.acquire_with(&guard, task_id, role, backend).await
+    }
+
+    pub async fn acquire_with(
+        &self,
+        lock: &SessionLock,
+        task_id: Uuid,
+        role: SessionRole,
+        backend: &str,
+    ) -> anyhow::Result<AgentSession> {
+        Self::check_lock(lock, task_id, role)?;
         let backend = backend.trim();
         if backend.is_empty() {
             bail!("backend must not be empty");
         }
         let scoped_path = self.metadata_path(task_id, role, backend);
-        if let Ok(raw) = tokio::fs::read_to_string(&scoped_path).await {
-            if let Ok(mut session) = serde_json::from_str::<AgentSession>(&raw) {
-                if session.backend == backend {
-                    if session.backend_session_id.is_none() {
-                        if let Some(legacy) = legacy_backend_session_id(backend, task_id, role) {
-                            session.backend_session_id = Some(legacy);
-                        }
-                    }
-                    session.last_used_at_unix = now_unix();
-                    self.persist_atomic(&scoped_path, &session).await?;
-                    return Ok(session);
+        if let Some(session) = self.load_matching(&scoped_path, backend).await {
+            let mut session = session;
+            // Never clobber a bound opaque ID: only backfill Pi's historical
+            // caller-chosen ID when no binding exists yet.
+            if session.backend_session_id.is_none() {
+                if let Some(legacy) = legacy_backend_session_id(backend, task_id, role) {
+                    session.backend_session_id = Some(legacy);
                 }
             }
+            session.last_used_at_unix = now_unix();
+            self.persist_atomic(&scoped_path, &session).await?;
+            return Ok(session);
         }
 
-        // Migrate a legacy single-record file (pre-backend-scoping) when it
-        // belongs to the requested backend. The historical data_dir is kept
-        // so in-flight Pi sessions survive without recreation.
-        let legacy_path = self.legacy_metadata_path(task_id, role);
-        if let Ok(raw) = tokio::fs::read_to_string(&legacy_path).await {
-            if let Ok(mut session) = serde_json::from_str::<AgentSession>(&raw) {
-                if session.backend == backend {
-                    if session.backend_session_id.is_none() {
-                        if let Some(legacy) = legacy_backend_session_id(backend, task_id, role) {
-                            session.backend_session_id = Some(legacy);
-                        }
-                    }
-                    session.last_used_at_unix = now_unix();
-                    tokio::fs::create_dir_all(&session.data_dir).await.with_context(|| {
-                        format!("create {} session directory", role.as_str())
-                    })?;
-                    self.persist_atomic(&scoped_path, &session).await?;
-                    let _ = tokio::fs::remove_file(&legacy_path).await;
-                    return Ok(session);
+        // Adopt a record written before backend scoping (legacy single-record
+        // or a previous sanitized-only name) when it belongs to the requested
+        // backend. The historical data_dir is kept so in-flight sessions
+        // survive without recreation.
+        if let Some((session, source)) = self.load_adoptable(task_id, role, backend).await {
+            let mut session = session;
+            if session.backend_session_id.is_none() {
+                if let Some(legacy) = legacy_backend_session_id(backend, task_id, role) {
+                    session.backend_session_id = Some(legacy);
                 }
             }
+            session.last_used_at_unix = now_unix();
+            tokio::fs::create_dir_all(&session.data_dir)
+                .await
+                .with_context(|| format!("create {} session directory", role.as_str()))?;
+            self.persist_atomic(&scoped_path, &session).await?;
+            if source != scoped_path {
+                let _ = tokio::fs::remove_file(&source).await;
+            }
+            return Ok(session);
         }
 
         let data_dir = self.data_dir_for(task_id, role, backend);
-        tokio::fs::create_dir_all(&data_dir).await
+        tokio::fs::create_dir_all(&data_dir)
+            .await
             .with_context(|| format!("create {} session directory", role.as_str()))?;
         let session = AgentSession {
             task_id,
@@ -116,6 +176,20 @@ impl SessionManager {
         backend: &str,
         backend_session_id: &str,
     ) -> anyhow::Result<AgentSession> {
+        let guard = self.lock_session(task_id, role).await;
+        self.bind_with(&guard, task_id, role, backend, backend_session_id)
+            .await
+    }
+
+    pub async fn bind_with(
+        &self,
+        lock: &SessionLock,
+        task_id: Uuid,
+        role: SessionRole,
+        backend: &str,
+        backend_session_id: &str,
+    ) -> anyhow::Result<AgentSession> {
+        Self::check_lock(lock, task_id, role)?;
         let backend = backend.trim();
         if backend.is_empty() {
             bail!("backend must not be empty");
@@ -125,37 +199,31 @@ impl SessionManager {
             bail!("backend session ID must not be empty");
         }
         let scoped_path = self.metadata_path(task_id, role, backend);
-        if let Ok(raw) = tokio::fs::read_to_string(&scoped_path).await {
-            if let Ok(mut session) = serde_json::from_str::<AgentSession>(&raw) {
-                if session.backend == backend {
-                    session.backend_session_id = Some(backend_session_id.to_string());
-                    session.last_used_at_unix = now_unix();
-                    self.persist_atomic(&scoped_path, &session).await?;
-                    return Ok(session);
-                }
-            }
+        if let Some(mut session) = self.load_matching(&scoped_path, backend).await {
+            session.backend_session_id = Some(backend_session_id.to_string());
+            session.last_used_at_unix = now_unix();
+            self.persist_atomic(&scoped_path, &session).await?;
+            return Ok(session);
         }
 
-        // Adopt a matching legacy record (preserving its historical data_dir)
-        // rather than abandoning in-flight session data.
-        let legacy_path = self.legacy_metadata_path(task_id, role);
-        if let Ok(raw) = tokio::fs::read_to_string(&legacy_path).await {
-            if let Ok(mut session) = serde_json::from_str::<AgentSession>(&raw) {
-                if session.backend == backend {
-                    session.backend_session_id = Some(backend_session_id.to_string());
-                    session.last_used_at_unix = now_unix();
-                    tokio::fs::create_dir_all(&session.data_dir).await.with_context(|| {
-                        format!("create {} session directory", role.as_str())
-                    })?;
-                    self.persist_atomic(&scoped_path, &session).await?;
-                    let _ = tokio::fs::remove_file(&legacy_path).await;
-                    return Ok(session);
-                }
+        // Adopt a matching pre-scoping record (preserving its historical
+        // data_dir) rather than abandoning in-flight session data.
+        if let Some((mut session, source)) = self.load_adoptable(task_id, role, backend).await {
+            session.backend_session_id = Some(backend_session_id.to_string());
+            session.last_used_at_unix = now_unix();
+            tokio::fs::create_dir_all(&session.data_dir)
+                .await
+                .with_context(|| format!("create {} session directory", role.as_str()))?;
+            self.persist_atomic(&scoped_path, &session).await?;
+            if source != scoped_path {
+                let _ = tokio::fs::remove_file(&source).await;
             }
+            return Ok(session);
         }
 
         let data_dir = self.data_dir_for(task_id, role, backend);
-        tokio::fs::create_dir_all(&data_dir).await
+        tokio::fs::create_dir_all(&data_dir)
+            .await
             .with_context(|| format!("create {} session directory", role.as_str()))?;
         let session = AgentSession {
             task_id,
@@ -172,30 +240,58 @@ impl SessionManager {
     /// Remove every backend-scoped record plus any legacy record for this
     /// logical (task, role), along with each record's backend-local data dir.
     /// `release` is intentionally backend-agnostic: cleanup items carry only
-    /// (task, role).
+    /// (task, role). Unlike earlier revisions, removal and enumeration
+    /// failures (other than not-found) are propagated so cleanup is never
+    /// acknowledged while data remains.
     pub async fn release(&self, task_id: Uuid, role: SessionRole) -> anyhow::Result<()> {
+        let guard = self.lock_session(task_id, role).await;
+        self.release_with(&guard, task_id, role).await
+    }
+
+    pub async fn release_with(
+        &self,
+        lock: &SessionLock,
+        task_id: Uuid,
+        role: SessionRole,
+    ) -> anyhow::Result<()> {
+        Self::check_lock(lock, task_id, role)?;
         let mut data_dirs: Vec<PathBuf> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
 
         let scoped_dir = self.scoped_dir(task_id, role);
-        if let Ok(mut entries) = tokio::fs::read_dir(&scoped_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(raw) = tokio::fs::read_to_string(&path).await {
-                    if let Ok(session) = serde_json::from_str::<AgentSession>(&raw) {
-                        data_dirs.push(session.data_dir);
+        match tokio::fs::read_dir(&scoped_dir).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+                        if let Ok(session) = serde_json::from_str::<AgentSession>(&raw) {
+                            data_dirs.push(session.data_dir);
+                        }
                     }
                 }
             }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!(
+                "list {}: {error:#}",
+                scoped_dir.display()
+            )),
         }
 
         let legacy_path = self.legacy_metadata_path(task_id, role);
-        if let Ok(raw) = tokio::fs::read_to_string(&legacy_path).await {
-            if let Ok(session) = serde_json::from_str::<AgentSession>(&raw) {
-                data_dirs.push(session.data_dir);
+        match tokio::fs::read_to_string(&legacy_path).await {
+            Ok(raw) => {
+                if let Ok(session) = serde_json::from_str::<AgentSession>(&raw) {
+                    data_dirs.push(session.data_dir);
+                }
             }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!(
+                "read {}: {error:#}",
+                legacy_path.display()
+            )),
         }
         // Fallbacks for records that predate backend scoping or whose
         // metadata was already removed.
@@ -208,28 +304,84 @@ impl SessionManager {
             SessionRole::Implementation => self.state_dir.join("sessions"),
             SessionRole::Review => self.state_dir.join("review-sessions"),
         };
-        if let Ok(mut entries) = tokio::fs::read_dir(&session_base).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str().map(str::to_string) {
-                    if name == task_id.to_string() || name.starts_with(&format!("{task_id}.")) {
-                        data_dirs.push(entry.path());
+        match tokio::fs::read_dir(&session_base).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if let Some(name) = entry.file_name().to_str().map(str::to_string) {
+                        if name == task_id.to_string() || name.starts_with(&format!("{task_id}.")) {
+                            data_dirs.push(entry.path());
+                        }
                     }
                 }
             }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!(
+                "list {}: {error:#}",
+                session_base.display()
+            )),
         }
 
         for dir in data_dirs {
             if dir.exists() {
-                let _ = tokio::fs::remove_dir_all(&dir).await;
+                if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+                    if error.kind() != ErrorKind::NotFound {
+                        failures.push(format!("remove {}: {error:#}", dir.display()));
+                    }
+                }
             }
         }
         if scoped_dir.exists() {
-            let _ = tokio::fs::remove_dir_all(&scoped_dir).await;
+            if let Err(error) = tokio::fs::remove_dir_all(&scoped_dir).await {
+                if error.kind() != ErrorKind::NotFound {
+                    failures.push(format!("remove {}: {error:#}", scoped_dir.display()));
+                }
+            }
         }
         if legacy_path.exists() {
-            let _ = tokio::fs::remove_file(&legacy_path).await;
+            if let Err(error) = tokio::fs::remove_file(&legacy_path).await {
+                if error.kind() != ErrorKind::NotFound {
+                    failures.push(format!("remove {}: {error:#}", legacy_path.display()));
+                }
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!("session cleanup incomplete: {}", failures.join("; "))
+        }
+    }
+
+    /// Load the scoped record only when its embedded backend matches the
+    /// requested backend. The filename is a lookup hint; the raw
+    /// `session.backend` field is the identity.
+    async fn load_matching(&self, path: &Path, backend: &str) -> Option<AgentSession> {
+        let raw = tokio::fs::read_to_string(path).await.ok()?;
+        let session = serde_json::from_str::<AgentSession>(&raw).ok()?;
+        (session.backend == backend).then_some(session)
+    }
+
+    /// Adoptable pre-scoping records: the legacy single-record file and the
+    /// previous sanitized-only name. Returns the record plus the path it was
+    /// read from so the caller can migrate it.
+    async fn load_adoptable(
+        &self,
+        task_id: Uuid,
+        role: SessionRole,
+        backend: &str,
+    ) -> Option<(AgentSession, PathBuf)> {
+        let mut candidates = Vec::new();
+        let previous = self.previous_scoped_path(task_id, role, backend);
+        let current = self.metadata_path(task_id, role, backend);
+        if previous != current {
+            candidates.push(previous);
+        }
+        candidates.push(self.legacy_metadata_path(task_id, role));
+        for path in candidates {
+            if let Some(session) = self.load_matching(&path, backend).await {
+                return Some((session, path));
+            }
+        }
+        None
     }
 
     fn scoped_dir(&self, task_id: Uuid, role: SessionRole) -> PathBuf {
@@ -240,6 +392,13 @@ impl SessionManager {
     }
 
     fn metadata_path(&self, task_id: Uuid, role: SessionRole, backend: &str) -> PathBuf {
+        self.scoped_dir(task_id, role)
+            .join(format!("{}.json", backend_file_key(backend)))
+    }
+
+    /// Previous sanitized-only naming (no hash suffix), checked only as a
+    /// migration source for state written before collision-free keys.
+    fn previous_scoped_path(&self, task_id: Uuid, role: SessionRole, backend: &str) -> PathBuf {
         self.scoped_dir(task_id, role)
             .join(format!("{}.json", sanitize_backend(backend)))
     }
@@ -258,17 +417,17 @@ impl SessionManager {
             SessionRole::Implementation => self.state_dir.join("sessions"),
             SessionRole::Review => self.state_dir.join("review-sessions"),
         };
-        if backend == "pi" {
+        if backend.trim() == "pi" {
             base.join(task_id.to_string())
         } else {
-            base.join(format!("{task_id}.{}", sanitize_backend(backend)))
+            base.join(format!("{task_id}.{}", backend_file_key(backend)))
         }
     }
 
-    /// Atomic, concurrency-safe metadata update: serialize fully, write to a
-    /// unique temp file in the same directory, then rename over the target.
-    /// Readers therefore never observe a truncated record, and concurrent
-    /// writers resolve to last-writer-wins with an intact document.
+    /// Atomic metadata update: serialize fully, write to a unique temp file
+    /// in the same directory, then rename over the target. Readers therefore
+    /// never observe a truncated record. Callers must hold the session lock
+    /// so concurrent read-modify-write cycles cannot lose updates.
     async fn persist_atomic(&self, path: &Path, session: &AgentSession) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -287,6 +446,29 @@ impl SessionManager {
         result.with_context(|| format!("persist session {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Collision-free backend key: a readable sanitized prefix plus an FNV-1a
+/// hash of the exact backend string, so distinct backends such as
+/// `opencode/foo` and `opencode_foo` never share a metadata file or data
+/// directory. The raw backend string (stored in `AgentSession.backend`) is
+/// the identity; the key is only a lookup hint. `pi` keeps the bare historic
+/// name.
+fn backend_file_key(backend: &str) -> String {
+    let backend = backend.trim();
+    if backend == "pi" {
+        return "pi".to_string();
+    }
+    format!("{}-{:016x}", sanitize_backend(backend), fnv1a64(backend))
+}
+
+fn fnv1a64(value: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn sanitize_backend(backend: &str) -> String {
@@ -415,6 +597,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn similar_backend_names_never_share_identity_or_data_dir() {
+        let root = std::env::temp_dir().join(format!("lazyteam-session-collide-{}", Uuid::new_v4()));
+        let manager = SessionManager::new(&root);
+        let task_id = Uuid::new_v4();
+        // `opencode/foo` and `opencode_foo` sanitize identically but are
+        // distinct backends and must not collide.
+        assert_ne!(backend_file_key("opencode/foo"), backend_file_key("opencode_foo"));
+        let slash = manager.bind_backend_session(task_id, SessionRole::Implementation, "opencode/foo", "ses_slash").await.unwrap();
+        let underscore = manager.bind_backend_session(task_id, SessionRole::Implementation, "opencode_foo", "ses_underscore").await.unwrap();
+        assert_ne!(slash.data_dir, underscore.data_dir);
+        let back_slash = manager.acquire(task_id, SessionRole::Implementation, "opencode/foo").await.unwrap();
+        assert_eq!(back_slash.backend_session_id.as_deref(), Some("ses_slash"));
+        assert_eq!(back_slash.data_dir, slash.data_dir);
+        let back_underscore = manager.acquire(task_id, SessionRole::Implementation, "opencode_foo").await.unwrap();
+        assert_eq!(back_underscore.backend_session_id.as_deref(), Some("ses_underscore"));
+        assert_eq!(back_underscore.data_dir, underscore.data_dir);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn concurrent_binds_leave_intact_metadata() {
         let root = std::env::temp_dir().join(format!("lazyteam-session-conc-{}", Uuid::new_v4()));
         let manager = SessionManager::new(&root);
@@ -462,6 +664,88 @@ mod tests {
             dirs.push(handle.await.unwrap().unwrap().data_dir);
         }
         assert!(dirs.iter().all(|d| *d == dirs[0]));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn guarded_first_runs_create_only_one_backend_session() {
+        use std::sync::Arc;
+
+        let root = std::env::temp_dir().join(format!("lazyteam-session-guard-{}", Uuid::new_v4()));
+        let manager = SessionManager::new(&root);
+        let task_id = Uuid::new_v4();
+        let created: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let manager = manager.clone();
+            let created = created.clone();
+            handles.push(tokio::spawn(async move {
+                // Hold the session lock across the whole acquire → create →
+                // bind sequence, exactly as the scheduler does around an agent
+                // run, so only the first arrival creates a backend session.
+                let guard = manager.lock_session(task_id, SessionRole::Implementation).await;
+                let session = manager.acquire_with(&guard, task_id, SessionRole::Implementation, "opencode").await.unwrap();
+                if session.backend_session_id.is_none() {
+                    let new_id = format!("ses_first_{i:02}");
+                    created.lock().unwrap().push(new_id.clone());
+                    manager.bind_with(&guard, task_id, SessionRole::Implementation, "opencode", &new_id).await.unwrap();
+                    new_id
+                } else {
+                    session.backend_session_id.unwrap()
+                }
+            }));
+        }
+        let mut observed = Vec::new();
+        for handle in handles {
+            observed.push(handle.await.unwrap());
+        }
+        // Exactly one backend session was created and every retry agrees on it:
+        // no orphaned second session exists.
+        let created = created.lock().unwrap();
+        assert_eq!(created.len(), 1, "expected a single created backend session, got {created:?}");
+        assert!(observed.iter().all(|id| *id == created[0]));
+        let stored = manager.acquire(task_id, SessionRole::Implementation, "opencode").await.unwrap();
+        assert_eq!(stored.backend_session_id.as_deref(), Some(created[0].as_str()));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn racing_acquires_never_lose_a_bound_id() {
+        let root = std::env::temp_dir().join(format!("lazyteam-session-race-{}", Uuid::new_v4()));
+        let manager = SessionManager::new(&root);
+        for _ in 0..10 {
+            let task_id = Uuid::new_v4();
+            let manager_r = manager.clone();
+            let binder = tokio::spawn(async move {
+                manager_r.bind_backend_session(task_id, SessionRole::Implementation, "opencode", "ses_racy").await.unwrap();
+            });
+            let mut acquirers = Vec::new();
+            for _ in 0..8 {
+                let manager = manager.clone();
+                acquirers.push(tokio::spawn(async move {
+                    manager.acquire(task_id, SessionRole::Implementation, "opencode").await.unwrap()
+                }));
+            }
+            binder.await.unwrap();
+            let mut sessions = Vec::new();
+            for handle in acquirers {
+                sessions.push(handle.await.unwrap());
+            }
+            sessions.push(manager.acquire(task_id, SessionRole::Implementation, "opencode").await.unwrap());
+            // A stale unbound write must never overwrite the bound ID: every
+            // observed record is either still-unbound-from-before-the-bind or
+            // the bound ID — and the final state is bound with a stable dir.
+            let first_dir = sessions[0].data_dir.clone();
+            assert!(sessions.iter().all(|s| s.data_dir == first_dir));
+            let final_session = sessions.last().unwrap();
+            assert_eq!(final_session.backend_session_id.as_deref(), Some("ses_racy"));
+            for session in &sessions {
+                match session.backend_session_id.as_deref() {
+                    None | Some("ses_racy") => {}
+                    Some(other) => panic!("unexpected backend session ID {other}"),
+                }
+            }
+        }
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
@@ -532,6 +816,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lock_rejects_mismatched_task_role() {
+        let root = std::env::temp_dir().join(format!("lazyteam-session-lock-{}", Uuid::new_v4()));
+        let manager = SessionManager::new(&root);
+        let task_id = Uuid::new_v4();
+        let guard = manager.lock_session(task_id, SessionRole::Implementation).await;
+        assert!(manager.acquire_with(&guard, Uuid::new_v4(), SessionRole::Implementation, "pi").await.is_err());
+        assert!(manager.acquire_with(&guard, task_id, SessionRole::Review, "pi").await.is_err());
+        assert!(manager.bind_with(&guard, task_id, SessionRole::Review, "pi", "ses_x").await.is_err());
+        assert!(manager.release_with(&guard, task_id, SessionRole::Review).await.is_err());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn cleanup_removes_bound_session_data() {
         let root = std::env::temp_dir().join(format!("lazyteam-session-cleanup-{}", Uuid::new_v4()));
         let manager = SessionManager::new(&root);
@@ -560,5 +857,19 @@ mod tests {
         let fresh = manager.acquire(task_id, SessionRole::Implementation, "opencode").await.unwrap();
         assert_eq!(fresh.backend_session_id, Option::<String>::None);
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_propagates_failures() {
+        // A state dir that is a regular file makes every metadata and data
+        // access fail with a non-NotFound error, which release must report
+        // instead of acknowledging cleanup while data remains.
+        let file = std::env::temp_dir().join(format!("lazyteam-session-notadir-{}", Uuid::new_v4()));
+        tokio::fs::write(&file, b"not a directory").await.unwrap();
+        let manager = SessionManager::new(&file);
+        let task_id = Uuid::new_v4();
+        assert!(manager.acquire(task_id, SessionRole::Implementation, "pi").await.is_err());
+        assert!(manager.release(task_id, SessionRole::Implementation).await.is_err());
+        let _ = tokio::fs::remove_file(&file).await;
     }
 }

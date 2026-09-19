@@ -968,9 +968,8 @@ async fn worker_cleanup_ack_legacy(Path((id, task_id)): Path<(Uuid, Uuid)>, Stat
     if let Some(execution_id) = execution_id { crate::git_broker::remove_task_repo(&state, uuid(execution_id)?).await?; }
     sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
         .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
-    let changed = sqlx::query("DELETE FROM agent_session_cleanup WHERE task_id=? AND worker_id=? AND role='implementation'")
-        .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
-    if changed == 0 { return Err((StatusCode::NOT_FOUND, "cleanup item not found".into())); }
+    sqlx::query("DELETE FROM agent_session_cleanup WHERE task_id=? AND worker_id=?")
+        .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -986,9 +985,8 @@ async fn worker_cleanup_ack(Path((id, task_id, role)): Path<(Uuid, Uuid, String)
         sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
             .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
     }
-    let changed = sqlx::query("DELETE FROM agent_session_cleanup WHERE task_id=? AND worker_id=? AND role=?")
-        .bind(task_id.to_string()).bind(id.to_string()).bind(&role).execute(&state.db).await.map_err(db_error)?.rows_affected();
-    if changed == 0 { return Err((StatusCode::NOT_FOUND, "cleanup item not found".into())); }
+    sqlx::query("DELETE FROM agent_session_cleanup WHERE task_id=? AND worker_id=? AND role=?")
+        .bind(task_id.to_string()).bind(id.to_string()).bind(&role).execute(&state.db).await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

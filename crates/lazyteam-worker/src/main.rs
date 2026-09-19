@@ -16,7 +16,7 @@ mod sandbox;
 mod session;
 use runtime::{AgentRunResult, AgentRuntime, PiRuntime};
 use sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
-use session::{AgentSession, SessionManager, SessionRole};
+use session::{AgentSession, SessionLock, SessionManager, SessionRole};
 
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
@@ -769,19 +769,29 @@ fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option
 /// Persist an opaque backend session ID returned by a runtime without
 /// interpreting it. Scheduler code stays backend-neutral: the ID is treated
 /// as an opaque string scoped to the logical (task, role, backend) session.
+/// The caller must hold the session lock so the bind cannot race a
+/// concurrent acquire or bind. Failures are propagated: continuing with an
+/// unpersisted binding would silently abandon session resumption on retry.
 async fn persist_backend_session_binding(
     session_manager: &SessionManager,
+    session_lock: &SessionLock,
     session: &AgentSession,
     result: &AgentRunResult,
-) {
-    let Some(new_id) = result.backend_session_id.as_deref() else { return; };
-    if session.backend_session_id.as_deref() == Some(new_id) { return; }
-    if let Err(error) = session_manager
-        .bind_backend_session(session.task_id, session.role, &session.backend, new_id)
-        .await
-    {
-        warn!(task = %session.task_id, role = session.role.as_str(), backend = %session.backend, %error, "failed to persist backend session binding");
-    }
+) -> anyhow::Result<()> {
+    let Some(new_id) = result.backend_session_id.as_deref() else { return Ok(()); };
+    if session.backend_session_id.as_deref() == Some(new_id) { return Ok(()); }
+    session_manager.bind_with(
+        session_lock,
+        session.task_id,
+        session.role,
+        &session.backend,
+        new_id,
+    ).await.with_context(|| format!(
+        "persist {} backend session binding for task {}",
+        session.backend,
+        session.task_id,
+    ))?;
+    Ok(())
 }
 
 async fn process_cleanup(client: &Client, server: &str, credential: &str, worker_id: Uuid, workspace_root: &Path, state_dir: &Path, session_manager: &SessionManager) -> anyhow::Result<()> {
@@ -878,6 +888,12 @@ async fn execute_review_assignment(
         .join(&assignment.project.slug)
         .join(review_id.to_string());
     let auth = GitAuthContext::broker(worker_credential, &assignment.lease_capability);
+    // Serialize concurrent retries for the same logical session: the guard is
+    // held across refresh → run → bind so a second arrival waits, then
+    // resumes the bound session instead of creating a duplicate backend
+    // session that would orphan one of them.
+    let session_lock = session_manager.lock_session(session.task_id, session.role).await;
+    let session = session_manager.acquire_with(&session_lock, session.task_id, session.role, &session.backend).await?;
     let outcome = match prepare_review_workspace(&workspace, &assignment, &auth).await {
         Ok(()) => {
             let agent_workspace = sandbox.reviewer_workspace(task_id);
@@ -885,14 +901,18 @@ async fn execute_review_assignment(
             let prompt = build_review_prompt(initial_prompt, &assignment)?;
             match runtime.run_review(&agent_workspace, &prompt, session.backend_session_id.as_deref()).await {
                 Ok(agent) => {
-                    persist_backend_session_binding(session_manager, &session, &agent).await;
-                    let dirty = git_status_external_worktree(&workspace, &agent_workspace)
-                        .await
-                        .unwrap_or_else(|error| format!("status-check-error: {error}"));
-                    if !dirty.is_empty() {
-                        Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
-                    } else {
-                        parse_review_verdict(&agent.summary)
+                    match persist_backend_session_binding(session_manager, &session_lock, &session, &agent).await {
+                        Ok(()) => {
+                            let dirty = git_status_external_worktree(&workspace, &agent_workspace)
+                                .await
+                                .unwrap_or_else(|error| format!("status-check-error: {error}"));
+                            if !dirty.is_empty() {
+                                Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
+                            } else {
+                                parse_review_verdict(&agent.summary)
+                            }
+                        }
+                        Err(error) => Err(error),
                     }
                 }
                 Err(error) => Err(error),
@@ -1034,7 +1054,13 @@ async fn execute_assignment(
     }));
 
     let auth = GitAuthContext::broker(worker_credential, &assignment.lease_capability);
-    let outcome = run_task(workspace_root, sandbox, runtime, initial_prompt, &session, session_manager, &assignment, &auth).await;
+    // Serialize concurrent retries for the same logical session: the guard is
+    // held across refresh → run → bind so a second arrival waits, then
+    // resumes the bound session instead of creating a duplicate backend
+    // session that would orphan one of them.
+    let session_lock = session_manager.lock_session(session.task_id, session.role).await;
+    let session = session_manager.acquire_with(&session_lock, session.task_id, session.role, &session.backend).await?;
+    let outcome = run_task(workspace_root, sandbox, runtime, initial_prompt, &session, session_manager, &session_lock, &assignment, &auth).await;
     renew.abort();
 
     let result = match outcome {
@@ -1065,14 +1091,14 @@ async fn execute_assignment(
     Ok(())
 }
 
-async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, session: &AgentSession, session_manager: &SessionManager, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
+async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, session: &AgentSession, session_manager: &SessionManager, session_lock: &SessionLock, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
     let workspace = trusted_task_workspace(workspace_root, &assignment.project.slug, assignment.task.id);
     let base_sha = prepare_workspace(&workspace, assignment, git_auth).await?;
     let agent_workspace = sandbox.agent_workspace(assignment.task.id);
     prepare_agent_workspace(&workspace, &agent_workspace, Some(&base_sha)).await?;
     let prompt = build_prompt(initial_prompt, assignment);
     let agent = runtime.run(&agent_workspace, &prompt, session.backend_session_id.as_deref()).await?;
-    persist_backend_session_binding(session_manager, session, &agent).await;
+    persist_backend_session_binding(session_manager, session_lock, session, &agent).await?;
     sync_agent_workspace(&agent_workspace, &workspace).await?;
     auto_commit(&workspace, assignment).await?;
     let head_sha = git_output(&workspace, &["rev-parse", "HEAD"]).await?;
