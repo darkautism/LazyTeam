@@ -972,13 +972,20 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
     let worker_id_text = worker.id.to_string();
     for row in rows {
         let sticky_worker_id: Option<String> = row.try_get("sticky_worker_id").map_err(internal)?;
-        if sticky_worker_id.as_deref().is_some_and(|sticky| sticky != worker_id_text) { continue; }
         let task = task_from_row(&row)?;
         if !dependencies_satisfied(&state.db, &task).await? { continue; }
         let project_row = sqlx::query("SELECT * FROM projects WHERE id=? AND enabled=1").bind(task.project_id.to_string())
             .fetch_optional(&state.db).await.map_err(db_error)?;
         let Some(project_row) = project_row else { continue };
         let project = project_from_row(&project_row)?;
+        if let Some(sticky_worker_id) = sticky_worker_id.as_deref().filter(|sticky| *sticky != worker_id_text) {
+            if sticky_worker_reservation_active(&state.db, sticky_worker_id, &project, &task).await? {
+                continue;
+            }
+            sqlx::query("UPDATE tasks SET sticky_worker_id=NULL,updated_at=? WHERE id=? AND state='queued' AND sticky_worker_id=?")
+                .bind(ts(Utc::now())).bind(task.id.to_string()).bind(sticky_worker_id)
+                .execute(&state.db).await.map_err(db_error)?;
+        }
         if !worker_matches_task(&worker, &project, &task) { continue; }
         let git_credential = git_credential_from_row(&state, &project_row)?;
 
@@ -1211,7 +1218,7 @@ async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState
         .bind(if success { "completed" } else { "failed" }).bind(ts(now)).bind(json(&input.result)?).bind(id.to_string())
         .execute(&mut *tx).await.map_err(db_error)?;
     sqlx::query("UPDATE tasks SET state=?,sticky_worker_id=CASE WHEN ? THEN sticky_worker_id ELSE NULL END,updated_at=? WHERE id=?")
-        .bind(if success { "review" } else { "draft" }).bind(success).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+        .bind(if success { "review" } else { "failed" }).bind(success).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
     sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
         .bind(&worker_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
@@ -1264,6 +1271,28 @@ fn secure_hash_eq(a: &str, b: &str) -> bool {
     let mut diff = 0u8;
     for (x, y) in a.as_bytes().iter().zip(b.as_bytes()) { diff |= x ^ y; }
     diff == 0
+}
+
+async fn sticky_worker_reservation_active(
+    db: &SqlitePool,
+    worker_id: &str,
+    project: &Project,
+    task: &Task,
+) -> Result<bool, ApiError> {
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?")
+        .bind(worker_id)
+        .fetch_optional(db)
+        .await
+        .map_err(db_error)?;
+    let Some(row) = row else { return Ok(false); };
+    let preferred = worker_from_row(&row)?;
+    let fresh_after = Utc::now() - chrono::Duration::seconds(45);
+    Ok(preferred.role == AgentRole::Worker
+        && preferred.protocol_version >= PROTOCOL_VERSION
+        && preferred.running_slots < preferred.slots
+        && matches!(preferred.state, WorkerState::Idle | WorkerState::Busy)
+        && preferred.last_heartbeat_at >= fresh_after
+        && worker_matches_task(&preferred, project, task))
 }
 
 async fn review_reserved_for_live_preferred_reviewer(
