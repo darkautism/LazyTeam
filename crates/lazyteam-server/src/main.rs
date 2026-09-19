@@ -124,8 +124,9 @@ async fn main() -> anyhow::Result<()> {
         tokio::fs::create_dir_all("data").await?;
     }
     tokio::fs::create_dir_all(&args.git_root).await.context("create Git broker storage")?;
+    let git_root = tokio::fs::canonicalize(&args.git_root).await.context("canonicalize Git broker storage")?;
     let git_credential_key = Some(git_credentials::load_or_create_master_key(
-        &args.git_root.join("credential.key"),
+        &git_root.join("credential.key"),
         args.git_credential_key.as_deref(),
     ).context("load or create Host Git credential key")?);
     let connect_options = SqliteConnectOptions::from_str(&args.database_url)
@@ -147,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         public_url,
         oauth_password: args.oauth_password,
         git_credential_key,
-        git_root: args.git_root,
+        git_root,
         agent_auth_updates: Default::default(),
     });
 
