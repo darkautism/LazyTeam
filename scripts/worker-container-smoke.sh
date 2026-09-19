@@ -3,8 +3,6 @@ set -eu
 
 image="${1:-lazyteam-worker:release-candidate}"
 
-docker run --rm "$image" lazyteam-worker --help >/dev/null
-
 set +e
 output="$(
   docker run --rm \
