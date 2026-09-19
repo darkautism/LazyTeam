@@ -241,7 +241,11 @@ def main():
     expect(own_renew.status == 204, f"worker A could not renew its execution: {own_renew.status}")
 
     approve_with_worker = request(f"/api/tasks/{task_json['id']}/approve", method="POST", obj={}, token=WORKER)
-    expect(approve_with_worker.status == 401, "worker enrollment token reached review approval")
+    expect(approve_with_worker.status == 401, "worker enrollment token reached removed approval route")
+    approve_with_worker.read()
+    approve_with_admin = request(f"/api/tasks/{task_json['id']}/approve", method="POST", obj={}, token=ADMIN)
+    expect(approve_with_admin.status == 404, f"manual approval bypass still exists: {approve_with_admin.status}")
+    approve_with_admin.read()
 
     bad_dcr = request("/mcp/oauth/register", method="POST", obj={
         "redirect_uris": ["https://evil.example/callback"],
