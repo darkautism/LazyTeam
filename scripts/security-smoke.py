@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import json
 import os
+import pathlib
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -12,6 +15,7 @@ ADMIN = os.environ.get("LAZYTEAM_ADMIN_TOKEN", "admin-security-smoke-token-01234
 WORKER = os.environ.get("LAZYTEAM_WORKER_TOKEN", "worker-security-smoke-token-0123456789abcdef")
 PUBLIC = os.environ.get("LAZYTEAM_PUBLIC_URL", "https://lazyteam.example.test").rstrip("/")
 WORKER_CREDENTIAL_HEADER = "X-LazyTeam-Worker-Credential"
+LEASE_CAPABILITY_HEADER = "X-LazyTeam-Lease-Capability"
 
 
 def request(path, *, method="GET", obj=None, data=None, token=None, headers=None):
@@ -39,13 +43,27 @@ def read_json(resp):
     return json.loads(raw.decode()) if raw else None
 
 
-def project_payload(slug):
+def project_payload(slug, repo_url):
     return {
         "slug": slug,
         "name": "Security Smoke",
-        "repo_url": "https://example.invalid/security.git",
+        "repo_url": repo_url,
         "default_branch": "main",
     }
+
+
+def create_local_upstream():
+    root = pathlib.Path(tempfile.mkdtemp(prefix="lazyteam-security-upstream-"))
+    work = root / "work"
+    bare = root / "upstream.git"
+    subprocess.run(["git", "init", "-b", "main", str(work)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(work), "config", "user.name", "Security Smoke"], check=True)
+    subprocess.run(["git", "-C", str(work), "config", "user.email", "security-smoke@example.invalid"], check=True)
+    (work / "README.md").write_text("security smoke\n")
+    subprocess.run(["git", "-C", str(work), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(work), "commit", "-m", "security smoke base"], check=True, capture_output=True)
+    subprocess.run(["git", "clone", "--bare", str(work), str(bare)], check=True, capture_output=True)
+    return bare.as_uri()
 
 
 def worker_payload(worker_id, name="security-smoke-worker"):
@@ -58,7 +76,7 @@ def worker_payload(worker_id, name="security-smoke-worker"):
         "allowed_projects": ["*"],
         "slots": 1,
         "worker_version": "security-smoke",
-        "protocol_version": 1,
+        "protocol_version": 6,
     }
 
 
@@ -80,6 +98,10 @@ def worker_headers(credential):
     return {WORKER_CREDENTIAL_HEADER: credential}
 
 
+def lease_headers(headers, capability):
+    return {**headers, LEASE_CAPABILITY_HEADER: capability}
+
+
 def main():
     health = request("/health")
     expect(health.status == 200 and health.read() == b"ok", "health failed")
@@ -93,14 +115,15 @@ def main():
     expect("lazyteam-admin" not in root_www, "production root MCP was intercepted by admin auth")
 
     slug = "security-" + uuid.uuid4().hex[:8]
+    upstream_repo = create_local_upstream()
 
-    anonymous_admin = request("/api/projects", method="POST", obj=project_payload(slug))
+    anonymous_admin = request("/api/projects", method="POST", obj=project_payload(slug, upstream_repo))
     expect(anonymous_admin.status == 401, f"anonymous admin API should be 401, got {anonymous_admin.status}")
 
-    worker_on_admin = request("/api/projects", method="POST", obj=project_payload(slug), token=WORKER)
+    worker_on_admin = request("/api/projects", method="POST", obj=project_payload(slug, upstream_repo), token=WORKER)
     expect(worker_on_admin.status == 401, f"worker enrollment token reached admin API: {worker_on_admin.status}")
 
-    admin_create = request("/api/projects", method="POST", obj=project_payload(slug), token=ADMIN)
+    admin_create = request("/api/projects", method="POST", obj=project_payload(slug, upstream_repo), token=ADMIN)
     expect(admin_create.status == 200, f"admin token could not create project: HTTP {admin_create.status}")
     project = read_json(admin_create)
 
@@ -201,18 +224,19 @@ def main():
     assignment = read_json(claim)
     expect(assignment["task"]["id"] == task_json["id"], "worker claimed unexpected task")
     execution_id = assignment["execution"]["id"]
+    lease_capability = assignment["lease_capability"]
 
     cross_worker_renew = request(
         f"/api/executions/{execution_id}/renew",
         method="POST",
-        headers=headers_b,
+        headers=lease_headers(headers_b, lease_capability),
     )
     expect(cross_worker_renew.status == 401, "worker B renewed worker A execution")
 
     own_renew = request(
         f"/api/executions/{execution_id}/renew",
         method="POST",
-        headers=headers_a,
+        headers=lease_headers(headers_a, lease_capability),
     )
     expect(own_renew.status == 204, f"worker A could not renew its execution: {own_renew.status}")
 

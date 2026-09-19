@@ -264,7 +264,7 @@ async fn refresh_project_mirror(mirror: &Path, upstream_url: &str, auth: &HostGi
     ).await
 }
 
-async fn verify_reviewed_candidate(task_repo: &Path, review_ref: &str, candidate_sha: &str, base_sha: &str) -> Result<(), ApiError> {
+async fn verify_candidate_ref(task_repo: &Path, review_ref: &str, candidate_sha: &str) -> Result<(), ApiError> {
     if !task_repo.exists() {
         return Err((StatusCode::CONFLICT, "Host task repository is missing".into()));
     }
@@ -276,6 +276,11 @@ async fn verify_reviewed_candidate(task_repo: &Path, review_ref: &str, candidate
     if actual_candidate.trim() != candidate_sha {
         return Err((StatusCode::CONFLICT, format!("candidate ref moved after review: expected {candidate_sha}, found {}", actual_candidate.trim())));
     }
+    Ok(())
+}
+
+async fn verify_reviewed_candidate(task_repo: &Path, review_ref: &str, candidate_sha: &str, base_sha: &str) -> Result<(), ApiError> {
+    verify_candidate_ref(task_repo, review_ref, candidate_sha).await?;
     let merge_base = git_output(
         &HostGitAuth::none(),
         Command::new("git").arg("-C").arg(task_repo).args(["merge-base", base_sha, candidate_sha]),
@@ -361,7 +366,11 @@ pub(crate) async fn verify_external_merge(
     let base_sha = evidence.checkout.base_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no pinned base commit".into()))?;
     let review_ref = evidence.checkout.review_ref.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate ref".into()))?;
     let task_repo = task_repo_path(state, evidence.execution.id);
-    verify_reviewed_candidate(&task_repo, review_ref, candidate_sha, base_sha).await?;
+    // External-merge recovery verifies the exact reviewed ref and compares the
+    // complete tree delta against the supplied upstream commit. It intentionally
+    // does not require candidate ancestry: older retry workspaces could produce
+    // a tree-correct reviewed candidate on stale history.
+    verify_candidate_ref(&task_repo, review_ref, candidate_sha).await?;
 
     let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
         .bind(evidence.project.id.to_string()).fetch_one(&state.db).await.map_err(internal)?;
