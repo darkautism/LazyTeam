@@ -63,15 +63,21 @@ fn review_steer_message(completed_tools: u64, soft: u64, hard: u64) -> Option<&'
 #[derive(Debug)]
 pub struct AgentRunResult {
     pub summary: String,
+    /// Opaque backend-owned session ID created (or rotated) by the runtime
+    /// during this run. `None` means the runtime did not create a new
+    /// identity (e.g. Pi reuses the caller-chosen logical session ID).
+    /// Scheduler code treats this as an opaque string and persists it via
+    /// `SessionManager::bind_backend_session` without interpreting it.
+    pub backend_session_id: Option<String>,
 }
 
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
     fn kind(&self) -> &'static str;
     async fn capabilities(&self) -> AgentCapabilities;
-    async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult>;
-    async fn run_review(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
-        self.run(workspace, prompt, session_name).await
+    async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult>;
+    async fn run_review(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+        self.run(workspace, prompt, backend_session_id).await
     }
 }
 
@@ -106,16 +112,21 @@ impl PiRuntime {
         &self,
         workspace: &Path,
         prompt: &str,
-        session_name: &str,
+        backend_session_id: Option<&str>,
         timeout: Duration,
         review_budgets: Option<(u64, u64)>,
     ) -> anyhow::Result<AgentRunResult> {
         if let Some(session_dir) = &self.session_dir {
             tokio::fs::create_dir_all(session_dir).await?;
         }
+        // Pi keeps caller-chosen session IDs: the logical session binding
+        // supplies the stable ID. An unbound (`None`) Pi session runs
+        // ephemerally without forcing a fabricated ID.
+        let session_name = backend_session_id.unwrap_or("lazyteam-ephemeral");
         let mut command = self.sandbox.command(&self.binary, workspace, self.session_dir.as_deref())?;
         command.arg("--mode").arg("rpc").arg("--name").arg(session_name);
-        if let Some(session_dir) = &self.session_dir {
+        if self.session_dir.is_some() && backend_session_id.is_some() {
+            let session_dir = self.session_dir.as_ref().expect("checked above");
             command.arg("--session-dir").arg(session_dir).arg("--session-id").arg(session_name);
         } else {
             command.arg("--no-session");
@@ -231,7 +242,7 @@ impl PiRuntime {
         }
         let _ = child.kill().await;
         let _ = child.wait().await;
-        Ok(AgentRunResult { summary })
+        Ok(AgentRunResult { summary, backend_session_id: None })
     }
 
     fn pi_module_index(&self) -> anyhow::Result<PathBuf> {
@@ -367,15 +378,15 @@ impl AgentRuntime for PiRuntime {
         }
     }
 
-    async fn run(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
-        self.run_rpc(workspace, prompt, session_name, agent_run_timeout(), None).await
+    async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+        self.run_rpc(workspace, prompt, backend_session_id, agent_run_timeout(), None).await
     }
 
-    async fn run_review(&self, workspace: &Path, prompt: &str, session_name: &str) -> anyhow::Result<AgentRunResult> {
+    async fn run_review(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
         self.run_rpc(
             workspace,
             prompt,
-            session_name,
+            backend_session_id,
             review_run_timeout(),
             Some(review_tool_budgets()),
         ).await
@@ -421,5 +432,46 @@ mod tests {
         assert_eq!(cost.output, 0.47);
         assert_eq!(cost.cache_read, 0.016);
         assert_eq!(cost.cache_write, 0.2);
+    }
+
+    struct FakeBackendRuntime {
+        created: String,
+    }
+
+    #[async_trait]
+    impl AgentRuntime for FakeBackendRuntime {
+        fn kind(&self) -> &'static str { "fake-backend" }
+        async fn capabilities(&self) -> AgentCapabilities { AgentCapabilities::default() }
+        async fn run(&self, _workspace: &Path, _prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+            // Backend-owned identity: first run creates an opaque ID, later
+            // runs resume the bound ID without the scheduler interpreting it.
+            match backend_session_id {
+                None => Ok(AgentRunResult { summary: "created".into(), backend_session_id: Some(self.created.clone()) }),
+                Some(existing) => Ok(AgentRunResult { summary: format!("resumed {existing}"), backend_session_id: None }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_owned_identity_is_created_once_then_resumed() {
+        let runtime = FakeBackendRuntime { created: "ses_opaque_123".into() };
+        let workspace = Path::new("/tmp");
+        let first = runtime.run(workspace, "prompt", None).await.unwrap();
+        assert_eq!(first.backend_session_id.as_deref(), Some("ses_opaque_123"));
+        // Scheduler persists the opaque ID as-is; the next run resumes it and
+        // the runtime reports no new identity.
+        let second = runtime.run(workspace, "prompt", first.backend_session_id.as_deref()).await.unwrap();
+        assert_eq!(second.backend_session_id, Option::<String>::None);
+        assert!(second.summary.contains("ses_opaque_123"));
+    }
+
+    #[tokio::test]
+    async fn pi_style_caller_chosen_session_reports_no_new_identity() {
+        // Pi reuses the logical session ID supplied by SessionManager, so a
+        // run result carries no new backend identity to persist.
+        let runtime = FakeBackendRuntime { created: "ses_opaque_123".into() };
+        let workspace = Path::new("/tmp");
+        let resumed = runtime.run(workspace, "prompt", Some("task-derived-id")).await.unwrap();
+        assert_eq!(resumed.backend_session_id, Option::<String>::None);
     }
 }
