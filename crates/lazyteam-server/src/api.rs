@@ -363,7 +363,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/task-board", get(task_board))
         .route("/api/workers", get(list_workers))
         .route("/api/worker-capabilities", get(worker_capability_catalog))
-        .route("/api/workers/{id}", axum::routing::patch(update_worker))
+        .route("/api/workers/{id}", axum::routing::patch(update_worker).delete(delete_worker))
         .route("/api/worker-join", post(create_worker_join_code))
         .route("/api/workers/register", post(register_worker))
         .route("/api/workers/{id}/config", get(worker_runtime_config))
@@ -698,6 +698,30 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
 pub(crate) async fn list_workers(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Worker>> {
     let rows = sqlx::query("SELECT * FROM workers ORDER BY name").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(worker_from_row).collect::<Result<Vec<_>,_>>().map(Json)
+}
+
+async fn delete_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+    let worker_id = id.to_string();
+    let row = sqlx::query("SELECT running_slots FROM workers WHERE id=?")
+        .bind(&worker_id).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
+    let running_slots: i64 = row.try_get("running_slots").map_err(internal)?;
+    if running_slots != 0 {
+        return Err((StatusCode::CONFLICT, "worker has active slots and cannot be deleted".into()));
+    }
+    let execution_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM executions WHERE worker_id=?")
+        .bind(&worker_id).fetch_one(&state.db).await.map_err(db_error)?;
+    let review_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE reviewer_worker_id=?")
+        .bind(&worker_id).fetch_one(&state.db).await.map_err(db_error)?;
+    if execution_count != 0 || review_count != 0 {
+        return Err((StatusCode::CONFLICT, "worker has task/review history and cannot be deleted without erasing audit history".into()));
+    }
+    let changed = sqlx::query("DELETE FROM workers WHERE id=? AND running_slots=0")
+        .bind(&worker_id).execute(&state.db).await.map_err(db_error)?.rows_affected();
+    if changed == 0 {
+        return Err((StatusCode::CONFLICT, "worker changed while deleting".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, Json(input): Json<UpdateWorker>) -> ApiResult<Worker> {

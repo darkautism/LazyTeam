@@ -20,7 +20,7 @@ const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
 const WORKER_PROTOCOL_VERSION: u32 = 6;
 const AGENT_ROOTFS_BUILD_SCRIPT: &str = include_str!("../../../scripts/agent-rootfs-build.sh");
-const AGENT_GIT_BOUNDARY: &str = "LazyTeam sandbox boundary: this workspace is a source snapshot and intentionally does not expose .git metadata, Git credentials, or necessarily the git executable. Do not run git commands or spend time looking for Git state. Inspect, edit, and validate the files directly. LazyTeam's trusted worker layer will diff, commit, and push your completed file changes after you finish.";
+const AGENT_GIT_BOUNDARY: &str = "LazyTeam sandbox boundary: this workspace is a source snapshot and intentionally does not expose .git metadata, Git credentials, or necessarily the git executable. Do not run git commands or spend time looking for Git state. Do not probe for Git, Python, Docker/Podman, Cargo, or other tools merely to discover whether they exist; invoke a tool only when a concrete acceptance criterion requires it. Inspect, edit, and validate files directly. LazyTeam's trusted worker layer will diff, commit, and push your completed file changes after you finish. Work proportionally to task size: for a narrow config/file-only change, inspect only the target file and directly relevant references, use the smallest validation that proves the criterion, and stop once the evidence is sufficient.";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -859,7 +859,7 @@ fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> a
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     let result = serde_json::to_string_pretty(&assignment.execution.result).context("serialize implementation evidence")?;
     Ok(format!(
-        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nReview the checkout at the exact candidate commit. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
+        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nReview efficiently. Start with the supplied changed files/patch and acceptance criteria. If the candidate changes an unrelated file, reverts newer base behavior, or otherwise violates scope, return retry immediately with that evidence; do not broaden into a repository-wide audit after a decisive finding. For a trivial config-only task, inspect only directly relevant files and run only focused validation. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
         assignment.checkout.repo_url,
         assignment.checkout.default_branch,
         assignment.checkout.review_ref,
