@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub type Tags = BTreeMap<String, String>;
 
 pub const BUILD_GIT_SHA: &str = env!("LAZYTEAM_BUILD_GIT_SHA");
+pub const LEASE_CAPABILITY_HEADER: &str = "x-lazyteam-lease-capability";
 
 pub const MANAGED_CAPABILITY_IDS: &[&str] = &["rust", "python", "node", "go", "gcc", "cpp", "clang", "java", "cmake", "ruby", "php"];
 
@@ -356,8 +357,7 @@ pub struct Assignment {
     pub project: Project,
     pub task: Task,
     pub execution: Execution,
-    #[serde(default)]
-    pub git_credential: GitCredential,
+    pub lease_capability: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,8 +386,7 @@ pub struct ReviewAssignment {
     pub execution: Execution,
     pub implementation_worker: Worker,
     pub checkout: ReviewCheckout,
-    #[serde(default)]
-    pub git_credential: GitCredential,
+    pub lease_capability: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -154,19 +154,17 @@ The Web UI is intentionally not part of the public Caddy route set. Open the loo
 
 ### Project Git access
 
-Each project chooses how workers authenticate for clone/fetch/push:
+The LazyTeam **Host is the only upstream Git principal**. Workers and reviewer workers never receive the project's GitHub/Gitea token, SSH private key, credential helper, or upstream Authorization header.
 
-- **Worker-managed** (default): LazyTeam sends no repository secret. Configure SSH/Git credentials directly on each worker. This preserves the existing deployment model and requires no additional server key.
-- **SSH private key**: store a project-scoped private key in LazyTeam. Workers receive it only with an authenticated assignment/cleanup response, write it to an ephemeral `0600` file for Git/SSH, and remove that file after the Git operation.
-- **HTTPS username + password/token**: store a username plus a password or access token. Workers pass the resulting Authorization header to Git through process environment/config instead of command-line arguments.
+Each project chooses how the Host reaches upstream:
 
-Server-managed secrets are write-only from the Project UI/API: project reads expose only the auth mode, username where applicable, and `credential_configured=true`; the secret itself is never returned. Secrets are encrypted at rest with AES-256-GCM using `LAZYTEAM_GIT_CREDENTIAL_KEY`. Set that variable to a base64-encoded 32-byte key before selecting a server-managed credential mode, for example:
+- **Host environment / public repository** (default): the Host uses anonymous access or Git/SSH configuration already present in the Host runtime.
+- **Host SSH private key**: store a project-scoped private key in LazyTeam. The Host materializes it only for the upstream Git command and removes the temporary key afterward.
+- **Host HTTPS username + token/password**: store a project-scoped HTTPS credential. The Host applies it only to its upstream fetch/publish command.
 
-```sh
-export LAZYTEAM_GIT_CREDENTIAL_KEY="$(python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))')"
-```
+Stored project secrets are write-only from the Project UI/API and encrypted at rest with AES-256-GCM. On first boot LazyTeam generates a random master key at `LAZYTEAM_GIT_ROOT/credential.key` (normally `/app/data/git/credential.key` in the container) with private permissions and reuses it across restarts. `LAZYTEAM_GIT_CREDENTIAL_KEY` remains only as an optional compatibility override; normal deployments do not need to provide it.
 
-Keep this master key stable and outside the database/backups. Without it, worker-managed projects continue to operate normally, while creation or use of server-managed credentials is rejected. Worker protocol 2 understands project-supplied Git credentials; protocol 1 workers remain eligible only for worker-managed projects.
+For execution, the Host maintains a project mirror and creates a bare repository scoped to the execution. Assignments contain a Host URL such as `https://lazyteam.example.com/git/task/<execution-id>/repo.git`, never the upstream URL plus credentials. Every implementation or review claim also mints a fresh opaque **lease capability**. Broker access and lease renew/finish calls require both the worker identity credential and that exact lease capability, so two slots on the same worker cannot authorize each other's execution/review. Only a hash of the lease capability is stored by the Host. The capability is revoked immediately when the execution/review finishes or is marked lost, and an expired lease cannot be renewed. Workers may push only the stable task ref allowed by the Host pre-receive hook; reviewer broker endpoints are read-only. After approval, `tasks_merge` makes the Host re-fetch upstream, verifies that the reviewed base and candidate have not moved, and publishes the exact reviewed candidate upstream with the Host-only project credential.
 
 ## Run a worker
 
@@ -177,7 +175,7 @@ ghcr.io/darkautism/lazyteam:latest         # control-plane server
 ghcr.io/darkautism/lazyteam-worker:latest  # worker daemon + Git + Node/Pi + rootfs tooling
 ```
 
-The worker image pins the same Pi distribution used by LazyTeam's live worker (`@earendil-works/pi-coding-agent@0.85.1`) and contains the host tools needed to build the per-capability Ubuntu agent rootfs. It does not contain project credentials; worker identity, Pi credentials, agent rootfs generations, and sessions live under `/app/state`, while trusted Git workspaces live under `/app/workspaces`.
+The worker image pins the same Pi distribution used by LazyTeam's live worker (`@earendil-works/pi-coding-agent@0.85.1`) and contains the host tools needed to build the per-capability Ubuntu agent rootfs. It never receives upstream project credentials; worker identity, its LazyTeam worker credential, Pi credentials, agent rootfs generations, and sessions live under `/app/state`, while trusted broker-backed Git workspaces live under `/app/workspaces`.
 
 For a containerized worker, generate a join code in the private UI and run:
 
@@ -224,7 +222,7 @@ On Linux, `lazyteam-worker` runs Pi inside an embedded sandbox implemented in th
 lazyteam-worker --sandbox-diagnose
 ```
 
-The trusted worker daemon keeps the real Git checkout and `.git` metadata outside the agent view. Before each implementation/review turn it materializes a source-only mirror with no `.git`; implementation changes are synchronized back by the daemon and committed/pushed by the daemon. An agent-created `.git` entry is always discarded during synchronization. Pi gets an isolated `PI_CODING_AGENT_DIR`, HOME, Cargo cache/target directory, temp directory, and persistent task session. A fresh worker's isolated Pi directory always starts empty: LazyTeam never imports `~/.pi`, `PI_CODING_AGENT_DIR`, `auth.json`, settings, model caches, or provider sessions from the host user. Provider credentials must be configured explicitly for that worker. The worker credential, ephemeral Git credentials, worker state root, host `~/.ssh`, and trusted Git metadata are not included in the sandbox allowlist or inherited agent environment.
+The trusted worker daemon keeps the real Git checkout and `.git` metadata outside the agent view. Before each implementation/review turn it materializes a source-only mirror with no `.git`; implementation changes are synchronized back by the daemon and committed/pushed by the daemon. An agent-created `.git` entry is always discarded during synchronization. Pi gets an isolated `PI_CODING_AGENT_DIR`, HOME, Cargo cache/target directory, temp directory, and persistent task session. A fresh worker's isolated Pi directory always starts empty: LazyTeam never imports `~/.pi`, `PI_CODING_AGENT_DIR`, `auth.json`, settings, model caches, or provider sessions from the host user. Provider credentials must be configured explicitly for that worker. The worker credential, worker state root, host `~/.ssh`, and trusted Git metadata are not included in the sandbox allowlist or inherited agent environment. Upstream Git credentials never exist on the worker at all.
 
 The initial seccomp policy deliberately stays small to preserve normal Node/Pi/Cargo behavior while denying mount/namespace escape and process-inspection primitives such as `mount`, `pivot_root`, `chroot`, `setns`, `unshare`, `ptrace`, `bpf`, and `perf_event_open`. Network access remains available because Pi and package managers need outbound access.
 
@@ -233,12 +231,12 @@ The initial seccomp policy deliberately stays small to preserve normal Node/Pi/C
 LazyTeam separates three responsibilities:
 
 - **Worker** agents claim implementation tasks (`assigned`/`running`), edit code in the task workspace, and publish a stable review ref when the execution finishes.
-- **Reviewer** agents (protocol 3) claim pinned review leases for tasks in `review`, verify the exact candidate commit independently, and return an approve/retry JSON verdict. They never modify source, commit, push, or merge.
-- The **main agent** (ChatGPT / MCP) owns the merge handoff. A reviewer-role worker's approve verdict already moves the task directly `review -> merge_pending`; `tasks_approve` is only the fallback for when the main agent performs the review itself. The normal main-agent path starts at `merge_pending`: integrate the exact reviewed candidate, resolve conflicts if any, push upstream, then call `tasks_merged(task_id, merge_commit_sha)` to move the task to `done`.
+- **Reviewer** agents (protocol 6) claim pinned review leases for tasks in `review`, verify the exact candidate commit independently from the Host broker, and return an approve/retry JSON verdict. They never modify source, commit, push, or merge.
+- The **main agent** owns the merge decision, but not an external Git credential. A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`; `tasks_approve` remains only a fallback for a main-agent review. From `merge_pending`, the main agent calls `tasks_merge(task_id)`. The LazyTeam Host revalidates the reviewed base/candidate, pushes the exact candidate upstream using Host-only credentials, then moves the task to `done`.
 
 After a worker is enrolled, open **Workers → Configure** in the private UI. The server becomes the source of truth for the worker name, role, tags, allowed projects, slots, agent selection, provider/model selection, and initial prompt. A running worker fetches this configuration before claiming work, so changes apply to subsequent tasks without re-enrollment. The worker list shows each worker's role (`worker` or `reviewer`) as a pill next to its name.
 
-The **Role** selector switches a registered agent between Worker and Reviewer. Changing the role replaces the **Initial prompt** with that role's default prompt: the Worker default (`lazyteam_core::DEFAULT_WORKER_PROMPT`) or the Reviewer default (`lazyteam_core::DEFAULT_REVIEWER_PROMPT`). If the current prompt has been customized, the UI asks for explicit confirmation that changing role will overwrite the customized prompt; cancelling keeps both the previous role selection and the prompt unchanged. Saving the dialog PATCHes `role` together with the existing agent/provider/model/prompt fields. Assigning the Reviewer role requires a protocol 3 worker; older workers must be updated/restarted first.
+The **Role** selector switches a registered agent between Worker and Reviewer. Changing the role replaces the **Initial prompt** with that role's default prompt: the Worker default (`lazyteam_core::DEFAULT_WORKER_PROMPT`) or the Reviewer default (`lazyteam_core::DEFAULT_REVIEWER_PROMPT`). If the current prompt has been customized, the UI asks for explicit confirmation that changing role will overwrite the customized prompt; cancelling keeps both the previous role selection and the prompt unchanged. Saving the dialog PATCHes `role` together with the existing agent/provider/model/prompt fields. Assigning the Reviewer role requires a protocol 6 worker; older workers must be updated/restarted first.
 
 Agent integrations are capability-driven instead of assuming every CLI exposes the same controls. Each worker reports whether its agent supports model discovery, what login mode it exposes (`unsupported`, `local_interactive`, or `remote`), and the provider/model catalog it can discover. The UI adapts to those capabilities.
 
@@ -254,15 +252,15 @@ A task keeps one stable worker workspace and one stable agent session across rev
 
 ### Reviewer configuration
 
-Review policy is project-scoped because different repositories can require different standards. Projects have an independent ChatGPT / MCP reviewer prompt, and the Home board keeps review work in two distinct lanes: **Review** holds only tasks in `review` state, while **MergePending** holds only tasks in `merge_pending` state. MergePending cards carry no Approve/Retry buttons; the lane and its cards state that reviewed candidates are waiting for the main agent to merge.
+Reviewer policy belongs to the **reviewer worker**, not the Project. Open **Workers → Configure**, set Role to Reviewer, and edit that worker's **Initial prompt**. There is no separate Project-level review prompt. The Home board keeps review work in two lanes: **Review** contains tasks awaiting/under reviewer-worker review, while **MergePending** contains approved candidates waiting for the main agent to invoke Host publish.
 
-Before deciding, an MCP reviewer calls `reviews_get(task_id)`. The response is designed for an actual review machine, not a patch-only judgment: it contains the project/task contract, full worker execution environment, latest execution, reviewer prompt, and a structured checkout bundle with repository URL, default branch, published review ref, commit SHA, and base SHA. The patch/summary/validation fields remain useful evidence, but the reviewer should fetch the review ref into an execution environment and run appropriate inspection/tests whenever practical.
+`reviews_get(task_id)` exposes pinned execution metadata and evidence for the main agent: implementation worker, candidate SHA, base SHA, stable review ref, patch/summary, and Host repository metadata. The actual reviewer worker gets a worker-authenticated read-only Host broker checkout and performs its independent inspection there; no upstream credential is involved.
 
-A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, pins the task back to the worker that produced the reviewed attempt, and injects the feedback into the same persistent task session. The task workspace and Pi session are reused instead of being recreated, improving continuity and provider prompt-cache reuse.
+A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, pins implementation back to the worker that produced the reviewed attempt, and injects the feedback into the same persistent task session. The task workspace and Pi session are reused instead of being recreated, improving continuity and provider prompt-cache reuse. For the next review, LazyTeam also gives the previous successful reviewer a **soft affinity** while that reviewer is live, eligible for the project, and has capacity; otherwise another reviewer may claim immediately. Affinity never reuses authority: every review claim receives a new lease capability, and the previous review capability stays revoked.
 
-A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`; `tasks_approve` is only the fallback when the main agent reviews the candidate itself. Neither path releases dependencies or deletes worker state. The main agent then integrates the exact reviewed candidate, resolves conflicts if any, pushes upstream, and calls `tasks_merged(task_id, merge_commit_sha)` once the reviewed ref is actually merged into the default branch. Only then does the task become `done`, dependencies unlock, and the original worker receive a cleanup item. The worker then deletes the task workspace, Pi session directory, and best-effort deletes the temporary review branch.
+A reviewer-role worker's approve verdict moves the task directly `review -> merge_pending`; `tasks_approve` is only the fallback when the main agent reviews the candidate itself. Neither path releases dependencies or deletes worker state. The main agent then calls `tasks_merge(task_id)`. The Host re-fetches upstream and refuses to publish if the default branch no longer equals the reviewed `base_sha` or if the task ref no longer equals the reviewed candidate SHA. On success the Host pushes that exact candidate, marks the task `done`, unlocks dependencies, and queues cleanup. The worker deletes only its local task workspace/session; the Host owns broker-repository cleanup.
 
-The worker also captures up to 256 KiB of textual patch evidence and marks truncated patches explicitly, but the pullable review ref is the primary path for full-context review.
+The worker also captures up to 256 KiB of textual patch evidence and marks truncated patches explicitly. Full-context reviewer validation uses the worker-authenticated Host review broker rather than an upstream review branch.
 
 ## Task lifecycle
 
@@ -277,7 +275,7 @@ queued -> assigned -> running -> review -> merge_pending -> done
 - Completed worker executions enter `review` and publish a stable review ref.
 - Review retry requires feedback and is sticky to the same worker so workspace/session state is reused.
 - A reviewer approve verdict moves `review -> merge_pending` directly (`tasks_approve` is only the main-agent self-review fallback); dependencies remain blocked.
-- `tasks_merged` requires a merge commit SHA, moves `merge_pending -> done`, releases dependencies, and queues worker cleanup.
+- `tasks_merge` performs Host-side upstream publish of the exact reviewed candidate, moves `merge_pending -> done`, releases dependencies, and queues worker cleanup. It refuses the publish if upstream or the candidate moved after review.
 - Every execution still gets its own UUID/attempt record, but attempts share the task workspace/session until merge.
 
 ## Connect ChatGPT through MCP
@@ -299,7 +297,7 @@ tasks_list
 tasks_create
 reviews_get
 tasks_approve
-tasks_merged
+tasks_merge
 tasks_retry
 workers_list
 ```

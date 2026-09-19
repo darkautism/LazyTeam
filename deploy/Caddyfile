@@ -6,7 +6,7 @@
         reverse_proxy lazyteam:8787
     }
 
-    @worker path /api/workers/register /api/workers/* /api/executions/*
+    @worker path /api/workers/register /api/workers/* /api/executions/* /api/reviews/* /git/*
     handle @worker {
         reverse_proxy lazyteam:8787
     }

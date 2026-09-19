@@ -129,9 +129,13 @@ def main():
     expect('id="project-git-auth-mode"' in ui, "project Git auth selector missing")
     expect('project-git-worker-managed' not in ui,
            "ambiguous worker-managed Git checkbox must not coexist with server credential fields")
-    expect('<option value="worker">Worker-managed credentials</option>' in ui and
-           '<option value="https_basic">HTTPS username + token/password</option>' in ui,
-           "project Git auth selector must make worker-managed vs HTTPS token mutually exclusive")
+    expect('<option value="worker">Host environment / public repository</option>' in ui and
+           '<option value="https_basic">Host HTTPS username + token/password</option>' in ui,
+           "project Git auth selector must make Host environment vs Host HTTPS token mutually exclusive")
+    expect('Upstream Git access (Host only)' in ui and 'workers never access upstream directly' in ui,
+           "project Git UI must state that upstream credentials stay on the Host")
+    expect('Advanced review' not in ui and 'project-reviewer-prompt' not in ui,
+           "Project must not expose a redundant reviewer prompt; reviewer workers own Initial prompt")
     expect('x-access-token' in ui and "github\\.com[:/]" in ui,
            "GitHub token mode should supply a usable default username")
     expect('Git credential was not stored; project remains unusable.' in ui,

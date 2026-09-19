@@ -142,13 +142,13 @@ mod tests {
         assert!(INDEX.contains("Working · "));
         assert!(INDEX.contains("Review · "));
         assert!(INDEX.contains("x.reviewer?.name"));
-        assert!(INDEX.contains("p?.reviewer?.mode==='mcp'"));
+        assert!(!INDEX.contains("p?.reviewer?.mode==='mcp'"));
         assert!(!INDEX.contains("'unclaimed'"));
         assert!(!INDEX.contains("merge_pending</span>"));
         assert!(!INDEX.contains("STATIC_MODELS"));
         assert!(!INDEX.contains("STATIC_PROVIDERS"));
-        assert!(INDEX.contains("project-reviewer-prompt"));
-        assert!(INDEX.contains("Advanced review"));
+        assert!(!INDEX.contains("project-reviewer-prompt"));
+        assert!(!INDEX.contains("Advanced review"));
         assert!(INDEX.contains("project-runner-labels"));
         assert!(INDEX.contains("Runs on"));
         assert!(INDEX.contains("All labels are required (AND)"));
@@ -157,7 +157,7 @@ mod tests {
         assert!(!INDEX.contains("Advanced tags"));
         assert!(!INDEX.contains("project-worker-tags"));
         assert!(!INDEX.contains("project-task-tags"));
-        assert!(INDEX.contains("Reviewer workers are configured separately"));
+        assert!(INDEX.contains("worker-config-prompt"));
         assert!(!INDEX.contains("· contributor "));
         assert!(!INDEX.contains("review ChatGPT / MCP ·"));
         assert!(INDEX.contains("project-contributor-name"));
@@ -166,8 +166,10 @@ mod tests {
         assert!(INDEX.contains("ChatGPT / MCP"));
         assert!(!INDEX.contains("project-git-worker-managed"));
         assert!(INDEX.contains("project-git-auth-mode"));
-        assert!(INDEX.contains("<option value=\"worker\">Worker-managed credentials</option>"));
-        assert!(INDEX.contains("<option value=\"https_basic\">HTTPS username + token/password</option>"));
+        assert!(INDEX.contains("<option value=\"worker\">Host environment / public repository</option>"));
+        assert!(INDEX.contains("Upstream Git access (Host only)"));
+        assert!(INDEX.contains("workers never access upstream directly"));
+        assert!(INDEX.contains("<option value=\"https_basic\">Host HTTPS username + token/password</option>"));
         assert!(INDEX.contains("project-git-secret"));
         assert!(INDEX.contains("x-access-token"));
         assert!(INDEX.contains("Git credential was not stored; project remains unusable."));

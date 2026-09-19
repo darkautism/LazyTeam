@@ -96,7 +96,7 @@ EXPECTED_TOOL_ANNOTATIONS = {
     "tasks_create": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "reviews_get": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
     "tasks_approve": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
-    "tasks_merged": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    "tasks_merge": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     "tasks_retry": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "tasks_delete": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     "workers_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
@@ -199,7 +199,7 @@ def main():
     expect(tokens["token_type"] == "Bearer", "wrong token type")
     expect(tokens.get("refresh_token"), "refresh token missing")
 
-    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_create", "reviews_get", "tasks_approve", "tasks_merged", "tasks_retry", "workers_list"}
+    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_create", "reviews_get", "tasks_approve", "tasks_merge", "tasks_retry", "workers_list"}
 
     legacy_initialize = mcp_call(tokens["access_token"], "initialize", {
         "protocolVersion": MCP_LEGACY_VERSION,

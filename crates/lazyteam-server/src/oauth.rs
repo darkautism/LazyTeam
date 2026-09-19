@@ -746,6 +746,7 @@ mod tests {
             public_url: public_url.map(str::to_string),
             oauth_password: None,
             git_credential_key: None,
+            git_root: std::env::temp_dir().join("lazyteam-oauth-test-git"),
             agent_auth_updates: Default::default(),
         }
     }

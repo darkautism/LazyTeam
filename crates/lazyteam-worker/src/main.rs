@@ -1,9 +1,9 @@
 use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context};
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
-use lazyteam_core::{AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, GitCredential, ReviewAssignment, ReviewVerdict};
+use lazyteam_core::{AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict, LEASE_CAPABILITY_HEADER};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -18,7 +18,7 @@ use sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
 
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
-const WORKER_PROTOCOL_VERSION: u32 = 5;
+const WORKER_PROTOCOL_VERSION: u32 = 6;
 const AGENT_ROOTFS_BUILD_SCRIPT: &str = include_str!("../../../scripts/agent-rootfs-build.sh");
 
 #[derive(Parser, Debug)]
@@ -90,54 +90,24 @@ struct AgentAuthDelivery {
 struct WorkerCleanup {
     task_id: Uuid,
     project_slug: String,
-    review_ref: String,
-    git_credential: GitCredential,
 }
 
 struct GitAuthContext {
     env: Vec<(String, String)>,
-    key_path: Option<PathBuf>,
 }
 
 impl GitAuthContext {
-    async fn prepare(state_dir: &Path, task_id: Uuid, nonce: Uuid, credential: &GitCredential) -> anyhow::Result<Self> {
-        let mut env = vec![("GIT_TERMINAL_PROMPT".into(), "0".into())];
-        let mut key_path = None;
-        match credential {
-            GitCredential::Worker => {}
-            GitCredential::HttpsBasic { username, secret } => {
-                if username.trim().is_empty() || secret.is_empty() {
-                    bail!("server-managed HTTPS Git credential is incomplete");
-                }
-                let value = STANDARD.encode(format!("{username}:{secret}"));
-                env.push(("GIT_CONFIG_COUNT".into(), "1".into()));
-                env.push(("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()));
-                env.push(("GIT_CONFIG_VALUE_0".into(), format!("Authorization: Basic {value}")));
-            }
-            GitCredential::SshKey { private_key } => {
-                if private_key.trim().is_empty() {
-                    bail!("server-managed SSH private key is empty");
-                }
-                let dir = state_dir.join("git-auth");
-                tokio::fs::create_dir_all(&dir).await?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await?;
-                }
-                let path = dir.join(format!("{}-{}.key", task_id.simple(), nonce.simple()));
-                tokio::fs::write(&path, private_key.as_bytes()).await?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
-                }
-                let quoted = shell_quote(&path)?;
-                env.push(("GIT_SSH_COMMAND".into(), format!("ssh -i {quoted} -o IdentitiesOnly=yes -o BatchMode=yes")));
-                key_path = Some(path);
-            }
+    fn broker(worker_credential: &str, lease_capability: &str) -> Self {
+        Self {
+            env: vec![
+                ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+                ("GIT_CONFIG_COUNT".into(), "2".into()),
+                ("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()),
+                ("GIT_CONFIG_VALUE_0".into(), format!("{WORKER_CREDENTIAL_HEADER}: {worker_credential}")),
+                ("GIT_CONFIG_KEY_1".into(), "http.extraHeader".into()),
+                ("GIT_CONFIG_VALUE_1".into(), format!("{LEASE_CAPABILITY_HEADER}: {lease_capability}")),
+            ],
         }
-        Ok(Self { env, key_path })
     }
 
     fn apply(&self, command: &mut Command) {
@@ -145,61 +115,6 @@ impl GitAuthContext {
             command.env(key, value);
         }
     }
-
-    async fn cleanup(&self) {
-        if let Some(path) = &self.key_path {
-            if let Err(error) = tokio::fs::remove_file(path).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    warn!(%error, "failed to remove ephemeral Git SSH key");
-                }
-            }
-        }
-    }
-}
-
-fn shell_quote(path: &Path) -> anyhow::Result<String> {
-    let raw = path.to_str().context("non-utf8 Git credential path")?;
-    Ok(format!("'{}'", raw.replace('\'', "'\"'\"'")))
-}
-
-fn git_repo_url_for_credential(repo_url: &str, credential: &GitCredential) -> anyhow::Result<String> {
-    if !matches!(credential, GitCredential::HttpsBasic { .. }) {
-        return Ok(repo_url.to_string());
-    }
-    if repo_url.starts_with("https://") || repo_url.starts_with("http://") {
-        return Ok(repo_url.to_string());
-    }
-    if let Some(rest) = repo_url.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':').context("HTTPS Git auth requires an HTTPS URL or standard git@host:path SSH URL")?;
-        if host.is_empty() || path.trim_matches('/').is_empty() {
-            bail!("HTTPS Git auth cannot rewrite malformed SSH repository URL");
-        }
-        return Ok(format!("https://{host}/{}", path.trim_start_matches('/')));
-    }
-    if let Some(rest) = repo_url.strip_prefix("ssh://") {
-        let (authority, path) = rest.split_once('/').context("HTTPS Git auth cannot rewrite malformed ssh:// repository URL")?;
-        let host_port = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
-        let host = match host_port.rsplit_once(':') {
-            Some((host, "22")) => host,
-            Some((_host, _port)) => bail!("HTTPS Git auth cannot safely rewrite an SSH repository URL using a non-default port"),
-            None => host_port,
-        };
-        if host.is_empty() || path.trim_matches('/').is_empty() {
-            bail!("HTTPS Git auth cannot rewrite malformed ssh:// repository URL");
-        }
-        return Ok(format!("https://{host}/{}", path.trim_start_matches('/')));
-    }
-    bail!("HTTPS Git auth requires an HTTPS repository URL or a standard SSH URL that can be rewritten safely")
-}
-
-async fn clear_stale_git_auth(state_dir: &Path) -> anyhow::Result<()> {
-    let dir = state_dir.join("git-auth");
-    match tokio::fs::remove_dir_all(&dir).await {
-        Ok(()) => info!(path = %dir.display(), "removed stale ephemeral Git credential files"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("remove stale Git credential files"),
-    }
-    Ok(())
 }
 
 fn parse_join_code_server(raw: &str) -> anyhow::Result<String> {
@@ -269,7 +184,6 @@ async fn async_main() -> anyhow::Result<()> {
     args.state_dir = resolve_worker_path(&startup_dir, &args.state_dir);
     args.workspace_dir = resolve_worker_path(&startup_dir, &args.workspace_dir);
     tokio::fs::create_dir_all(&args.state_dir).await?;
-    clear_stale_git_auth(&args.state_dir).await?;
     tokio::fs::create_dir_all(&args.workspace_dir).await?;
     let mut local_installed_capabilities = load_local_installed_capabilities(&args.state_dir).await?;
     let mut agent_rootfs = build_agent_rootfs(&args.state_dir, &local_installed_capabilities).await?;
@@ -481,7 +395,6 @@ async fn async_main() -> anyhow::Result<()> {
                         let slot_server = server.clone();
                         let slot_credential = worker_credential.clone();
                         let slot_workspace_root = args.workspace_dir.clone();
-                        let slot_state_dir = args.state_dir.clone();
                         let slot_sandbox = agent_sandbox.clone();
                         let slot_prompt = runtime_config.agent.initial_prompt.clone();
                         active_jobs.spawn(async move {
@@ -490,7 +403,6 @@ async fn async_main() -> anyhow::Result<()> {
                                 &slot_server,
                                 &slot_credential,
                                 &slot_workspace_root,
-                                &slot_state_dir,
                                 &slot_sandbox,
                                 runtime,
                                 &slot_prompt,
@@ -531,7 +443,6 @@ async fn async_main() -> anyhow::Result<()> {
                         let slot_server = server.clone();
                         let slot_credential = worker_credential.clone();
                         let slot_workspace_root = args.workspace_dir.clone();
-                        let slot_state_dir = args.state_dir.clone();
                         let slot_sandbox = agent_sandbox.clone();
                         let slot_prompt = runtime_config.agent.initial_prompt.clone();
                         active_jobs.spawn(async move {
@@ -540,7 +451,6 @@ async fn async_main() -> anyhow::Result<()> {
                                 &slot_server,
                                 &slot_credential,
                                 &slot_workspace_root,
-                                &slot_state_dir,
                                 &slot_sandbox,
                                 runtime,
                                 &slot_prompt,
@@ -571,6 +481,10 @@ fn enrollment_auth(request: RequestBuilder, token: &str) -> RequestBuilder {
 
 fn worker_auth(request: RequestBuilder, credential: &str) -> RequestBuilder {
     request.header(WORKER_CREDENTIAL_HEADER, credential)
+}
+
+fn lease_auth(request: RequestBuilder, worker_credential: &str, lease_capability: &str) -> RequestBuilder {
+    worker_auth(request, worker_credential).header(LEASE_CAPABILITY_HEADER, lease_capability)
 }
 
 async fn register(
@@ -811,15 +725,6 @@ async fn process_cleanup(client: &Client, server: &str, credential: &str, worker
     for item in items {
         let workspace = workspace_root.join(&item.project_slug).join(item.task_id.to_string());
         if workspace.exists() {
-            match GitAuthContext::prepare(state_dir, item.task_id, Uuid::new_v4(), &item.git_credential).await {
-                Ok(auth) => {
-                    if let Err(error) = command_ok_with_auth(&workspace, "git", &["push", "origin", "--delete", &item.review_ref], &auth).await {
-                        warn!(%error, task = %item.task_id, "review branch cleanup skipped or already deleted");
-                    }
-                    auth.cleanup().await;
-                }
-                Err(error) => warn!(%error, task = %item.task_id, "review branch cleanup credential setup failed"),
-            }
             tokio::fs::remove_dir_all(&workspace).await?;
         }
         let session_dir = state_dir.join("sessions").join(item.task_id.to_string());
@@ -858,7 +763,6 @@ async fn execute_review_assignment(
     server: &str,
     worker_credential: &str,
     workspace_root: &Path,
-    state_dir: &Path,
     sandbox: &AgentSandbox,
     runtime: Arc<dyn AgentRuntime>,
     initial_prompt: &str,
@@ -868,13 +772,15 @@ async fn execute_review_assignment(
     let renew_client = client.clone();
     let renew_server = server.to_string();
     let renew_credential = worker_credential.to_string();
+    let renew_capability = assignment.lease_capability.clone();
     let renew = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         loop {
             tick.tick().await;
-            match worker_auth(
+            match lease_auth(
                 renew_client.post(format!("{renew_server}/api/reviews/{review_id}/renew")),
                 &renew_credential,
+                &renew_capability,
             ).send().await {
                 Ok(response) if response.status().is_success() => {}
                 Ok(response) => warn!(status = %response.status(), %review_id, "review lease renew rejected"),
@@ -887,27 +793,21 @@ async fn execute_review_assignment(
         .join(".reviews")
         .join(&assignment.project.slug)
         .join(review_id.to_string());
-    let outcome = match GitAuthContext::prepare(state_dir, assignment.task.id, review_id, &assignment.git_credential).await {
-        Ok(auth) => {
-            let prepared = prepare_review_workspace(&workspace, &assignment, &auth).await;
-            auth.cleanup().await;
-            match prepared {
-                Ok(()) => {
-                    let agent_workspace = sandbox.reviewer_workspace(review_id);
-                    prepare_agent_workspace(&workspace, &agent_workspace).await?;
-                    let prompt = build_review_prompt(initial_prompt, &assignment)?;
-                    match runtime.run(&agent_workspace, &prompt, &review_id.to_string()).await {
-                        Ok(agent) => {
-                            let dirty = git_status_external_worktree(&workspace, &agent_workspace)
-                                .await
-                                .unwrap_or_else(|error| format!("status-check-error: {error}"));
-                            if !dirty.is_empty() {
-                                Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
-                            } else {
-                                parse_review_verdict(&agent.summary)
-                            }
-                        }
-                        Err(error) => Err(error),
+    let auth = GitAuthContext::broker(worker_credential, &assignment.lease_capability);
+    let outcome = match prepare_review_workspace(&workspace, &assignment, &auth).await {
+        Ok(()) => {
+            let agent_workspace = sandbox.reviewer_workspace(review_id);
+            prepare_agent_workspace(&workspace, &agent_workspace).await?;
+            let prompt = build_review_prompt(initial_prompt, &assignment)?;
+            match runtime.run(&agent_workspace, &prompt, &review_id.to_string()).await {
+                Ok(agent) => {
+                    let dirty = git_status_external_worktree(&workspace, &agent_workspace)
+                        .await
+                        .unwrap_or_else(|error| format!("status-check-error: {error}"));
+                    if !dirty.is_empty() {
+                        Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
+                    } else {
+                        parse_review_verdict(&agent.summary)
                     }
                 }
                 Err(error) => Err(error),
@@ -921,9 +821,10 @@ async fn execute_review_assignment(
         Ok(verdict) => json!({"status":"completed","verdict":verdict}),
         Err(error) => json!({"status":"failed","error":error.to_string()}),
     };
-    let response = worker_auth(
+    let response = lease_auth(
         client.post(format!("{server}/api/reviews/{review_id}/finish")),
         worker_credential,
+        &assignment.lease_capability,
     ).json(&body).send().await?;
     ensure_success(response).await?;
     if workspace.exists() { let _ = tokio::fs::remove_dir_all(&workspace).await; }
@@ -935,11 +836,10 @@ async fn execute_review_assignment(
 async fn prepare_review_workspace(path: &Path, assignment: &ReviewAssignment, git_auth: &GitAuthContext) -> anyhow::Result<()> {
     if path.exists() { tokio::fs::remove_dir_all(path).await?; }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
-    let repo_url = git_repo_url_for_credential(&assignment.checkout.repo_url, &assignment.git_credential)?;
     command_ok_with_auth(
         Path::new("."),
         "git",
-        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &repo_url, path.to_str().context("non-utf8 review workspace path")?],
+        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &assignment.checkout.repo_url, path.to_str().context("non-utf8 review workspace path")?],
         git_auth,
     ).await?;
     let review_ref = format!("refs/heads/{}", assignment.checkout.review_ref);
@@ -958,8 +858,7 @@ fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> a
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     let result = serde_json::to_string_pretty(&assignment.execution.result).context("serialize implementation evidence")?;
     Ok(format!(
-        "{initial_prompt}\n\nProject-specific review policy:\n{}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nReview the checkout at the exact candidate commit. You may inspect files and run validation, but do not edit, commit, push, or merge. Return only the required JSON verdict object.\n",
-        assignment.project.reviewer.initial_prompt,
+        "{initial_prompt}\n\nPinned review target:\nRepository: {}\nDefault branch: {}\nReview ref: {}\nCandidate commit: {}\nBase commit: {}\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation evidence:\n{}\n\nReview the checkout at the exact candidate commit. You may inspect files and run validation, but do not edit, commit, push, or merge. Return only the required JSON verdict object.\n",
         assignment.checkout.repo_url,
         assignment.checkout.default_branch,
         assignment.checkout.review_ref,
@@ -999,7 +898,6 @@ async fn execute_assignment(
     server: &str,
     worker_credential: &str,
     workspace_root: &Path,
-    state_dir: &Path,
     sandbox: &AgentSandbox,
     runtime: Arc<dyn AgentRuntime>,
     initial_prompt: &str,
@@ -1009,13 +907,15 @@ async fn execute_assignment(
     let renew_client = client.clone();
     let renew_server = server.to_string();
     let renew_credential = worker_credential.to_string();
+    let renew_capability = assignment.lease_capability.clone();
     let renew = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         loop {
             tick.tick().await;
-            match worker_auth(
+            match lease_auth(
                 renew_client.post(format!("{renew_server}/api/executions/{execution_id}/renew")),
                 &renew_credential,
+                &renew_capability,
             ).send().await {
                 Ok(response) if response.status().is_success() => {}
                 Ok(response) => warn!(status = %response.status(), %execution_id, "lease renew rejected"),
@@ -1024,14 +924,8 @@ async fn execute_assignment(
         }
     });
 
-    let outcome = match GitAuthContext::prepare(state_dir, assignment.task.id, assignment.execution.id, &assignment.git_credential).await {
-        Ok(auth) => {
-            let result = run_task(workspace_root, sandbox, runtime, initial_prompt, &assignment, &auth).await;
-            auth.cleanup().await;
-            result
-        }
-        Err(error) => Err(error),
-    };
+    let auth = GitAuthContext::broker(worker_credential, &assignment.lease_capability);
+    let outcome = run_task(workspace_root, sandbox, runtime, initial_prompt, &assignment, &auth).await;
     renew.abort();
 
     let result = match outcome {
@@ -1051,9 +945,10 @@ async fn execute_assignment(
             artifacts: vec![],
         },
     };
-    let response = worker_auth(
+    let response = lease_auth(
         client.post(format!("{server}/api/executions/{}/finish", assignment.execution.id)),
         worker_credential,
+        &assignment.lease_capability,
     )
         .json(&json!({"result": result}))
         .send().await?;
@@ -1146,15 +1041,19 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
         let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]).await?;
         if inside != "true" { bail!("existing task workspace is not a git repository"); }
         install_workspace_excludes(path).await?;
+        command_ok(path, "git", &["remote", "set-url", "origin", &assignment.project.repo_url]).await?;
+        let default_ref = format!("refs/heads/{}", assignment.project.default_branch);
+        command_ok_with_auth(path, "git", &["fetch", "origin", &default_ref], git_auth).await?;
+        let base = git_output(path, &["rev-parse", "FETCH_HEAD"]).await?;
+        command_ok(path, "git", &["update-ref", &default_ref, &base]).await?;
         command_ok(path, "git", &["checkout", &branch]).await?;
-        return git_output(path, &["rev-parse", &format!("refs/heads/{}", assignment.project.default_branch)]).await;
+        return Ok(base);
     }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
-    let repo_url = git_repo_url_for_credential(&assignment.project.repo_url, &assignment.git_credential)?;
     command_ok_with_auth(
         Path::new("."),
         "git",
-        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &repo_url, path.to_str().context("non-utf8 workspace path")?],
+        &["clone", "--branch", &assignment.project.default_branch, "--single-branch", &assignment.project.repo_url, path.to_str().context("non-utf8 workspace path")?],
         git_auth,
     ).await?;
     let base = git_output(path, &["rev-parse", "HEAD"]).await?;
@@ -1358,29 +1257,15 @@ mod tests {
     }
 
     #[test]
-    fn https_git_auth_rewrites_standard_ssh_repo_urls() {
-        let credential = GitCredential::HttpsBasic { username: "x-access-token".into(), secret: "secret".into() };
-        assert_eq!(git_repo_url_for_credential("git@github.com:darkautism/LazyTeam.git", &credential).unwrap(), "https://github.com/darkautism/LazyTeam.git");
-        assert_eq!(git_repo_url_for_credential("ssh://git@github.com/darkautism/LazyTeam.git", &credential).unwrap(), "https://github.com/darkautism/LazyTeam.git");
-        assert_eq!(git_repo_url_for_credential("https://github.com/darkautism/LazyTeam.git", &credential).unwrap(), "https://github.com/darkautism/LazyTeam.git");
-        assert!(git_repo_url_for_credential("ssh://git@example.com:2222/repo.git", &credential).is_err());
-        assert_eq!(git_repo_url_for_credential("git@github.com:darkautism/LazyTeam.git", &GitCredential::Worker).unwrap(), "git@github.com:darkautism/LazyTeam.git");
-    }
-
-    #[tokio::test]
-    async fn https_git_auth_uses_environment_not_command_arguments() {
-        let root = std::env::temp_dir().join(format!("lazyteam-git-auth-{}", Uuid::new_v4()));
-        let credential = GitCredential::HttpsBasic {
-            username: "alice".into(),
-            secret: "example-value".into(),
-        };
-        let auth = GitAuthContext::prepare(&root, Uuid::new_v4(), Uuid::new_v4(), &credential).await.unwrap();
-        assert!(auth.key_path.is_none());
-        assert!(auth.env.iter().any(|(key, value)| key == "GIT_CONFIG_KEY_0" && value == "http.extraHeader"));
-        let header = auth.env.iter().find(|(key, _)| key == "GIT_CONFIG_VALUE_0").unwrap().1.clone();
-        assert!(header.starts_with("Authorization: Basic "));
-        assert!(!header.contains("example-value"));
-        let _ = tokio::fs::remove_dir_all(root).await;
+    fn broker_git_auth_uses_worker_and_lease_capability_headers_only() {
+        let auth = GitAuthContext::broker("worker-secret", "lease-secret");
+        assert_eq!(auth.env.iter().find(|(key, _)| key == "GIT_CONFIG_COUNT").unwrap().1, "2");
+        let worker_header = auth.env.iter().find(|(key, _)| key == "GIT_CONFIG_VALUE_0").unwrap().1.clone();
+        let lease_header = auth.env.iter().find(|(key, _)| key == "GIT_CONFIG_VALUE_1").unwrap().1.clone();
+        assert_eq!(worker_header, "x-lazyteam-worker-credential: worker-secret");
+        assert_eq!(lease_header, "x-lazyteam-lease-capability: lease-secret");
+        assert!(!worker_header.contains("Authorization:"));
+        assert!(!lease_header.contains("Authorization:"));
     }
 
     #[cfg(unix)]
@@ -1458,8 +1343,7 @@ mod tests {
                 "started_at": "2026-01-01T00:00:00Z",
                 "finished_at": null,
                 "result": null
-            },
-            "git_credential": {"mode": "worker"}
+            }
         })).unwrap();
 
         auto_commit(&root, &assignment).await.unwrap();
@@ -1468,21 +1352,4 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn ssh_git_auth_key_is_ephemeral_and_private() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir().join(format!("lazyteam-git-auth-{}", Uuid::new_v4()));
-        let credential = GitCredential::SshKey {
-            private_key: "test-private-key\n".into(),
-        };
-        let auth = GitAuthContext::prepare(&root, Uuid::new_v4(), Uuid::new_v4(), &credential).await.unwrap();
-        let key_path = auth.key_path.clone().unwrap();
-        assert_eq!(tokio::fs::read_to_string(&key_path).await.unwrap(), "test-private-key\n");
-        assert_eq!(tokio::fs::metadata(&key_path).await.unwrap().permissions().mode() & 0o777, 0o600);
-        auth.cleanup().await;
-        assert!(!key_path.exists());
-        let _ = tokio::fs::remove_dir_all(root).await;
-    }
 }

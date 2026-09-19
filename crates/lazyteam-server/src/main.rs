@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
 };
@@ -17,6 +18,7 @@ use url::Url;
 
 mod api;
 mod cimd;
+mod git_broker;
 mod git_credentials;
 mod mcp;
 mod oauth;
@@ -37,6 +39,8 @@ struct Args {
     database_url: String,
     #[arg(long, env = "LAZYTEAM_PUBLIC_URL")]
     public_url: Option<String>,
+    #[arg(long, env = "LAZYTEAM_GIT_ROOT", default_value = "data/git")]
+    git_root: PathBuf,
     #[arg(long, env = "LAZYTEAM_OAUTH_PASSWORD")]
     oauth_password: Option<String>,
     #[arg(long, env = "LAZYTEAM_PRODUCTION", default_value_t = false)]
@@ -45,8 +49,8 @@ struct Args {
     admin_token: Option<String>,
     #[arg(long, env = "LAZYTEAM_WORKER_TOKEN")]
     worker_token: Option<String>,
-    /// Base64-encoded 32-byte master key used only to encrypt project Git credentials at rest.
-    /// It is optional while every project relies on credentials configured directly on workers.
+    /// Optional compatibility override for the Host Git-credential encryption key.
+    /// When omitted, LazyTeam creates and persists a private key under LAZYTEAM_GIT_ROOT on first boot.
     #[arg(long, env = "LAZYTEAM_GIT_CREDENTIAL_KEY")]
     git_credential_key: Option<String>,
     #[arg(long, env = "LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS", default_value = "")]
@@ -71,14 +75,6 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| s.trim_end_matches('/').to_string());
     let allowed_oauth_client_hosts = parse_hosts(&args.allowed_oauth_client_hosts);
     let allowed_redirect_hosts = parse_hosts(&args.allowed_redirect_hosts);
-    let git_credential_key = args
-        .git_credential_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(git_credentials::parse_master_key)
-        .transpose()
-        .context("parse LAZYTEAM_GIT_CREDENTIAL_KEY")?;
 
     if let Some(public) = public_url.as_deref() {
         validate_public_url(public)?;
@@ -127,6 +123,11 @@ async fn main() -> anyhow::Result<()> {
     if args.database_url.starts_with("sqlite://data/") {
         tokio::fs::create_dir_all("data").await?;
     }
+    tokio::fs::create_dir_all(&args.git_root).await.context("create Git broker storage")?;
+    let git_credential_key = Some(git_credentials::load_or_create_master_key(
+        &args.git_root.join("credential.key"),
+        args.git_credential_key.as_deref(),
+    ).context("load or create Host Git credential key")?);
     let connect_options = SqliteConnectOptions::from_str(&args.database_url)
         .context("parse sqlite URL")?
         .create_if_missing(true)
@@ -146,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
         public_url,
         oauth_password: args.oauth_password,
         git_credential_key,
+        git_root: args.git_root,
         agent_auth_updates: Default::default(),
     });
 
@@ -172,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .merge(web::router())
         .merge(api::router())
+        .merge(git_broker::router())
         .merge(review::router())
         .merge(oauth::router())
         .merge(mcp_router)
@@ -263,6 +266,7 @@ mod tests {
             public_url: Some("https://lazyteam.example.test".to_string()),
             oauth_password: None,
             git_credential_key: None,
+            git_root: std::env::temp_dir().join("lazyteam-test-git"),
             agent_auth_updates: Default::default(),
         });
         let mcp_state = state.clone();

@@ -74,11 +74,6 @@ pub struct TaskRetryParams {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct TaskMergedParams {
-    pub task_id: String,
-    pub merge_commit_sha: String,
-}
 
 #[tool_router]
 impl LazyTeamMcp {
@@ -195,7 +190,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "reviews_get",
         title = "Get review evidence",
-        description = "Get the latest execution evidence for a task in review, including reviewer policy, the full worker execution environment, and a pullable repository/ref/commit checkout. Patch/summary data are supplemental; reviewers should fetch the review ref into an execution environment and validate the project when practical before approving or retrying.",
+        description = "Get the latest pinned execution evidence for a task in review, including the implementation worker, candidate commit, base commit, review ref, patch/summary evidence, and Host repository metadata.",
         annotations(
             title = "Get review evidence",
             read_only_hint = true,
@@ -216,7 +211,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "tasks_approve",
         title = "Approve task",
-        description = "Approve the review verdict after reading reviews_get and validating the pullable review ref. Moves the task to merge_pending; it is not done and dependencies are not released until the reviewed ref is actually merged and tasks_merged is called",
+        description = "Approve a task after main-agent review when no reviewer worker has already decided it. Moves review to merge_pending; dependencies remain blocked until tasks_merge performs Host-side publish.",
         annotations(
             title = "Approve task",
             read_only_hint = false,
@@ -230,33 +225,39 @@ impl LazyTeamMcp {
         Parameters(input): Parameters<TaskIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
-        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        if evidence.project.reviewer.mode != lazyteam_core::ReviewerMode::Mcp {
-            return Err(McpError::internal_error("project reviewer mode is manual; approve from the admin UI or switch the project to ChatGPT / MCP reviewer", None));
-        }
+        let _ = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         let transition = review::approve_task(&self.state, task_id).await.map_err(api_to_mcp)?;
         json_result(&transition)
     }
 
     #[tool(
-        name = "tasks_merged",
-        title = "Mark task merged",
-        description = "Confirm that an approved task's reviewed ref has actually been merged into the project's default branch. Marks the task done, releases dependencies, and queues cleanup of the original worker workspace and agent session. Never call this before the merge is complete.",
+        name = "tasks_merge",
+        title = "Merge reviewed task",
+        description = "Publish an approved reviewed candidate from the LazyTeam Host to the project's upstream default branch using Host-only Git credentials, then mark the task done and queue worker cleanup. Refuses to publish if the reviewed base or candidate moved.",
         annotations(
-            title = "Mark task merged",
+            title = "Merge reviewed task",
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
-    async fn tasks_merged(
+    async fn tasks_merge(
         &self,
-        Parameters(input): Parameters<TaskMergedParams>,
+        Parameters(input): Parameters<TaskIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
-        let transition = review::merged_task(&self.state, task_id, &input.merge_commit_sha).await.map_err(api_to_mcp)?;
-        json_result(&transition)
+        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        if evidence.task.state != lazyteam_core::TaskState::MergePending {
+            return Err(McpError::internal_error("task must be merge_pending before Host publish", None));
+        }
+        let merge_commit_sha = crate::git_broker::publish_reviewed_task(&self.state, &evidence).await.map_err(api_to_mcp)?;
+        let transition = review::merged_task(&self.state, task_id, &merge_commit_sha).await.map_err(api_to_mcp)?;
+        json_result(&serde_json::json!({
+            "task_id": transition.task_id,
+            "state": transition.state,
+            "merge_commit_sha": merge_commit_sha,
+        }))
     }
 
     #[tool(
@@ -277,12 +278,7 @@ impl LazyTeamMcp {
     ) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         match review_evidence(Path(task_id), State(self.state.clone())).await {
-            Ok(Json(evidence)) => {
-                if evidence.project.reviewer.mode != lazyteam_core::ReviewerMode::Mcp {
-                    return Err(McpError::internal_error("project reviewer mode is manual; retry from the admin UI or switch the project to ChatGPT / MCP reviewer", None));
-                }
-            }
-            Err((StatusCode::CONFLICT, _)) => {}
+            Ok(_) | Err((StatusCode::CONFLICT, _)) => {}
             Err(error) => return Err(api_to_mcp(error)),
         }
         let transition = review::retry_task(&self.state, task_id, input.reason.as_deref()).await.map_err(api_to_mcp)?;
@@ -334,7 +330,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, reviews, merges, and a distributed AI worker pool. For review: call reviews_get, fetch the pullable checkout ref into an execution environment when practical, and validate the task contract. tasks_approve records only the review verdict and moves the task to merge_pending. Merge the reviewed ref into the default branch, then call tasks_merged; only that marks done and allows the original worker to delete its persistent workspace/session. On tasks_retry, give a concrete reason; review retries are pinned to the same worker so its workspace and agent session can be reused.".to_string(),
+                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. Reviewer workers normally move approved tasks to merge_pending automatically. For a merge_pending task, call tasks_merge: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review retries stay pinned to the implementation worker workspace/session when applicable.".to_string(),
             )
     }
 }

@@ -1,4 +1,4 @@
-use std::{collections::{BTreeSet, HashMap}, sync::Arc, time::Duration};
+use std::{collections::{BTreeSet, HashMap}, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -14,7 +14,8 @@ use lazyteam_core::{
     AgentRole, Assignment, ContributorIdentity, Execution, ExecutionResult, ExecutionState, GitAuthConfig,
     GitAuthMode, GitCredential, Project, ReviewAssignment, ReviewCheckout as WorkerReviewCheckout, ReviewLease,
     ReviewerConfig, ReviewerMode, ReviewVerdict, ReviewVerdictKind, Tags, Task, TaskState, Worker,
-    WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT, MANAGED_CAPABILITY_IDS,
+    WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT, LEASE_CAPABILITY_HEADER,
+    MANAGED_CAPABILITY_IDS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +24,7 @@ use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u32 = 5;
+pub(crate) const PROTOCOL_VERSION: u32 = 6;
 const MIN_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
@@ -37,6 +38,7 @@ pub(crate) struct AppState {
     pub(crate) public_url: Option<String>,
     pub(crate) oauth_password: Option<String>,
     pub(crate) git_credential_key: Option<[u8; 32]>,
+    pub(crate) git_root: PathBuf,
     pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, PendingAgentAuth>>>,
 }
 
@@ -144,8 +146,6 @@ pub(crate) struct ReviewEvidence {
 struct WorkerCleanup {
     task_id: Uuid,
     project_slug: String,
-    review_ref: String,
-    git_credential: GitCredential,
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,6 +441,8 @@ async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
         .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     let current = project_from_row(&row)?;
+    let enabled = input.enabled.unwrap_or(current.enabled);
+    let disabling = current.enabled && !enabled;
     let slug = input.slug.unwrap_or(current.slug);
     if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
         return Err((StatusCode::BAD_REQUEST, "invalid project slug".into()));
@@ -457,6 +459,8 @@ async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
         return Err((StatusCode::BAD_REQUEST, "reviewer initial prompt must not be empty".into()));
     }
     let stored_git_auth = resolve_updated_git_auth(&state, &row, input.git_auth)?;
+    let now = ts(Utc::now());
+    let mut tx = state.db.begin().await.map_err(db_error)?;
     sqlx::query("UPDATE projects SET slug=?,name=?,repo_url=?,default_branch=?,contributor_name=?,contributor_email=?,required_worker_tags=?,default_task_tags=?,reviewer_mode=?,reviewer_prompt=?,git_auth_mode=?,git_auth_username=?,git_auth_secret=?,enabled=?,updated_at=? WHERE id=?")
         .bind(&slug).bind(name.trim()).bind(repo_url.trim()).bind(default_branch.trim())
         .bind(&contributor.name).bind(&contributor.email)
@@ -464,10 +468,18 @@ async fn update_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
         .bind(json(&input.default_task_tags.unwrap_or(current.default_task_tags))?)
         .bind(reviewer_mode_str(&reviewer.mode)).bind(reviewer.initial_prompt.trim())
         .bind(git_auth_mode_str(&stored_git_auth.mode)).bind(&stored_git_auth.username).bind(&stored_git_auth.encrypted_secret)
-        .bind(if input.enabled.unwrap_or(current.enabled) { 1_i64 } else { 0_i64 })
-        .bind(ts(Utc::now())).bind(id.to_string()).execute(&state.db).await.map_err(db_conflict)?;
-    let row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
-    Ok(Json(project_from_row(&row)?))
+        .bind(if enabled { 1_i64 } else { 0_i64 })
+        .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_conflict)?;
+    if disabling {
+        sqlx::query("UPDATE executions SET lease_capability_hash=NULL,lease_until=? WHERE state IN ('assigned','running') AND task_id IN (SELECT id FROM tasks WHERE project_id=?)")
+            .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("UPDATE reviews SET lease_capability_hash=NULL,lease_until=? WHERE state IN ('assigned','running') AND task_id IN (SELECT id FROM tasks WHERE project_id=?)")
+            .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+    }
+    let row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(id.to_string()).fetch_one(&mut *tx).await.map_err(db_error)?;
+    let project = project_from_row(&row)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(project))
 }
 
 async fn delete_project(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
@@ -543,6 +555,10 @@ pub(crate) async fn delete_task(Path(id): Path<Uuid>, State(state): State<Arc<Ap
         tx.rollback().await.map_err(db_error)?;
         return Err((StatusCode::CONFLICT, "task changed while deleting".into()));
     }
+    if current == "review" {
+        sqlx::query("UPDATE reviews SET lease_capability_hash=NULL,lease_until=? WHERE task_id=? AND state IN ('assigned','running')")
+            .bind(&now).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+    }
     if let Some(worker_id) = worker_id {
         sqlx::query("INSERT INTO task_cleanup(task_id,worker_id,created_at) VALUES(?,?,?) ON CONFLICT(task_id) DO UPDATE SET worker_id=excluded.worker_id,created_at=excluded.created_at")
             .bind(&task_id).bind(worker_id).bind(&now).execute(&mut *tx).await.map_err(db_error)?;
@@ -568,12 +584,12 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
     let worker = worker_from_row(&worker_row)?;
     let result = execution.result.as_ref();
     let checkout = ReviewCheckout {
-        repo_url: project.repo_url.clone(),
+        repo_url: crate::git_broker::task_repo_url(&state, execution.id)?,
         default_branch: project.default_branch.clone(),
         review_ref: result.and_then(|value| value.review_ref.clone()),
         commit_sha: result.and_then(|value| value.commit_sha.clone()),
         base_sha: result.and_then(|value| value.base_sha.clone()),
-        pullable: result.is_some_and(|value| value.review_ref.is_some() && value.commit_sha.is_some()),
+        pullable: false,
     };
     Ok(Json(ReviewEvidence { project, task, execution, worker, checkout }))
 }
@@ -656,9 +672,11 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let current = worker_from_row(&row)?;
+    let authority_changed = input.role.as_ref().is_some_and(|value| value != &current.role)
+        || input.allowed_projects.as_ref().is_some_and(|value| value != &current.allowed_projects);
     let role = input.role.unwrap_or_else(|| current.role.clone());
-    if role == AgentRole::Reviewer && current.protocol_version < 3 {
-        return Err((StatusCode::CONFLICT, "update/restart this worker with protocol 3 before assigning the reviewer role".into()));
+    if role == AgentRole::Reviewer && current.protocol_version < PROTOCOL_VERSION {
+        return Err((StatusCode::CONFLICT, format!("update/restart this worker with protocol {PROTOCOL_VERSION} before assigning the reviewer role")));
     }
     let agent_type = input.agent_type.unwrap_or_else(|| current.agent.agent_type.clone());
     if agent_type != "pi" { return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into())); }
@@ -703,13 +721,23 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     let capability_error = if needs_build || recovering_capability_state { None } else { current.capability_error.as_deref() };
     let capability_phase = if needs_build { Some("queued") } else { current.capability_phase.as_deref() };
     let capability_log = if needs_build { "" } else { current.capability_log.as_str() };
+    let now = ts(Utc::now());
+    let mut tx = state.db.begin().await.map_err(db_error)?;
     sqlx::query("UPDATE workers SET name=?,role=?,tags=?,managed_capabilities=?,capability_error=?,capability_phase=?,capability_log=?,state=?,allowed_projects=?,slots=?,agent_type=?,agent_provider=?,agent_model=?,initial_prompt=? WHERE id=?")
         .bind(name.trim()).bind(agent_role_str(&role)).bind(json(&tags)?).bind(json(&managed_capabilities)?)
         .bind(capability_error).bind(capability_phase).bind(capability_log).bind(next_state).bind(json(&allowed_projects)?).bind(slots as i64)
         .bind(&agent_type).bind(&provider).bind(&model).bind(initial_prompt.trim()).bind(id.to_string())
-        .execute(&state.db).await.map_err(db_error)?;
-    let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
-    Ok(Json(worker_from_row(&row)?))
+        .execute(&mut *tx).await.map_err(db_error)?;
+    if authority_changed {
+        sqlx::query("UPDATE executions SET lease_capability_hash=NULL,lease_until=? WHERE worker_id=? AND state IN ('assigned','running')")
+            .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("UPDATE reviews SET lease_capability_hash=NULL,lease_until=? WHERE reviewer_worker_id=? AND state IN ('assigned','running')")
+            .bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+    }
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&mut *tx).await.map_err(db_error)?;
+    let worker = worker_from_row(&row)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(worker))
 }
 
 async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<WorkerRuntimeConfig> {
@@ -847,19 +875,13 @@ async fn worker_heartbeat(Path(id): Path<Uuid>, State(state): State<Arc<AppState
 
 async fn worker_cleanup(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Vec<WorkerCleanup>> {
     require_worker(&state.db, id, &headers).await?;
-    let rows = sqlx::query("SELECT c.task_id,t.project_id,p.slug FROM task_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
+    let rows = sqlx::query("SELECT c.task_id,p.slug FROM task_cleanup c JOIN tasks t ON t.id=c.task_id JOIN projects p ON p.id=t.project_id WHERE c.worker_id=? ORDER BY c.created_at ASC")
         .bind(id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let task_id = uuid(row.try_get("task_id").map_err(internal)?)?;
-        let project_id: String = row.try_get("project_id").map_err(internal)?;
-        let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
-            .bind(project_id).fetch_one(&state.db).await.map_err(db_error)?;
         items.push(WorkerCleanup {
-            task_id,
+            task_id: uuid(row.try_get("task_id").map_err(internal)?)?,
             project_slug: row.try_get("slug").map_err(internal)?,
-            review_ref: format!("lazyteam/task-{}", task_id.simple()),
-            git_credential: git_credential_from_row(&state, &project_row)?,
         });
     }
     Ok(Json(items))
@@ -867,6 +889,11 @@ async fn worker_cleanup(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>
 
 async fn worker_cleanup_ack(Path((id, task_id)): Path<(Uuid, Uuid)>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
     require_worker(&state.db, id, &headers).await?;
+    let execution_id: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(task_id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
+    if let Some(execution_id) = execution_id {
+        crate::git_broker::remove_task_repo(&state, uuid(execution_id)?).await?;
+    }
     let changed = sqlx::query("DELETE FROM task_cleanup WHERE task_id=? AND worker_id=?")
         .bind(task_id.to_string()).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?.rows_affected();
     if changed == 0 { return Err((StatusCode::NOT_FOUND, "cleanup item not found".into())); }
@@ -878,7 +905,7 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&row)?;
-    if worker.role != AgentRole::Worker {
+    if worker.role != AgentRole::Worker || worker.protocol_version < PROTOCOL_VERSION {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     if worker.running_slots >= worker.slots || !matches!(worker.state, WorkerState::Idle | WorkerState::Busy) {
@@ -897,7 +924,6 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
         let Some(project_row) = project_row else { continue };
         let project = project_from_row(&project_row)?;
         if !worker_matches_task(&worker, &project, &task) { continue; }
-        if project.git_auth.mode != GitAuthMode::Worker && worker.protocol_version < 2 { continue; }
         let git_credential = git_credential_from_row(&state, &project_row)?;
 
         let now = Utc::now();
@@ -906,19 +932,28 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
             .bind(task.id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
         let execution = Execution { id: Uuid::new_v4(), task_id: task.id, worker_id: worker.id, attempt: attempt as u32,
             state: ExecutionState::Assigned, lease_until, started_at: None, finished_at: None, result: None };
+        let (lease_capability, lease_capability_hash) = issue_lease_capability();
+        crate::git_broker::prepare_task_repo(&state, &project, task.id, execution.id, &git_credential).await?;
+        let mut worker_project = project.clone();
+        worker_project.repo_url = crate::git_broker::task_repo_url(&state, execution.id)?;
+        worker_project.git_auth = GitAuthConfig::default();
 
         let mut tx = state.db.begin().await.map_err(db_error)?;
         let claimed = sqlx::query("UPDATE tasks SET state='assigned',updated_at=? WHERE id=? AND state='queued'")
             .bind(ts(now)).bind(task.id.to_string()).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
-        if claimed == 0 { tx.rollback().await.map_err(db_error)?; continue; }
-        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+        if claimed == 0 {
+            tx.rollback().await.map_err(db_error)?;
+            crate::git_broker::remove_task_repo(&state, execution.id).await?;
+            continue;
+        }
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,lease_capability_hash) VALUES(?,?,?,?,?,?,?,?)")
             .bind(execution.id.to_string()).bind(task.id.to_string()).bind(worker.id.to_string()).bind(attempt)
-            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).execute(&mut *tx).await.map_err(db_error)?;
+            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash).execute(&mut *tx).await.map_err(db_error)?;
         sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
             .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         let mut assigned_task = task; assigned_task.state = TaskState::Assigned; assigned_task.updated_at = now;
-        return Ok(Json(Assignment { project, task: assigned_task, execution, git_credential }).into_response());
+        return Ok(Json(Assignment { project: worker_project, task: assigned_task, execution, lease_capability }).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -928,7 +963,7 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
     let worker_row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&worker_row)?;
-    if worker.role != AgentRole::Reviewer || worker.protocol_version < 3 {
+    if worker.role != AgentRole::Reviewer || worker.protocol_version < PROTOCOL_VERSION {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     if worker.running_slots >= worker.slots || !matches!(worker.state, WorkerState::Idle | WorkerState::Busy) {
@@ -944,7 +979,7 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         let Some(project_row) = project_row else { continue };
         let project = project_from_row(&project_row)?;
         if !worker_can_run_project(&worker, &project) { continue; }
-        if project.git_auth.mode != GitAuthMode::Worker && worker.protocol_version < 2 { continue; }
+        if review_reserved_for_live_preferred_reviewer(&state.db, &task, &project, worker.id).await? { continue; }
 
         let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? AND state='completed' ORDER BY attempt DESC LIMIT 1")
             .bind(task.id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
@@ -961,7 +996,6 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         let implementation_row = sqlx::query("SELECT * FROM workers WHERE id=?")
             .bind(execution.worker_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
         let implementation_worker = worker_from_row(&implementation_row)?;
-        let git_credential = git_credential_from_row(&state, &project_row)?;
         let now = Utc::now();
         let lease_until = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
         let review = ReviewLease {
@@ -971,6 +1005,7 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
             reviewer_worker_id: worker.id,
             lease_until,
         };
+        let (lease_capability, lease_capability_hash) = issue_lease_capability();
 
         let mut tx = state.db.begin().await.map_err(db_error)?;
         let still_review: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE id=? AND state='review'")
@@ -981,15 +1016,19 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
             tx.rollback().await.map_err(db_error)?;
             continue;
         }
-        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash) VALUES(?,?,?,?,?,?,?,?)")
             .bind(review.id.to_string()).bind(task.id.to_string()).bind(execution.id.to_string()).bind(worker.id.to_string())
-            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).execute(&mut *tx).await.map_err(db_conflict)?;
+            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash).execute(&mut *tx).await.map_err(db_conflict)?;
         sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
             .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
 
+        let review_repo_url = crate::git_broker::review_repo_url(&state, review.id)?;
+        let mut worker_project = project.clone();
+        worker_project.repo_url = review_repo_url.clone();
+        worker_project.git_auth = GitAuthConfig::default();
         let checkout = WorkerReviewCheckout {
-            repo_url: project.repo_url.clone(),
+            repo_url: review_repo_url,
             default_branch: project.default_branch.clone(),
             review_ref,
             commit_sha,
@@ -997,12 +1036,12 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         };
         return Ok(Json(ReviewAssignment {
             review,
-            project,
+            project: worker_project,
             task,
             execution,
             implementation_worker,
             checkout,
-            git_credential,
+            lease_capability,
         }).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -1011,11 +1050,13 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
 async fn renew_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
     let now = Utc::now();
     let lease = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
-    let row = sqlx::query("SELECT reviewer_worker_id FROM reviews WHERE id=? AND state IN ('assigned','running')")
-        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+    let row = sqlx::query("SELECT reviewer_worker_id,lease_capability_hash FROM reviews WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
+        .bind(id.to_string()).bind(ts(now)).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::CONFLICT, "review is not active".into()))?;
     let reviewer_worker_id = uuid(row.try_get("reviewer_worker_id").map_err(internal)?)?;
+    let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
     require_worker(&state.db, reviewer_worker_id, &headers).await?;
+    require_lease_capability(&headers, &capability_hash)?;
     sqlx::query("UPDATE reviews SET state='running',lease_until=?,started_at=COALESCE(started_at,?) WHERE id=? AND state IN ('assigned','running')")
         .bind(ts(lease)).bind(ts(now)).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1024,13 +1065,15 @@ async fn renew_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
 async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(input): Json<FinishReview>) -> Result<StatusCode, ApiError> {
     let now = Utc::now();
     let mut tx = state.db.begin().await.map_err(db_error)?;
-    let row = sqlx::query("SELECT task_id,execution_id,reviewer_worker_id FROM reviews WHERE id=? AND state IN ('assigned','running')")
-        .bind(id.to_string()).fetch_optional(&mut *tx).await.map_err(db_error)?
+    let row = sqlx::query("SELECT task_id,execution_id,reviewer_worker_id,lease_capability_hash FROM reviews WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
+        .bind(id.to_string()).bind(ts(now)).fetch_optional(&mut *tx).await.map_err(db_error)?
         .ok_or((StatusCode::CONFLICT, "review is not active".into()))?;
     let task_id: String = row.try_get("task_id").map_err(internal)?;
     let execution_id: String = row.try_get("execution_id").map_err(internal)?;
     let reviewer_worker_id: String = row.try_get("reviewer_worker_id").map_err(internal)?;
+    let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
     require_worker(&state.db, uuid(reviewer_worker_id.clone())?, &headers).await?;
+    require_lease_capability(&headers, &capability_hash)?;
 
     let current_state: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
         .bind(&task_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
@@ -1044,7 +1087,7 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     }
     if input.status == "failed" {
         let error = input.error.unwrap_or_else(|| "reviewer failed without an error message".into());
-        sqlx::query("UPDATE reviews SET state='failed',finished_at=?,verdict=? WHERE id=?")
+        sqlx::query("UPDATE reviews SET state='failed',finished_at=?,verdict=?,lease_capability_hash=NULL WHERE id=?")
             .bind(ts(now)).bind(json(&serde_json::json!({"error": error}))?).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
     } else {
         let verdict = input.verdict.ok_or((StatusCode::BAD_REQUEST, "completed review requires a verdict".into()))?;
@@ -1052,7 +1095,7 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
         if reason.is_empty() {
             return Err((StatusCode::BAD_REQUEST, "review verdict requires a reason".into()));
         }
-        sqlx::query("UPDATE reviews SET state='completed',finished_at=?,verdict=? WHERE id=?")
+        sqlx::query("UPDATE reviews SET state='completed',finished_at=?,verdict=?,lease_capability_hash=NULL WHERE id=?")
             .bind(ts(now)).bind(json(&verdict)?).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         match verdict.verdict {
             ReviewVerdictKind::Approve => {
@@ -1077,13 +1120,15 @@ async fn renew_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>
     let now = Utc::now();
     let lease = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
     let mut tx = state.db.begin().await.map_err(db_error)?;
-    let row = sqlx::query("SELECT task_id,worker_id FROM executions WHERE id=? AND state IN ('assigned','running')")
-        .bind(id.to_string()).fetch_optional(&mut *tx).await.map_err(db_error)?
+    let row = sqlx::query("SELECT task_id,worker_id,lease_capability_hash FROM executions WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
+        .bind(id.to_string()).bind(ts(now)).fetch_optional(&mut *tx).await.map_err(db_error)?
         .ok_or((StatusCode::CONFLICT, "execution is not active".into()))?;
     let task_id: String = row.try_get("task_id").map_err(internal)?;
     let worker_id: String = row.try_get("worker_id").map_err(internal)?;
+    let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
     let worker_id = uuid(worker_id)?;
     require_worker(&state.db, worker_id, &headers).await?;
+    require_lease_capability(&headers, &capability_hash)?;
     if !is_latest_execution(&mut tx, &task_id, id).await? { return Err((StatusCode::CONFLICT, "stale execution".into())); }
     sqlx::query("UPDATE executions SET state='running',lease_until=?,started_at=COALESCE(started_at,?) WHERE id=?")
         .bind(ts(lease)).bind(ts(now)).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
@@ -1096,15 +1141,17 @@ async fn renew_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>
 async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(input): Json<FinishExecution>) -> Result<StatusCode, ApiError> {
     let now = Utc::now();
     let mut tx = state.db.begin().await.map_err(db_error)?;
-    let row = sqlx::query("SELECT task_id,worker_id FROM executions WHERE id=? AND state IN ('assigned','running')")
-        .bind(id.to_string()).fetch_optional(&mut *tx).await.map_err(db_error)?
+    let row = sqlx::query("SELECT task_id,worker_id,lease_capability_hash FROM executions WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
+        .bind(id.to_string()).bind(ts(now)).fetch_optional(&mut *tx).await.map_err(db_error)?
         .ok_or((StatusCode::CONFLICT, "execution is not active".into()))?;
     let task_id: String = row.try_get("task_id").map_err(internal)?;
     let worker_id: String = row.try_get("worker_id").map_err(internal)?;
+    let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
     require_worker(&state.db, uuid(worker_id.clone())?, &headers).await?;
+    require_lease_capability(&headers, &capability_hash)?;
     if !is_latest_execution(&mut tx, &task_id, id).await? { return Err((StatusCode::CONFLICT, "stale execution".into())); }
     let success = input.result.status == "completed";
-    sqlx::query("UPDATE executions SET state=?,finished_at=?,result=? WHERE id=?")
+    sqlx::query("UPDATE executions SET state=?,finished_at=?,result=?,lease_capability_hash=NULL WHERE id=?")
         .bind(if success { "completed" } else { "failed" }).bind(ts(now)).bind(json(&input.result)?).bind(id.to_string())
         .execute(&mut *tx).await.map_err(db_error)?;
     sqlx::query("UPDATE tasks SET state=?,sticky_worker_id=CASE WHEN ? THEN sticky_worker_id ELSE NULL END,updated_at=? WHERE id=?")
@@ -1115,7 +1162,24 @@ async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn require_worker(db: &SqlitePool, worker_id: Uuid, headers: &HeaderMap) -> Result<(), ApiError> {
+fn issue_lease_capability() -> (String, String) {
+    let capability = format!("ltc_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let hash = hash_secret(&capability);
+    (capability, hash)
+}
+
+pub(crate) fn require_lease_capability(headers: &HeaderMap, stored_hash: &str) -> Result<(), ApiError> {
+    let supplied = headers
+        .get(LEASE_CAPABILITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or((StatusCode::UNAUTHORIZED, "lease capability required".into()))?;
+    if !secure_hash_eq(&hash_secret(supplied), stored_hash) {
+        return Err((StatusCode::UNAUTHORIZED, "lease capability rejected".into()));
+    }
+    Ok(())
+}
+
+pub(crate) async fn require_worker(db: &SqlitePool, worker_id: Uuid, headers: &HeaderMap) -> Result<(), ApiError> {
     let supplied = headers
         .get(WORKER_CREDENTIAL_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -1144,6 +1208,38 @@ fn secure_hash_eq(a: &str, b: &str) -> bool {
     let mut diff = 0u8;
     for (x, y) in a.as_bytes().iter().zip(b.as_bytes()) { diff |= x ^ y; }
     diff == 0
+}
+
+async fn review_reserved_for_live_preferred_reviewer(
+    db: &SqlitePool,
+    task: &Task,
+    project: &Project,
+    claimant_id: Uuid,
+) -> Result<bool, ApiError> {
+    let preferred_id: Option<String> = sqlx::query_scalar(
+        "SELECT reviewer_worker_id FROM reviews WHERE task_id=? AND state='completed' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(task.id.to_string())
+    .fetch_optional(db)
+    .await
+    .map_err(db_error)?;
+    let Some(preferred_id) = preferred_id else { return Ok(false); };
+    if preferred_id == claimant_id.to_string() { return Ok(false); }
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?")
+        .bind(&preferred_id)
+        .fetch_optional(db)
+        .await
+        .map_err(db_error)?;
+    let Some(row) = row else { return Ok(false); };
+    let preferred = worker_from_row(&row)?;
+    let fresh_after = Utc::now() - chrono::Duration::seconds(45);
+    let live = preferred.role == AgentRole::Reviewer
+        && preferred.protocol_version >= PROTOCOL_VERSION
+        && preferred.running_slots < preferred.slots
+        && matches!(preferred.state, WorkerState::Idle | WorkerState::Busy)
+        && preferred.last_heartbeat_at >= fresh_after
+        && worker_can_run_project(&preferred, project);
+    Ok(live)
 }
 
 async fn dependencies_satisfied(db: &SqlitePool, task: &Task) -> Result<bool, ApiError> {
@@ -1179,7 +1275,7 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
         let mut tx = db.begin().await?;
         let latest: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
             .bind(&task_id).fetch_optional(&mut *tx).await?;
-        sqlx::query("UPDATE executions SET state='lost',finished_at=? WHERE id=? AND state IN ('assigned','running')")
+        sqlx::query("UPDATE executions SET state='lost',finished_at=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running')")
             .bind(&now).bind(&id).execute(&mut *tx).await?;
         if latest.as_deref() == Some(id.as_str()) {
             sqlx::query("UPDATE tasks SET state='queued',updated_at=? WHERE id=? AND state IN ('assigned','running')")
@@ -1196,7 +1292,7 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
         let id: String = row.try_get("id")?;
         let reviewer_worker_id: String = row.try_get("reviewer_worker_id")?;
         let mut tx = db.begin().await?;
-        let changed = sqlx::query("UPDATE reviews SET state='lost',finished_at=? WHERE id=? AND state IN ('assigned','running')")
+        let changed = sqlx::query("UPDATE reviews SET state='lost',finished_at=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running')")
             .bind(&now).bind(&id).execute(&mut *tx).await?.rows_affected();
         if changed > 0 {
             sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
@@ -1244,7 +1340,7 @@ fn git_auth_summary(stored: &StoredGitAuth) -> GitAuthConfig {
 fn git_credential_key(state: &AppState) -> Result<&[u8; 32], ApiError> {
     state.git_credential_key.as_ref().ok_or((
         StatusCode::CONFLICT,
-        "LAZYTEAM_GIT_CREDENTIAL_KEY must be configured before storing or using server-managed Git credentials".into(),
+        "Host Git credential encryption key is unavailable".into(),
     ))
 }
 
@@ -1346,7 +1442,7 @@ fn resolve_updated_git_auth(
     }
 }
 
-fn git_credential_from_row(state: &AppState, row: &sqlx::sqlite::SqliteRow) -> Result<GitCredential, ApiError> {
+pub(crate) fn git_credential_from_row(state: &AppState, row: &sqlx::sqlite::SqliteRow) -> Result<GitCredential, ApiError> {
     let stored = stored_git_auth_from_row(row)?;
     match stored.mode {
         GitAuthMode::Worker => Ok(GitCredential::Worker),
