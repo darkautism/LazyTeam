@@ -187,5 +187,21 @@ mod tests {
         assert!(INDEX.contains("merge_pending"));
         assert!(!INDEX.contains(">Approve</button>"));
         assert!(!INDEX.contains(">Retry</button>"));
+        // Review-loop signal: durable attempt/review counts on Home cards.
+        assert!(INDEX.contains("loopCounts"));
+        assert!(INDEX.contains("loopMeta"));
+        assert!(INDEX.contains("isLoopingCounts"));
+        assert!(INDEX.contains("Build "));
+        assert!(INDEX.contains("Reviews "));
+        assert!(INDEX.contains("Returned "));
+        assert!(INDEX.contains("Looping"));
+        assert!(INDEX.contains("loop-pill"));
+        assert!(INDEX.contains("looping-pill"));
+        assert!(INDEX.contains("review_rounds"));
+        assert!(INDEX.contains("reviewer_retries"));
+        // Compact card layout and 3-line summary behavior are preserved.
+        assert!(INDEX.contains("compactCard(t.title,cardSummary(x),"));
+        // Looping derives from durable counts only, never review_feedback prose.
+        assert!(!INDEX.contains("review_feedback"));
     }
 }
