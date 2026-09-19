@@ -107,7 +107,11 @@ if (( ${#packages[@]} > 0 )); then
   package_args="$(printf '%q ' "${packages[@]}")"
   export LAZYTEAM_BUILD_ROOTFS="$rootfs_stage"
   export LAZYTEAM_BUILD_PACKAGES="$package_args"
-  unshare --user --map-root-user --mount --pid --fork /bin/bash -c '
+  namespace_args=(--user --map-root-user --mount --pid --fork)
+  if [[ "${LAZYTEAM_TRUSTED_CONTAINER_DAEMON:-}" == "1" ]]; then
+    namespace_args=(--mount --pid --fork)
+  fi
+  unshare "${namespace_args[@]}" /bin/bash -c '
     set -euo pipefail
     rootfs="$LAZYTEAM_BUILD_ROOTFS"
     mount --make-rprivate /

@@ -22,6 +22,8 @@ struct SandboxSpec {
     namespace_root_base: PathBuf,
     container_rootfs: Option<PathBuf>,
     container_read_only: Vec<PathBuf>,
+    #[serde(default)]
+    trusted_container_daemon: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,12 +41,18 @@ pub struct AgentSandbox {
     rustup_home: Option<PathBuf>,
     container_rootfs: Option<PathBuf>,
     container_read_only: Vec<PathBuf>,
+    trusted_container_daemon: bool,
 }
 
 impl AgentSandbox {
     pub async fn prepare(state_dir: &Path, pi_bin: &str, container_rootfs: Option<&Path>) -> anyhow::Result<Self> {
         let state_dir = canonical_dir(state_dir).context("canonicalize worker state directory")?;
         let container_rootfs = container_rootfs.map(canonical_dir).transpose().context("canonicalize agent rootfs")?;
+        let trusted_container_daemon = container_rootfs.is_some()
+            && std::env::var_os("LAZYTEAM_TRUSTED_CONTAINER_DAEMON").is_some_and(|value| value == "1");
+        if trusted_container_daemon && unsafe { libc::geteuid() } != 0 {
+            bail!("trusted container daemon mode requires container uid 0");
+        }
         let pi_config_dir = state_dir.join("pi-agent");
         let home_dir = state_dir.join("agent-home");
         let cargo_home = state_dir.join("agent-cache").join("cargo");
@@ -142,6 +150,7 @@ impl AgentSandbox {
             rustup_home,
             container_rootfs,
             container_read_only: container_read_only.into_iter().collect(),
+            trusted_container_daemon,
         };
         sandbox.probe().await?;
         Ok(sandbox)
@@ -210,6 +219,7 @@ impl AgentSandbox {
             namespace_root_base: self.namespace_root_base.clone(),
             container_rootfs: self.container_rootfs.clone(),
             container_read_only: self.container_read_only.clone(),
+            trusted_container_daemon: self.trusted_container_daemon,
         };
         let mut command = Command::new(std::env::current_exe().context("resolve lazyteam-worker executable")?);
         command.arg(if self.container_rootfs.is_some() { CONTAINER_EXEC_ARG } else { EXEC_ARG }).arg(program);
@@ -373,7 +383,11 @@ fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
     use std::{ffi::CString, fs, os::unix::ffi::OsStrExt, ptr};
 
     let rootfs = spec.container_rootfs.as_ref().context("agent container rootfs is missing")?;
-    if !root_in_outer_user_namespace()? {
+    if spec.trusted_container_daemon {
+        if unsafe { libc::geteuid() } != 0 {
+            bail!("trusted container daemon sandbox helper lost container uid 0");
+        }
+    } else if !root_in_outer_user_namespace()? {
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
         if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {

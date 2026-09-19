@@ -149,9 +149,8 @@ if [ "$runtime_uid" -ne 0 ]; then
   umask 027
   case "${1:-}" in
     lazyteam-worker|/usr/local/bin/lazyteam-worker)
-      export LAZYTEAM_DAEMON_USERNS_UID="$runtime_uid"
-      export LAZYTEAM_DAEMON_USERNS_GID="$runtime_gid"
-      echo "lazyteam-entrypoint: entering rootless daemon user namespace for $runtime_uid:$runtime_gid (auto source: $source)"
+      export LAZYTEAM_TRUSTED_CONTAINER_DAEMON=1
+      echo "lazyteam-entrypoint: running trusted worker daemon with container mount capability (state owner: $runtime_uid:$runtime_gid; auto source: $source)"
       exec "$@"
       ;;
     *)
