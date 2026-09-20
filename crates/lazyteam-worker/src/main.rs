@@ -1170,7 +1170,11 @@ async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dy
     sync_agent_workspace(&agent_workspace, &workspace).await?;
     auto_commit(&workspace, assignment).await?;
     let head_sha = git_output(&workspace, &["rev-parse", "HEAD"]).await?;
-    ensure_tracked_change(&head_sha, &base_sha)?;
+    // Compare tree content, not commit SHAs: an empty or equivalent-tree
+    // commit on top of the base is still a genuinely unchanged attempt.
+    let head_tree = git_output(&workspace, &["rev-parse", "HEAD^{tree}"]).await?;
+    let base_tree = git_output(&workspace, &["rev-parse", &format!("{base_sha}^{{tree}}")]).await?;
+    ensure_tracked_change(&head_tree, &base_tree)?;
     let commit_sha = Some(head_sha);
     let review_ref = task_branch(assignment);
     command_ok_with_auth(&workspace, "git", &["push", "origin", &format!("HEAD:refs/heads/{review_ref}")], git_auth).await?;
@@ -1220,12 +1224,13 @@ fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
     )
 }
 
-/// Zero-change guard: an attempt that ends exactly at the base produced no
-/// tracked delta. A retry that restored the prior candidate ends at the
-/// candidate commit instead, so amending-by-keeping still passes while a
-/// genuinely unchanged fresh task still fails.
-fn ensure_tracked_change(head_sha: &str, base_sha: &str) -> anyhow::Result<()> {
-    if head_sha.trim() == base_sha.trim() {
+/// Zero-change guard: compares tracked tree content, not commit SHAs, so an
+/// empty or equivalent-tree commit still counts as a genuinely unchanged
+/// attempt. A retry that restored the prior candidate ends at the candidate
+/// tree instead, so amending-by-keeping still passes while a genuinely
+/// unchanged fresh task still fails.
+fn ensure_tracked_change(head_tree: &str, base_tree: &str) -> anyhow::Result<()> {
+    if head_tree.trim() == base_tree.trim() {
         bail!("agent completed without producing any tracked change");
     }
     Ok(())
@@ -1267,7 +1272,7 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
         let seed = fetch_seeded_candidate(path, &branch_ref, git_auth).await?;
         checkout_task_branch(path, &branch).await?;
         if seed == SeedFetch::Present {
-            restore_seeded_candidate_tree(path).await?;
+            restore_seeded_candidate_tree(path, assignment).await?;
         }
         merge_ref_into_head(path, assignment, &base).await?;
         return Ok(base);
@@ -1356,13 +1361,18 @@ async fn origin_advertises_branch(path: &Path, branch_ref: &str, git_auth: &GitA
 /// Restore the trusted worktree to the last valid (server-seeded) candidate
 /// tree. A failed attempt can leave the reused branch at a descendant commit
 /// (e.g. an unpushed revert/overwrite, committed before the failed push) or
-/// a dirty worktree; ancestry merging would then keep the revert and hide
-/// the prior delta from the agent. Resetting to the seeded commit restores
-/// the candidate, and the pre-reset HEAD is preserved on a backup ref for
-/// forensics so nothing is silently dropped.
-async fn restore_seeded_candidate_tree(path: &Path) -> anyhow::Result<()> {
-    let head = git_output(path, &["rev-parse", "HEAD"]).await?;
+/// a dirty worktree (staged, uncommitted, or untracked changes, or an
+/// unfinished conflicted merge); ancestry merging would then keep the revert
+/// and hide the prior delta from the agent.
+///
+/// Nothing is discarded: dirty worktree state is committed first so staged,
+/// uncommitted, and untracked failed-attempt work is preserved, and the
+/// pre-reset HEAD is kept on a verified backup branch. Backup creation is
+/// fail-closed, and no `clean` is used, so candidate-related changes cannot
+/// be silently lost.
+async fn restore_seeded_candidate_tree(path: &Path, assignment: &Assignment) -> anyhow::Result<()> {
     let seeded = git_output(path, &["rev-parse", "--verify", SEEDED_CANDIDATE_REF]).await?;
+    let mut head = git_output(path, &["rev-parse", "HEAD"]).await?;
     // A failed attempt can also leave an uncommitted revert/overwrite or an
     // unfinished conflicted merge on top of the right commit, which would
     // likewise hide the prior delta from the agent.
@@ -1371,15 +1381,58 @@ async fn restore_seeded_candidate_tree(path: &Path) -> anyhow::Result<()> {
     if head == seeded && !dirty {
         return Ok(());
     }
-    let backup = format!("refs/lazyteam/retry-backup-{}", head.chars().take(12).collect::<String>());
-    let _ = trusted_git_command().args(["update-ref", &backup, &head]).current_dir(path).output().await;
-    if trusted_git_command().args(["reset", "--hard", SEEDED_CANDIDATE_REF]).current_dir(path).status().await?.success() {
-        return Ok(());
+    if dirty {
+        // Commit staged, uncommitted, and untracked (`-A`) worktree state
+        // before resetting, so failed-attempt work survives on the backup
+        // branch instead of being discarded by the reset.
+        command_ok(path, "git", &["add", "-A"]).await?;
+        let commit = trusted_git_command()
+            .args([
+                "-c",
+                &format!("user.name={}", assignment.project.contributor.name),
+                "-c",
+                &format!("user.email={}", assignment.project.contributor.email),
+                "commit",
+                "-m",
+                "lazyteam: preserve pre-retry worktree",
+            ])
+            .current_dir(path)
+            .output()
+            .await?;
+        if !commit.status.success() {
+            let still_dirty = !git_output(path, &["status", "--porcelain"]).await?.trim().is_empty()
+                || git_output(path, &["rev-parse", "--verify", "MERGE_HEAD"]).await.is_ok();
+            if still_dirty {
+                bail!(
+                    "cannot preserve pre-retry worktree changes: {}",
+                    String::from_utf8_lossy(&commit.stderr).trim()
+                );
+            }
+        }
+        head = git_output(path, &["rev-parse", "HEAD"]).await?;
     }
-    // Untracked files can shadow candidate paths and block the reset; remove
-    // non-ignored untracked files (info/exclude keeps build outputs) and
-    // retry once before failing closed.
-    command_ok(path, "git", &["clean", "-fd"]).await?;
+    // The worktree is committed now, so the reset cannot discard uncommitted
+    // state; the backup branch keeps the failed-attempt HEAD reachable.
+    let backup = format!("lazyteam/retry-backup-{}", head.chars().take(12).collect::<String>());
+    if trusted_git_command()
+        .args(["branch", "--no-track", &backup, &head])
+        .current_dir(path)
+        .status()
+        .await?
+        .success()
+    {
+        let created = git_output(path, &["rev-parse", "--verify", &format!("refs/heads/{backup}")]).await?;
+        if created != head {
+            bail!("retry backup branch {backup} verification failed");
+        }
+    } else {
+        // A rerun may race an identical backup name; tolerate it only when it
+        // already points at exactly this HEAD, and fail otherwise.
+        let existing = git_output(path, &["rev-parse", "--verify", &format!("refs/heads/{backup}")]).await?;
+        if existing != head {
+            bail!("retry backup branch {backup} already exists for a different commit");
+        }
+    }
     command_ok(path, "git", &["reset", "--hard", SEEDED_CANDIDATE_REF]).await?;
     Ok(())
 }
@@ -2042,7 +2095,7 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
         assert_eq!(git_output(&workspace, &["rev-parse", "HEAD"]).await.unwrap(), seeded);
         // The pre-reset descendant is preserved for forensics, not dropped.
-        assert!(!git_output(&workspace, &["for-each-ref", "refs/lazyteam/retry-backup-*"]).await.unwrap().is_empty());
+        assert!(!git_output(&workspace, &["for-each-ref", "refs/heads/lazyteam/retry-backup-*"]).await.unwrap().is_empty());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
@@ -2069,6 +2122,16 @@ mod tests {
         let auth = GitAuthContext::broker("worker-secret", "lease-secret");
         prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
         assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
+        // The tampered uncommitted work is preserved on the backup branch,
+        // not discarded: nothing staged, uncommitted, or untracked is lost.
+        let backup = git_output(&workspace, &["for-each-ref", "--format=%(refname:short)", "refs/heads/lazyteam/retry-backup-*"])
+            .await
+            .unwrap();
+        assert!(!backup.trim().is_empty());
+        let preserved = git_output(&workspace, &["show", &format!("{}:fix.txt", backup.lines().next().unwrap().trim())])
+            .await
+            .unwrap();
+        assert_eq!(preserved, "tampered");
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
@@ -2098,15 +2161,45 @@ mod tests {
     }
 
     #[test]
-    fn tracked_change_guard_fails_at_base_and_passes_at_candidate() {
-        // Genuinely unchanged fresh task: HEAD == base still fails, so the
+    fn tracked_change_guard_compares_trees_not_commit_shas() {
+        // Identical trees fail even with distinct commit SHAs, so the
         // zero-change completion error is preserved.
-        assert!(ensure_tracked_change("abc123", "abc123").is_err());
-        let error = ensure_tracked_change("abc123", "abc123").unwrap_err();
+        assert!(ensure_tracked_change("tree-abc", "tree-abc").is_err());
+        let error = ensure_tracked_change("tree-abc", "tree-abc").unwrap_err();
         assert!(error.to_string().contains("without producing any tracked change"));
         // Retry that restored the prior candidate ends at the candidate
-        // commit: amending-by-keeping passes the guard.
-        assert!(ensure_tracked_change("candidate-sha", "base-sha").is_ok());
+        // tree: amending-by-keeping passes the guard.
+        assert!(ensure_tracked_change("candidate-tree", "base-tree").is_ok());
+    }
+
+    /// An empty (or equivalent-tree) commit on top of the base resolves to
+    /// the same tree and must still trip the zero-change guard, while a
+    /// real content change passes it.
+    #[tokio::test]
+    async fn tracked_change_guard_rejects_empty_commit_with_identical_tree() {
+        let root = std::env::temp_dir().join(format!("lazyteam-guard-tree-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let repo = root.join("repo");
+        command_ok(&root, "git", &["init", repo.to_str().unwrap()]).await.unwrap();
+        command_ok(&repo, "git", &["config", "user.name", "LazyTeam Test"]).await.unwrap();
+        command_ok(&repo, "git", &["config", "user.email", "lazyteam-test@local"]).await.unwrap();
+        git_commit_file(&repo, "base.txt", "base\n", "base").await;
+        let base_tree = git_output(&repo, &["rev-parse", "HEAD^{tree}"]).await.unwrap();
+        // Empty commit: new SHA, identical tree. SHA comparison would pass
+        // this; tree comparison must reject it.
+        let head = git_output(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        command_ok(&repo, "git", &["commit", "--allow-empty", "-m", "empty"]).await.unwrap();
+        let empty_head = git_output(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_ne!(head, empty_head, "empty commit must mint a new SHA for this test to be meaningful");
+        let empty_tree = git_output(&repo, &["rev-parse", "HEAD^{tree}"]).await.unwrap();
+        assert_eq!(empty_tree, base_tree);
+        let error = ensure_tracked_change(&empty_tree, &base_tree).unwrap_err();
+        assert!(error.to_string().contains("without producing any tracked change"));
+        // Real content change passes.
+        git_commit_file(&repo, "fix.txt", "fix\n", "real change").await;
+        let changed_tree = git_output(&repo, &["rev-parse", "HEAD^{tree}"]).await.unwrap();
+        assert!(ensure_tracked_change(&changed_tree, &base_tree).is_ok());
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     /// A genuinely fresh task (no seeded candidate) still starts from the
