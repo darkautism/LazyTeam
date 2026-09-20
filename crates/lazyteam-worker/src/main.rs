@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, t
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
-use lazyteam_core::{can_claim_work, host_agent_selection_ready, AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, LEASE_CAPABILITY_HEADER};
+use lazyteam_core::{can_claim_work, host_agent_selection_ready, AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict, LEASE_CAPABILITY_HEADER};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -904,7 +904,20 @@ async fn execute_review_assignment(
     assignment: ReviewAssignment,
 ) -> anyhow::Result<()> {
     let review_id = assignment.review.id;
-    let slot = ReviewSlot::start(review_id, assignment.execution.id).await?;
+    let slot = match ReviewSlot::start(review_id, assignment.execution.id).await {
+        Ok(slot) => slot,
+        Err(error) => {
+            warn!(%review_id, %error, "reviewer MCP slot failed to start; reporting failed review");
+            let body = json!({"status":"failed","error":format!("reviewer MCP slot startup failed: {error}")});
+            let response = lease_auth(
+                client.post(format!("{server}/api/reviews/{review_id}/finish")),
+                worker_credential,
+                &assignment.lease_capability,
+            ).json(&body).send().await?;
+            ensure_success(response).await?;
+            return Ok(());
+        }
+    };
     let renew_slot = slot.clone();
     let renew_client = client.clone();
     let renew_server = server.to_string();
@@ -937,51 +950,51 @@ async fn execute_review_assignment(
         .join(&assignment.project.slug)
         .join(review_id.to_string());
     let auth = GitAuthContext::broker(worker_credential, &assignment.lease_capability);
-    // Serialize concurrent retries for the same logical session: the guard is
-    // held across refresh → run → bind so a second arrival waits, then
-    // resumes the bound session instead of creating a duplicate backend
-    // session that would orphan one of them.
-    let session_lock = session_manager.lock_session(session.task_id, session.role).await;
-    let session = session_manager.acquire_with(&session_lock, session.task_id, session.role, &session.backend).await?;
-    let outcome = if !runtime.supports_reviewer_mcp() {
-        Err(anyhow::anyhow!("{} runtime cannot attach the required reviewer MCP terminal", runtime.kind()))
-    } else {
-        match prepare_review_workspace(&workspace, &assignment, &auth).await {
-            Ok(()) => {
-                let agent_workspace = sandbox.reviewer_workspace(task_id);
-                let review_base = assignment.checkout.upstream_sha.as_deref().or(assignment.checkout.base_sha.as_deref());
-                prepare_agent_workspace(&workspace, &agent_workspace, review_base).await?;
-                let prompt = build_review_prompt(initial_prompt, &assignment)?;
-                let review_run = runtime.run_review_with_mcp(
-                    &agent_workspace,
-                    &prompt,
-                    session.backend_session_id.as_deref(),
-                    slot.endpoint(),
-                );
-                tokio::pin!(review_run);
-                let verdict = tokio::select! {
-                    verdict = slot.wait() => verdict,
-                    run = &mut review_run => {
-                        let agent = run?;
-                        persist_backend_session_binding(session_manager, &session_lock, &session, &agent).await?;
-                        match tokio::time::timeout(Duration::from_secs(2), slot.wait()).await {
-                            Ok(verdict) => verdict,
-                            Err(_) => Err(anyhow::anyhow!("reviewer ended without calling submit_review MCP tool")),
-                        }
-                    }
-                }?;
-                let dirty = git_status_external_worktree(&workspace, &agent_workspace)
-                    .await
-                    .unwrap_or_else(|error| format!("status-check-error: {error}"));
-                if !dirty.is_empty() {
-                    Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
-                } else {
-                    Ok(verdict)
+    // From this point onward the Host already owns an active review lease.
+    // Capture every local/runtime error into `outcome`; never `?` out of this
+    // function before POSTing /finish, or the Host can only observe a lost lease.
+    let outcome: anyhow::Result<ReviewVerdict> = async {
+        if !runtime.supports_reviewer_mcp() {
+            bail!("{} runtime cannot attach the required reviewer MCP terminal", runtime.kind());
+        }
+        // Serialize concurrent retries for the same logical session: the guard is
+        // held across refresh → run → bind so a second arrival waits, then resumes
+        // the bound session instead of orphaning a duplicate backend session.
+        let session_lock = session_manager.lock_session(session.task_id, session.role).await;
+        let session = session_manager
+            .acquire_with(&session_lock, session.task_id, session.role, &session.backend)
+            .await?;
+        prepare_review_workspace(&workspace, &assignment, &auth).await?;
+        let agent_workspace = sandbox.reviewer_workspace(task_id);
+        let review_base = assignment.checkout.upstream_sha.as_deref().or(assignment.checkout.base_sha.as_deref());
+        prepare_agent_workspace(&workspace, &agent_workspace, review_base).await?;
+        let prompt = build_review_prompt(initial_prompt, &assignment)?;
+        let review_run = runtime.run_review_with_mcp(
+            &agent_workspace,
+            &prompt,
+            session.backend_session_id.as_deref(),
+            slot.endpoint(),
+        );
+        tokio::pin!(review_run);
+        let verdict = tokio::select! {
+            verdict = slot.wait() => verdict,
+            run = &mut review_run => {
+                let agent = run?;
+                persist_backend_session_binding(session_manager, &session_lock, &session, &agent).await?;
+                match tokio::time::timeout(Duration::from_secs(2), slot.wait()).await {
+                    Ok(verdict) => verdict,
+                    Err(_) => Err(anyhow::anyhow!("reviewer ended without calling submit_review MCP tool")),
                 }
             }
-            Err(error) => Err(error),
+        }?;
+        let dirty = git_status_external_worktree(&workspace, &agent_workspace)
+            .await
+            .unwrap_or_else(|error| format!("status-check-error: {error}"));
+        if !dirty.is_empty() {
+            bail!("reviewer modified the pinned source checkout; review discarded: {dirty}");
         }
-    };
+        Ok(verdict)
+    }.await;
     renew.abort();
 
     let body = match outcome {

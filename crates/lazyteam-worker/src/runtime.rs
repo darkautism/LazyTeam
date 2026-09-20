@@ -251,45 +251,48 @@ impl Drop for TempExtension {
 
 fn pi_reviewer_mcp_bridge_source(endpoint: &str) -> anyhow::Result<String> {
     let endpoint = serde_json::to_string(endpoint)?;
-    Ok(format!(r#"import type {{ ExtensionAPI }} from \"@earendil-works/pi-coding-agent\";
-import {{ Type }} from \"typebox\";
+    Ok(format!(r#"const endpoint = {endpoint};
+// Dependency-free by design: this file lives in a per-slot session directory,
+// outside Pi's package tree. Semantic validation belongs to the Rust MCP slot.
+const params = {{
+  type: "object",
+  additionalProperties: true,
+  properties: {{
+    verdict: {{ description: "Required: approve or retry" }},
+    reason: {{ description: "Required non-empty review reason" }},
+    validation: {{ description: "Required array of validation evidence strings" }},
+  }},
+}};
 
-const endpoint = {endpoint};
-const params = Type.Object({{
-  verdict: Type.Optional(Type.Any({{ description: \"approve or retry\" }})),
-  reason: Type.Optional(Type.Any({{ description: \"non-empty review reason\" }})),
-  validation: Type.Optional(Type.Any({{ description: \"array of validation evidence strings\" }})),
-}}, {{ additionalProperties: true }});
-
-export default function lazyteamReviewerMcp(pi: ExtensionAPI) {{
+export default function lazyteamReviewerMcp(pi) {{
   pi.registerTool({{
-    name: \"submit_review\",
-    label: \"Submit review\",
-    description: \"Submit the terminal LazyTeam review verdict through MCP. If the server rejects arguments, correct them and call again without redoing the review.\",
+    name: "submit_review",
+    label: "Submit review",
+    description: "Submit the terminal LazyTeam review verdict through MCP. If the server rejects arguments, correct them and call again without redoing the review.",
     parameters: params,
-    executionMode: \"sequential\",
+    executionMode: "sequential",
     async execute(_toolCallId, input) {{
       const body = {{
-        jsonrpc: \"2.0\",
+        jsonrpc: "2.0",
         id: `review-${{Date.now()}}-${{Math.random()}}`,
-        method: \"tools/call\",
+        method: "tools/call",
         params: {{
           _meta: {{
-            \"io.modelcontextprotocol/protocolVersion\": \"2026-07-28\",
-            \"io.modelcontextprotocol/clientCapabilities\": {{}},
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {{}},
           }},
-          name: \"submit_review\",
+          name: "submit_review",
           arguments: input,
         }},
       }};
       const response = await fetch(endpoint, {{
-        method: \"POST\",
+        method: "POST",
         headers: {{
-          \"content-type\": \"application/json\",
-          \"accept\": \"application/json, text/event-stream\",
-          \"MCP-Protocol-Version\": \"2026-07-28\",
-          \"Mcp-Method\": \"tools/call\",
-          \"Mcp-Name\": \"submit_review\",
+          "content-type": "application/json",
+          "accept": "application/json, text/event-stream",
+          "MCP-Protocol-Version": "2026-07-28",
+          "Mcp-Method": "tools/call",
+          "Mcp-Name": "submit_review",
         }},
         body: JSON.stringify(body),
       }});
@@ -297,11 +300,11 @@ export default function lazyteamReviewerMcp(pi: ExtensionAPI) {{
       if (!response.ok || result.error) throw new Error(result.error?.message || `review MCP HTTP ${{response.status}}`);
       const tool = result.result || {{}};
       const text = Array.isArray(tool.content)
-        ? tool.content.filter((item: any) => item?.type === \"text\").map((item: any) => item.text).join(\"\\n\")
-        : \"\";
-      if (tool.isError) throw new Error(text || \"submit_review rejected\");
+        ? tool.content.filter((item) => item?.type === "text").map((item) => item.text).join("\\n")
+        : "";
+      if (tool.isError) throw new Error(text || "submit_review rejected");
       return {{
-        content: Array.isArray(tool.content) ? tool.content : [{{ type: \"text\", text: \"Review verdict accepted\" }}],
+        content: Array.isArray(tool.content) ? tool.content : [{{ type: "text", text: "Review verdict accepted" }}],
         details: tool.structuredContent || {{}},
       }};
     }},
@@ -353,7 +356,11 @@ impl PiRuntime {
         }
         if let Some(provider) = &self.provider { command.arg("--provider").arg(provider); }
         if let Some(model) = &self.model { command.arg("--model").arg(model); }
-        if let Some(extension) = extension { command.arg("--extension").arg(extension); }
+        if let Some(extension) = extension {
+            // Reviewer verdict transport must be deterministic: load only the
+            // explicit slot bridge, not ambient/project extensions.
+            command.arg("--no-extensions").arg("--extension").arg(extension);
+        }
         command.current_dir(workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         command.kill_on_drop(true);
 
@@ -519,6 +526,10 @@ impl PiRuntime {
                 Some("extension_ui_request") => {
                     let _ = child.kill().await;
                     bail!("Pi requested interactive extension UI; worker tasks must be unattended");
+                }
+                Some("extension_error") if extension.is_some() => {
+                    let _ = child.kill().await;
+                    bail!("Pi reviewer MCP bridge failed to load");
                 }
                 Some("tool_execution_end") => {
                     if let Some((soft, hard)) = review_budgets {
@@ -785,6 +796,15 @@ mod tests {
         assert!(review_steer_message(13, 12, 20).is_none());
         assert!(review_steer_message(20, 12, 20).is_some());
         assert!(review_steer_message(21, 12, 20).is_none());
+    }
+
+    #[test]
+    fn reviewer_mcp_bridge_is_dependency_free_and_registers_terminal_tool() {
+        let source = pi_reviewer_mcp_bridge_source("http://127.0.0.1:12345/mcp/cap").unwrap();
+        assert!(!source.contains("import "), "temporary reviewer extension must not depend on node module resolution");
+        assert!(source.contains("name: \"submit_review\""));
+        assert!(source.contains("method: \"tools/call\""));
+        assert!(source.contains("http://127.0.0.1:12345/mcp/cap"));
     }
 
     #[test]
