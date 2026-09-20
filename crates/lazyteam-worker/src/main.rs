@@ -1097,18 +1097,7 @@ fn parse_review_verdict(raw: &str) -> anyhow::Result<ReviewVerdict> {
     bail!("reviewer did not return the required JSON verdict")
 }
 
-/// Bounded excerpt length for malformed verdict diagnostics: enough to
-/// identify a truncation or prose wrapper, never a full model output dump.
-const MALFORMED_VERDICT_EXCERPT_CHARS: usize = 500;
-/// Bounded length for a failed repair request's backend error text. Backend
-/// errors can embed raw event payloads, so they are sanitized and capped
-/// exactly like model output before they reach logs or durable evidence.
-const MALFORMED_REPAIR_ERROR_CHARS: usize = 300;
-/// Redaction runs on a window slightly larger than the excerpt cap so a
-/// secret value that starts inside the visible excerpt but runs past it is
-/// still recognised as a value (and fully redacted) rather than leaking a
-/// prefix into the truncated diagnostic.
-const SECRET_REDACT_SLACK_CHARS: usize = 512;
+
 
 /// Resolve the review verdict for the current lease. A successfully parsed
 /// first output completes immediately. A format-only failure gets exactly one
@@ -1140,7 +1129,7 @@ async fn resolve_review_verdict_in_lease(
             return Err(anyhow::anyhow!(
                 "{}; format repair request failed: {}",
                 malformed_verdict_diagnostic(&first.summary),
-                sanitize_for_diagnostic(&format!("{error:#}"), MALFORMED_REPAIR_ERROR_CHARS),
+                backend_error_fingerprint(&error),
             ));
         }
     };
@@ -1151,7 +1140,7 @@ async fn resolve_review_verdict_in_lease(
             if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
                 return Err(anyhow::anyhow!(
                     "repaired reviewer verdict parsed but its session could not persist: {}",
-                    sanitize_for_diagnostic(&format!("{error:#}"), MALFORMED_REPAIR_ERROR_CHARS),
+                    backend_error_fingerprint(&error),
                 ));
             }
             info!("reviewer verdict repaired in-lease; completing existing review row");
@@ -1166,7 +1155,7 @@ async fn resolve_review_verdict_in_lease(
             if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
                 warn!(
                     "repaired reviewer session binding failed alongside malformed verdict: {}",
-                    sanitize_for_diagnostic(&format!("{error:#}"), MALFORMED_REPAIR_ERROR_CHARS),
+                    backend_error_fingerprint(&error),
                 );
             }
             Err(anyhow::anyhow!(malformed_verdict_diagnostic(&repaired.summary)))
@@ -1174,444 +1163,129 @@ async fn resolve_review_verdict_in_lease(
     }
 }
 
-/// Durable diagnostic for a malformed verdict: generic prefix plus bounded,
-/// sanitized excerpt/hash/length of the malformed final output. The excerpt is
-/// capped and control characters are stripped so logs and the persisted
-/// `failed` review error never carry secrets or giant model output.
+/// Durable diagnostic for a malformed verdict: hash/length plus
+/// fixed-vocabulary structural facts about the malformed final output. No
+/// input bytes are ever copied into the diagnostic — every emitted token
+/// after the fixed prefix is a number or a constant authored below — so the
+/// diagnostic is non-secret by construction however the model formatted its
+/// output, while still distinguishing truncation, prose-wrapping, and
+/// wrong-shape failures for diagnosis.
 fn malformed_verdict_diagnostic(raw: &str) -> String {
+    let trimmed = raw.trim();
     let len = raw.len();
     let hash = fnv1a64_hex(raw.as_bytes());
-    let excerpt = sanitized_verdict_excerpt(raw);
+    let lines = raw.lines().count();
+    let (object, cause) = classify_malformed_verdict(trimmed);
+    let keys = present_fixed_keys(trimmed);
+    let hint = verdict_hint(trimmed);
     format!(
-        "reviewer did not return the required JSON verdict (len={len} hash={hash} excerpt={excerpt:?})"
+        "reviewer did not return the required JSON verdict (len={len} hash={hash} lines={lines} object={object} keys={keys} hint={hint} cause={cause})"
     )
 }
 
-fn sanitized_verdict_excerpt(raw: &str) -> String {
-    sanitize_for_diagnostic(raw, MALFORMED_VERDICT_EXCERPT_CHARS)
-}
-
-/// Bound arbitrary untrusted text (model output or backend error text) for
-/// logs and durable `failed`-review evidence: redact common secret shapes
-/// first, then strip control characters and cap the length. Redaction runs
-/// before truncation so a secret is never persisted just because it appeared
-/// early in the output.
-fn sanitize_for_diagnostic(raw: &str, max_chars: usize) -> String {
-    let window: String = raw.chars().take(max_chars + SECRET_REDACT_SLACK_CHARS).collect();
-    let redacted = redact_secret_values(&window);
-    let cleaned: String = redacted
-        .chars()
-        .map(|c| if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c })
-        .collect();
-    let visible: String = cleaned.trim().chars().take(max_chars).collect();
-    let visible = visible.trim();
-    if visible.is_empty() { "(empty)".to_string() } else { visible.to_string() }
-}
-
-/// Redact secret shapes without any regex dependency across generic layers:
-/// PEM blocks, `Bearer` tokens, `name: value` / `name=value` pairs whose
-/// name contains a sensitive substring (so any `*_KEY`, `*_SECRET`,
-/// `*_TOKEN`, `*_PASSWORD` spelling is claimed without enumerating vendor
-/// prefixes), cookie-header values (session credentials by nature, whatever
-/// the cookie name), credentials embedded in URLs, and well-known token
-/// prefixes. Anything without a credential delimiter is left untouched.
-fn redact_secret_values(text: &str) -> String {
-    let text = redact_pem_blocks(text);
-    // Bearer before fields: `Authorization: Bearer <token>` must redact the
-    // credential, not just the `Bearer` scheme word a field pass would see.
-    let text = redact_bearer_tokens(&text);
-    let text = redact_secret_fields(&text);
-    let text = redact_cookie_values(&text);
-    let text = redact_url_credentials(&text);
-    redact_prefixed_tokens(&text)
-}
-
-/// ASCII case-insensitive search that only visits char boundaries, so
-/// ordinary non-ASCII model output (accents, ellipsis, CJK, emoji) can never
-/// cause a mid-character slice panic. The returned index is always a char
-/// boundary when the needle starts with an ASCII byte, because ASCII bytes
-/// never occur inside multi-byte UTF-8 sequences.
-fn find_ascii_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
-    let needle_bytes = needle.as_bytes();
-    if needle_bytes.is_empty() || haystack.len() < needle_bytes.len() {
-        return None;
+/// Classify the outer JSON-object shape without echoing any input. The
+/// `{`/`}` offsets come from `str::find` on ASCII bytes, so the candidate
+/// slice cannot split a UTF-8 character.
+fn classify_malformed_verdict(trimmed: &str) -> (&'static str, &'static str) {
+    if trimmed.is_empty() {
+        return ("absent", "empty");
     }
-    let haystack_bytes = haystack.as_bytes();
-    let from = haystack.floor_char_boundary(from.min(haystack.len()));
-    for (rel, _) in haystack[from..].char_indices() {
-        let i = from + rel;
-        if i + needle_bytes.len() > haystack_bytes.len() {
-            break;
-        }
-        if haystack_bytes[i..i + needle_bytes.len()]
-            .iter()
-            .zip(needle_bytes.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
-        {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Replace every `-----BEGIN ... [-----END ...]` span with a placeholder. An
-/// unterminated block is redacted through the end of the window so a key
-/// whose END marker was truncated away still never leaks.
-fn redact_pem_blocks(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    loop {
-        let Some(begin) = find_ascii_ci(rest, "-----BEGIN", 0) else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..begin]);
-        let after_begin = &rest[begin..];
-        match find_ascii_ci(after_begin, "-----END", "-----BEGIN".len()) {
-            Some(end_rel) => {
-                let mut end = begin + end_rel + "-----END".len();
-                while end < rest.len() && rest.as_bytes()[end] == b'-' {
-                    end += 1;
-                }
-                out.push_str("[redacted-key-material]");
-                rest = &rest[end..];
-            }
-            None => {
-                out.push_str("[redacted-key-material]");
-                break;
+    let (start, end) = match (trimmed.find('{'), trimmed.rfind('}')) {
+        (Some(start), Some(end)) if start <= end => (start, end),
+        (None, None) => return ("absent", "no-object"),
+        _ => return ("unbalanced", "unbalanced"),
+    };
+    let object = if start == 0 && end + 1 == trimmed.len() { "whole" } else { "wrapped" };
+    match serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+        Err(_) => (object, "invalid-json"),
+        // Mirror `parse_review_verdict`'s strictness structurally: an empty
+        // reason or any other valid-JSON-but-not-a-verdict shape, without
+        // echoing the offending values.
+        Ok(value) => {
+            let reason_empty = value
+                .get("reason")
+                .and_then(|reason| reason.as_str())
+                .is_some_and(|reason| reason.trim().is_empty());
+            if reason_empty {
+                (object, "empty-reason")
+            } else {
+                (object, "shape-mismatch")
             }
         }
     }
-    out
 }
 
-/// Sensitive field names whose associated value must not reach diagnostics.
-/// Longest-first so `access_token` wins over `token` at the same position.
-const SECRET_FIELD_NAMES: &[&str] = &[
-    "aws_secret_access_key",
-    "aws_session_token",
-    "secret_access_key",
-    "access_token",
-    "refresh_token",
-    "client_secret",
-    "private_key",
-    "session_token",
-    "secretaccesskey",
-    "auth_token",
-    "id_token",
-    "api_key",
-    "authorization",
-    "password",
-    "passwd",
-    "credential",
-    "secret",
-    "session",
-    "token",
-    "apikey",
-    "api-key",
-    // Generic credential-identifier tail: with the substring match plus the
-    // identifier-suffix skip in `redact_secret_field`, any `ENCRYPTION_KEY`,
-    // `PRIVATE_KEY`, or vendor `*_KEY` spelling is claimed.
-    "key",
-];
-
-fn redact_secret_fields(text: &str) -> String {
-    let mut current = text.to_string();
-    for name in SECRET_FIELD_NAMES {
-        current = redact_secret_field(&current, name);
+/// Fixed-vocabulary presence signals over literal JSON key names. Only the
+/// constant labels below are ever emitted.
+fn present_fixed_keys(trimmed: &str) -> &'static str {
+    match (
+        trimmed.contains("\"verdict\""),
+        trimmed.contains("\"reason\""),
+        trimmed.contains("\"validation\""),
+    ) {
+        (true, true, true) => "verdict,reason,validation",
+        (true, true, false) => "verdict,reason",
+        (true, false, true) => "verdict,validation",
+        (false, true, true) => "reason,validation",
+        (true, false, false) => "verdict",
+        (false, true, false) => "reason",
+        (false, false, true) => "validation",
+        (false, false, false) => "none",
     }
-    current
 }
 
-/// Redact the value of one `name: value` / `name=value` pair (quoted JSON
-/// strings or bare tokens). The sensitive name matches as a substring, so a
-/// longer identifier such as `STRIPE_SECRET_KEY` is claimed via `secret`:
-/// trailing identifier characters (`[A-Za-z0-9_-]`) are skipped before the
-/// delimiter check. Occurrences without a `:`/`=` delimiter are ordinary
-/// prose and are left untouched.
-fn redact_secret_field(text: &str, name: &str) -> String {
-    let mut out = String::new();
-    let mut cursor = 0;
-    while let Some(rel) = find_ascii_ci(text, name, cursor) {
-        let bytes = text.as_bytes();
-        let mut j = rel + name.len();
-        // Skip the rest of a longer identifier (`SECRET_KEY`, `secret-key`,
-        // `secretAccessKey`, ...) so compound credential names are covered
-        // without enumerating every vendor prefix.
-        while j < bytes.len()
-            && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
-        {
-            j += 1;
-        }
-        while j < bytes.len()
-            && (bytes[j] == b'"' || bytes[j] == b'\'' || bytes[j] == b']' || bytes[j].is_ascii_whitespace())
-        {
-            j += 1;
-        }
-        if j < bytes.len() && (bytes[j] == b':' || bytes[j] == b'=') {
-            j += 1;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
-                let quote = bytes[j];
-                j += 1;
-                let mut k = j;
-                while k < bytes.len() && bytes[k] != quote {
-                    k += 1;
-                    if k < bytes.len() && bytes[k - 1] == b'\\' {
-                        k += 1; // skip the escaped byte (e.g. \" in JSON)
-                    }
-                }
-                if k < bytes.len() {
-                    k += 1; // consume the closing quote
-                }
-                out.push_str(&text[cursor..rel]);
-                out.push_str(&text[rel..rel + name.len()]);
-                out.push_str("=[redacted]");
-                cursor = k;
-                continue;
-            }
-            let mut k = j;
-            while k < bytes.len()
-                && !matches!(bytes[k], b'"' | b'\'' | b',' | b'}' | b']' | b';' | b')')
-                && !bytes[k].is_ascii_whitespace()
-            {
-                k += 1;
-            }
-            if k > j {
-                out.push_str(&text[cursor..rel]);
-                out.push_str(&text[rel..rel + name.len()]);
-                out.push_str("=[redacted]");
-                cursor = k;
-                continue;
-            }
-        }
-        out.push_str(&text[cursor..rel + name.len()]);
-        cursor = rel + name.len();
+/// Fixed-vocabulary presence signal over the two legal verdict literals.
+/// Emits only the constant labels below, never input text.
+fn verdict_hint(trimmed: &str) -> &'static str {
+    match (trimmed.contains("approve"), trimmed.contains("retry")) {
+        (true, true) => "both",
+        (true, false) => "approve",
+        (false, true) => "retry",
+        (false, false) => "none",
     }
-    out.push_str(&text[cursor..]);
-    out
 }
 
-/// Redact credentials embedded in URLs (`scheme://user:password@host...`)
-/// by replacing the password between the last `:` and `@`. A bare
-/// `scheme://user@host` userinfo without a password is left untouched, as
-/// are `host:port` segments, which have no `@` before the next delimiter.
-fn redact_url_credentials(text: &str) -> String {
-    let mut out = String::new();
-    let mut cursor = 0;
-    // `"://"` is ASCII, so every offset derived here is a char boundary.
-    while let Some(rel) = text[cursor..].find("://") {
-        let authority = cursor + rel + "://".len();
-        let bytes = text.as_bytes();
-        let mut end = authority;
-        while end < bytes.len() {
-            let byte = bytes[end];
-            if byte == b'/' || byte == b'?' || byte == b'#' || byte == b'"' || byte == b'\'' || bytes[end].is_ascii_whitespace() {
-                break;
-            }
-            end += 1;
-        }
-        // The last `@` in the segment separates credentials from the host,
-        // so a password containing `@` is redacted in full.
-        if let Some(at) = text[authority..end].rfind('@') {
-            let at = authority + at;
-            if let Some(colon) = text[authority..at].rfind(':') {
-                let absolute = authority + colon;
-                out.push_str(&text[cursor..=absolute]);
-                out.push_str("[redacted]");
-                cursor = at;
-                continue;
-            }
-        }
-        out.push_str(&text[cursor..authority]);
-        cursor = authority;
-    }
-    out.push_str(&text[cursor..]);
-    out
+/// Fingerprint a backend/session error for durable evidence and logs
+/// without copying its text: backend errors can embed raw event payloads,
+/// so only a closed operational label plus length and hash are emitted.
+fn backend_error_fingerprint(error: &anyhow::Error) -> String {
+    let full = format!("{error:#}");
+    format!(
+        "error_kind={} error_len={} error_hash={}",
+        classify_backend_error(&full),
+        full.len(),
+        fnv1a64_hex(full.as_bytes()),
+    )
 }
 
-/// Redact cookie values generically: after a `Cookie:` / `Set-Cookie:`
-/// header, every `name=value` pair carries a session credential by nature,
-/// so each value is replaced regardless of cookie name (`connect.sid`,
-/// `sessionid`, ...). Only `=`-bound values on the header line are touched;
-/// a header with no pairs passes through unchanged.
-fn redact_cookie_values(text: &str) -> String {
-    let mut out = String::new();
-    let mut cursor = 0;
-    while let Some(rel) = find_ascii_ci(text, "cookie", cursor) {
-        let bytes = text.as_bytes();
-        let mut j = rel + "cookie".len();
-        while j < bytes.len()
-            && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
-        {
-            j += 1;
-        }
-        while j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'' || bytes[j].is_ascii_whitespace()) {
-            j += 1;
-        }
-        if j < bytes.len() && bytes[j] == b':' {
-            j += 1;
-            let mut line_end = j;
-            while line_end < bytes.len() && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
-                line_end += 1;
-            }
-            // `line_end` rests on an ASCII newline or the string end, so
-            // every slice below lands on a char boundary.
-            out.push_str(&text[cursor..j]);
-            let mut k = j;
-            while k < line_end {
-                if bytes[k] == b'=' {
-                    k += 1;
-                    while k < line_end && bytes[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
-                    out.push('=');
-                    if k < line_end && (bytes[k] == b'"' || bytes[k] == b'\'') {
-                        // Quoted value: consume through the closing quote so
-                        // `connect.sid="..."` cannot leak its contents.
-                        let quote = bytes[k];
-                        k += 1;
-                        while k < line_end && bytes[k] != quote {
-                            k += 1;
-                        }
-                        if k < line_end {
-                            k += 1; // consume the closing quote
-                        }
-                        out.push(quote as char);
-                        out.push_str("[redacted]");
-                        out.push(quote as char);
-                    } else {
-                        out.push_str("[redacted]");
-                        while k < line_end
-                            && !matches!(bytes[k], b';' | b'"' | b'\'')
-                            && !bytes[k].is_ascii_whitespace()
-                        {
-                            k += 1;
-                        }
-                    }
-                } else {
-                    let start = k;
-                    k += 1;
-                    // Never split a multi-byte character: advance to the
-                    // next char boundary before slicing.
-                    while k < line_end && !text.is_char_boundary(k) {
-                        k += 1;
-                    }
-                    out.push_str(&text[start..k]);
-                }
-            }
-            cursor = line_end;
-            continue;
-        }
-        out.push_str(&text[cursor..rel + "cookie".len()]);
-        cursor = rel + "cookie".len();
-    }
-    out.push_str(&text[cursor..]);
-    out
-}
-
-/// Redact `Bearer <token>` credential values, keeping only the scheme name.
-fn redact_bearer_tokens(text: &str) -> String {
-    let mut out = String::new();
-    let mut cursor = 0;
-    while let Some(rel) = find_ascii_ci(text, "bearer", cursor) {
-        let bytes = text.as_bytes();
-        let mut j = rel + "bearer".len();
-        if j < bytes.len() && bytes[j].is_ascii_whitespace() {
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            let mut k = j;
-            let mut quoted = None;
-            if k < bytes.len() && (bytes[k] == b'"' || bytes[k] == b'\'') {
-                quoted = Some(bytes[k]);
-                k += 1;
-            }
-            let start = k;
-            while k < bytes.len()
-                && !bytes[k].is_ascii_whitespace()
-                && !matches!(bytes[k], b'"' | b'\'' | b',' | b'}' | b';')
-            {
-                k += 1;
-            }
-            if let Some(quote) = quoted {
-                if k < bytes.len() && bytes[k] == quote {
-                    k += 1;
-                }
-            }
-            if k > start {
-                out.push_str(&text[cursor..rel]);
-                out.push_str("Bearer [redacted]");
-                cursor = k;
-                continue;
-            }
-        }
-        out.push_str(&text[cursor..rel + "bearer".len()]);
-        cursor = rel + "bearer".len();
-    }
-    out.push_str(&text[cursor..]);
-    out
-}
-
-/// Well-known token prefixes. Matches are case-sensitive and must extend to
-/// a minimum total length so ordinary words containing e.g. `sk-` are left
-/// untouched.
-const TOKEN_PREFIXES: &[&str] = &[
-    "sk-ant-",
-    "AIza",
-    "github_pat_",
-    "sk_live_",
-    "sk_test_",
-    "sk-",
-    "ghp_",
-    "gho_",
-    "xoxa-",
-    "xoxb-",
-    "xoxp-",
-    "xoxs-",
-    "AKIA",
-];
-const MIN_PREFIXED_TOKEN_LEN: usize = 12;
-
-fn is_token_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'+' | b'=' | b'~')
-}
-
-fn redact_prefixed_tokens(text: &str) -> String {
-    let mut out = String::new();
-    let mut cursor = 0;
-    loop {
-        let mut best: Option<(usize, usize)> = None;
-        for prefix in TOKEN_PREFIXES {
-            // Prefixes are ASCII, so `find` offsets are char boundaries.
-            if let Some(rel) = text[cursor..].find(prefix) {
-                let pos = cursor + rel;
-                if best.is_none_or(|(best_pos, _)| pos < best_pos) {
-                    best = Some((pos, prefix.len()));
-                }
-            }
-        }
-        let Some((pos, prefix_len)) = best else {
-            break;
-        };
-        let bytes = text.as_bytes();
-        let mut end = pos + prefix_len;
-        while end < bytes.len() && is_token_char(bytes[end]) {
-            end += 1;
-        }
-        if end - pos >= MIN_PREFIXED_TOKEN_LEN {
-            out.push_str(&text[cursor..pos]);
-            out.push_str("[redacted-token]");
-            cursor = end;
-        } else {
-            out.push_str(&text[cursor..pos + prefix_len]);
-            cursor = pos + prefix_len;
+/// Closed operational vocabulary over our own static backend/session error
+/// constructors. This table classifies failures for operators; it makes no
+/// secrecy claims and needs none, because every emitted label is a constant
+/// and unrecognized errors still yield a fixed label, never input bytes.
+fn classify_backend_error(message: &str) -> &'static str {
+    const TABLE: &[(&str, &str)] = &[
+        ("timed out", "timeout"),
+        ("unresponsive after", "unresponsive"),
+        ("stayed inactive", "inactive"),
+        ("no observable progress", "tool-stall"),
+        ("interactive extension ui", "interactive-ui"),
+        ("final assistant text", "no-final-text"),
+        ("before agent_settled", "early-exit"),
+        ("stdin missing", "rpc-io"),
+        ("stdout missing", "rpc-io"),
+        ("stderr missing", "rpc-io"),
+        ("persist session", "session-persist"),
+        ("session lock", "session-bind"),
+        ("backend session", "session-bind"),
+        ("spawn", "spawn-failed"),
+    ];
+    let lowered = message.to_ascii_lowercase();
+    for (fragment, label) in TABLE {
+        if lowered.contains(fragment) {
+            return label;
         }
     }
-    out.push_str(&text[cursor..]);
-    out
+    "backend-error"
 }
 
 fn fnv1a64_hex(bytes: &[u8]) -> String {
@@ -2586,102 +2260,77 @@ mod tests {
         assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
         assert!(message.contains("len="), "diagnostic must carry length: {message}");
         assert!(message.contains("hash="), "diagnostic must carry hash: {message}");
-        assert!(message.contains("excerpt="), "diagnostic must carry excerpt: {message}");
-        // Bounded: the 5000-char filler must not appear in full.
+        assert!(message.contains("object=absent"), "prose must classify structurally: {message}");
+        assert!(message.contains("cause=no-object"), "prose must classify structurally: {message}");
+        // Bounded fixed-size diagnostic: the 5000-char filler must not appear.
         assert!(message.len() < malformed.len(), "diagnostic must be bounded");
-        assert!(!message.contains(&"x".repeat(1000)), "excerpt must be truncated");
+        assert!(!message.contains(&"x".repeat(1000)), "no raw output may be embedded");
         // Strict: prose is never regex-guessed into a verdict.
         assert!(parse_review_verdict(&malformed).is_err());
     }
 
     #[test]
-    fn malformed_excerpt_redacts_common_secret_shapes() {
-        let raw = "not json; Authorization: Bearer bearer-secret-value-12345 password=hunter2-secret \
-            {\"api_key\": \"api-key-secret-value\", \"token\":\"json-token-secret\"} \
-            key=sk-test-secret-key-abcdef1234567890";
-        let excerpt = sanitized_verdict_excerpt(raw);
-        for leaked in [
-            "bearer-secret-value-12345",
-            "hunter2-secret",
-            "api-key-secret-value",
-            "json-token-secret",
-            "sk-test-secret-key-abcdef1234567890",
-        ] {
-            assert!(!excerpt.contains(leaked), "secret leaked in excerpt: {excerpt}");
-        }
-        assert!(excerpt.contains("[redacted"), "expected redaction placeholders: {excerpt}");
-        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
-    }
-
-    #[test]
-    fn malformed_excerpt_redacts_key_block_even_when_end_is_truncated_away() {
-        let raw = format!("preamble not json -----BEGIN RSA PRIVATE KEY-----\n{}", "A".repeat(5000));
-        let excerpt = sanitized_verdict_excerpt(&raw);
-        assert!(!excerpt.contains("BEGIN"), "key block leaked: {excerpt}");
-        assert!(excerpt.contains("[redacted-key-material]"), "unexpected: {excerpt}");
-        // Ordinary words containing a token prefix but no real credential
-        // must survive redaction.
-        let innocent = sanitized_verdict_excerpt("the flask-based task token list is empty");
-        assert!(innocent.contains("flask-based"), "false positive redaction: {innocent}");
-    }
-
-    #[test]
-    fn malformed_excerpt_redacts_aws_and_url_credentials() {
-        let raw = "review failed; env AWS_SECRET_ACCESS_KEY=aws-secret-value-abc123 config \
-            {\"secretAccessKey\": \"json-aws-secret-xyz789\"} db \
-            postgres://deploy:db-password-secret-456@db.internal:5432/app";
-        let excerpt = sanitized_verdict_excerpt(raw);
-        for leaked in [
-            "aws-secret-value-abc123",
-            "json-aws-secret-xyz789",
-            "db-password-secret-456",
-        ] {
-            assert!(!excerpt.contains(leaked), "secret leaked in excerpt: {excerpt}");
-        }
-        // The non-secret URL skeleton stays diagnosable.
-        assert!(excerpt.contains("postgres://"), "unexpected: {excerpt}");
-        assert!(excerpt.contains("db.internal"), "unexpected: {excerpt}");
-        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
-    }
-
-    #[test]
-    fn malformed_excerpt_redacts_compound_key_names_and_stripe_prefixes() {
-        // `secret` is followed by `_`, not a delimiter, so only a
-        // substring-aware identifier match can claim the value.
-        let raw = "deploy failed; STRIPE_SECRET_KEY=sk_live_abc123def456ghi789 secretAccessKey: AKIAIOSFODNN7EXAMPLE-ish";
-        let excerpt = sanitized_verdict_excerpt(raw);
-        assert!(!excerpt.contains("sk_live_abc123def456ghi789"), "secret leaked: {excerpt}");
-        assert!(!excerpt.contains("AKIAIOSFODNN7EXAMPLE-ish"), "secret leaked: {excerpt}");
-        assert!(excerpt.contains("[redacted"), "expected redaction placeholders: {excerpt}");
-        // A bare Stripe test key with no field name is caught by prefix.
-        let bare = sanitized_verdict_excerpt("saw sk_test_abc123def456ghi789 in output");
-        assert!(!bare.contains("sk_test_abc123def456ghi789"), "secret leaked: {bare}");
-        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
-    }
-
-    #[test]
-    fn malformed_excerpt_redacts_generic_key_names_and_cookie_sessions() {
-        // Neither name appears in the field allowlist verbatim: `key` as a
-        // substring plus the identifier-suffix skip must claim the value,
-        // and cookie values redact whatever the cookie is called, quoted
-        // or bare.
-        let raw = "config ENCRYPTION_KEY=enc-key-secret-001 CREDENTIAL=cred-secret-004 SESSION_ID=sess-field-secret-005 \
-            Cookie: connect.sid=sess-id-secret-002; Path=/\nCookie: connect.sid=\"sess-quoted-secret-003\"; Path=/ token AIzaSyD-secret-raw-006";
-        let excerpt = sanitized_verdict_excerpt(raw);
-        for leaked in [
-            "enc-key-secret-001",
-            "cred-secret-004",
-            "sess-field-secret-005",
-            "sess-id-secret-002",
-            "sess-quoted-secret-003",
+    fn malformed_diagnostic_embeds_no_raw_values() {
+        // Regression: the diagnostic carries hash/length plus structural
+        // facts only, so even arbitrary previously-unknown secret strings
+        // with no recognized field, prefix, or context cannot appear in
+        // durable evidence or logs. Every secret below defeated at least
+        // one generation of the old shape allowlist.
+        let unknowns = [
+            "zz-top-secret-blob-9f8e7d6c5b4a",
+            "mystery=xyzzy-unknown-format-12345",
+            "Bearer bearer-secret-value-12345",
+            "password=hunter2-secret",
+            "-----BEGIN MYSTERY KEY-----\nquux-quuz-corge",
+            "ENCRYPTION_KEY=enc-key-secret-001",
+            "CREDENTIAL=cred-secret-004",
+            "SESSION_ID=sess-field-secret-005",
+            "Cookie: connect.sid=sess-id-secret-002; Path=/",
+            "Cookie: connect.sid=\"sess-quoted-secret-003\"; Path=/",
+            "postgres://deploy:db-password-secret-456@db.internal:5432/app",
+            "sk_live_abc123def456ghi789",
             "AIzaSyD-secret-raw-006",
-        ] {
-            assert!(!excerpt.contains(leaked), "secret leaked: {excerpt}");
+        ];
+        for secret in unknowns {
+            let raw = format!("model rambled: {secret} {}", "w".repeat(3000));
+            let diagnostic = malformed_verdict_diagnostic(&raw);
+            // Neither the whole secret nor any of its distinctive tokens.
+            assert!(!diagnostic.contains(secret), "secret leaked: {diagnostic}");
+            for token in secret.split(|c: char| !c.is_alphanumeric()) {
+                if token.len() >= 6 {
+                    assert!(!diagnostic.contains(token), "secret token {token:?} leaked: {diagnostic}");
+                }
+            }
+            // Fixed-size vocabulary plus numbers only.
+            assert!(diagnostic.is_ascii(), "diagnostic must be fixed-vocabulary: {diagnostic}");
+            assert!(diagnostic.len() < 512, "diagnostic must stay bounded: {diagnostic}");
+            assert!(diagnostic.contains("len="), "diagnostic must carry length");
+            assert!(diagnostic.contains("hash="), "diagnostic must carry hash");
         }
-        // Non-secret structure stays diagnosable.
-        assert!(excerpt.contains("connect.sid"), "unexpected: {excerpt}");
-        assert!(excerpt.contains("Cookie"), "unexpected: {excerpt}");
-        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
+    }
+
+    #[test]
+    fn malformed_diagnostic_classifies_malformed_shapes() {
+        // Structural facts replace the old raw excerpt: truncation,
+        // prose-wrapping, and wrong-shape failures stay distinguishable.
+        let truncated = malformed_verdict_diagnostic("{\"verdict\":\"retry\",\"reason\":\"abc");
+        assert!(truncated.contains("object=unbalanced"), "unexpected: {truncated}");
+        assert!(truncated.contains("cause=unbalanced"), "unexpected: {truncated}");
+        let wrapped = malformed_verdict_diagnostic(
+            "Result:\n{\"verdict\":\"retry\",\"reason\":\"\",\"validation\":[]}\nThanks",
+        );
+        assert!(wrapped.contains("object=wrapped"), "unexpected: {wrapped}");
+        assert!(wrapped.contains("cause=empty-reason"), "unexpected: {wrapped}");
+        assert!(wrapped.contains("hint=retry"), "unexpected: {wrapped}");
+        let shape = malformed_verdict_diagnostic(r#"{"verdict":"maybe","reason":"x"}"#);
+        assert!(shape.contains("object=whole"), "unexpected: {shape}");
+        assert!(shape.contains("cause=shape-mismatch"), "unexpected: {shape}");
+        // The offending variant value is never echoed.
+        assert!(!shape.contains("maybe"), "value leaked: {shape}");
+        let invalid = malformed_verdict_diagnostic("{oops}");
+        assert!(invalid.contains("cause=invalid-json"), "unexpected: {invalid}");
+        let empty = malformed_verdict_diagnostic("   ");
+        assert!(empty.contains("cause=empty"), "unexpected: {empty}");
     }
 
     #[tokio::test]
@@ -2716,7 +2365,8 @@ mod tests {
         assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
         assert!(message.contains("len="), "diagnostic must carry length: {message}");
         assert!(message.contains("hash="), "diagnostic must carry hash: {message}");
-        assert!(message.contains("excerpt="), "diagnostic must carry excerpt: {message}");
+        assert!(message.contains("object=absent"), "diagnostic must classify shape: {message}");
+        assert!(message.contains("cause=no-object"), "diagnostic must classify shape: {message}");
         assert!(!message.contains("bind-fail-secret-003"), "secret leaked: {message}");
         assert!(!message.contains(&"q".repeat(1000)), "giant output must be capped");
         let _ = tokio::fs::remove_dir_all(&root).await;
@@ -2756,10 +2406,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_diagnostic_survives_non_ascii_output() {
-        // Accented words, ellipsis, CJK, and emoji place multi-byte
-        // characters at every excerpt-window alignment: redaction must never
-        // slice inside a UTF-8 character while scanning for secret shapes.
+    fn malformed_diagnostic_is_ascii_and_bounded_for_non_ascii_output() {
+        // Accented words, ellipsis, CJK, and emoji exercise every byte
+        // alignment: classification uses `str::find` on ASCII braces only,
+        // so no mid-character slicing panic is possible, and no input
+        // bytes — ASCII or otherwise — reach the diagnostic.
         let raw = format!(
             "héllo wörld … {}",
             "café Naïve \u{4e2d}\u{6587} \u{1f600} password=non-ascii-secret-\u{00e9}\u{4e2d}".repeat(40),
@@ -2768,16 +2419,16 @@ mod tests {
         assert!(diagnostic.contains("reviewer did not return the required JSON verdict"));
         assert!(diagnostic.contains("len="), "diagnostic must carry length");
         assert!(diagnostic.contains("hash="), "diagnostic must carry hash");
+        assert!(diagnostic.is_ascii(), "diagnostic must be fixed-vocabulary: {diagnostic}");
         assert!(!diagnostic.contains("non-ascii-secret"), "secret leaked: {diagnostic}");
-        assert!(diagnostic.contains("h\u{e9}llo"), "non-ASCII prose must survive: {diagnostic}");
-        let excerpt = sanitized_verdict_excerpt(&raw);
-        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
+        assert!(diagnostic.len() < 512, "diagnostic must stay bounded: {diagnostic}");
     }
 
     #[tokio::test]
-    async fn repair_request_failure_is_sanitized_and_bounded() {
-        // Backend repair errors can embed raw event payloads: the persisted
-        // failure must carry only a sanitized, capped fragment of them.
+    async fn repair_request_failure_embeds_no_raw_text() {
+        // Backend repair errors can embed raw event payloads, and the first
+        // output is untrusted model text: the persisted failure must carry
+        // only structural facts and fingerprints, never raw bytes.
         let repair_error = format!(
             "Pi RPC blew up with Bearer repair-bearer-secret-999 {} event={{\"type\":\"message_update\"}}",
             "y".repeat(4000),
@@ -2789,12 +2440,16 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
         assert!(message.contains("format repair request failed"), "unexpected: {message}");
-        for leaked in ["repair-bearer-secret-999", "first-output-secret"] {
-            assert!(!message.contains(leaked), "secret leaked in failure: {message}");
+        assert!(message.contains("error_kind="), "failure must fingerprint the backend error: {message}");
+        assert!(message.contains("error_len="), "failure must fingerprint the backend error: {message}");
+        assert!(message.contains("error_hash="), "failure must fingerprint the backend error: {message}");
+        for leaked in ["repair-bearer-secret-999", "first-output-secret", "message_update"] {
+            assert!(!message.contains(leaked), "raw text leaked in failure: {message}");
         }
-        assert!(!message.contains(&"y".repeat(1000)), "backend filler must be capped");
-        assert!(!message.contains(&"w".repeat(1000)), "giant output must be capped");
-        assert!(message.len() < 2000, "failure diagnostic must stay bounded, got {} chars", message.len());
+        assert!(!message.contains(&"y".repeat(100)), "backend filler must be absent");
+        assert!(!message.contains(&"w".repeat(100)), "giant output must be absent");
+        assert!(message.is_ascii(), "failure must be fixed-vocabulary: {message}");
+        assert!(message.len() < 1000, "failure diagnostic must stay bounded, got {} chars", message.len());
     }
 
     #[test]
