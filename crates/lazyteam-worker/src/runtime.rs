@@ -225,7 +225,20 @@ pub trait AgentRuntime: Send + Sync {
     async fn run_review(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
         self.run(workspace, prompt, backend_session_id).await
     }
+    /// One narrow same-session formatting repair: re-emit the already-decided
+    /// verdict in the required JSON shape without performing another review.
+    /// The default reuses the supplied logical session so the model can
+    /// reformat its immediately preceding decision.
+    async fn repair_review_verdict(&self, workspace: &Path, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+        self.run(workspace, REVIEW_VERDICT_REPAIR_PROMPT, backend_session_id).await
+    }
 }
+
+/// Narrow in-lease repair prompt: the substantive review and evidence are
+/// fixed; the model must only re-emit its already-decided verdict in the
+/// required JSON shape. It must not start another code review or inspect
+/// files.
+pub const REVIEW_VERDICT_REPAIR_PROMPT: &str = "Your substantive review is complete and its evidence is fixed. Do not perform another code review, do not inspect files, and do not use tools. Re-emit only your already-decided verdict as a single JSON object with exactly this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[...]}. The verdict field must be approve or retry and reason must be non-empty. Return only that JSON object, with no prose and no code fences.";
 
 #[derive(Debug, Clone)]
 pub struct PiRuntime {
@@ -681,6 +694,12 @@ impl AgentRuntime for PiRuntime {
             backend_session_id,
             Some(review_tool_budgets()),
         ).await
+    }
+
+    async fn repair_review_verdict(&self, workspace: &Path, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+        // Cheap in-lease reformat in the same logical reviewer session: no
+        // tool budgets or steering, so the model just re-emits its decision.
+        self.run_rpc(workspace, REVIEW_VERDICT_REPAIR_PROMPT, backend_session_id, None).await
     }
 }
 

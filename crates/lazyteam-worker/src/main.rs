@@ -977,7 +977,16 @@ async fn execute_review_assignment(
                             if !dirty.is_empty() {
                                 Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
                             } else {
-                                parse_review_verdict(&agent.summary)
+                                // Format-only failure gets at most one narrow same-session
+                                // repair within this lease; the substantive run stays fixed.
+                                resolve_review_verdict_in_lease(
+                                    runtime.as_ref(),
+                                    &agent_workspace,
+                                    session_manager,
+                                    &session_lock,
+                                    &session,
+                                    &agent,
+                                ).await
                             }
                         }
                         Err(error) => Err(error),
@@ -1086,6 +1095,91 @@ fn parse_review_verdict(raw: &str) -> anyhow::Result<ReviewVerdict> {
         }
     }
     bail!("reviewer did not return the required JSON verdict")
+}
+
+/// Bounded excerpt length for malformed verdict diagnostics: enough to
+/// identify a truncation or prose wrapper, never a full model output dump.
+const MALFORMED_VERDICT_EXCERPT_CHARS: usize = 500;
+
+/// Resolve the review verdict for the current lease. A successfully parsed
+/// first output completes immediately. A format-only failure gets exactly one
+/// narrow same-session repair request that must only re-emit the
+/// already-decided verdict in the required JSON shape — never another code
+/// review. The repaired verdict completes the existing review row; no new row
+/// is created and runtime-failure counters are untouched by this path.
+async fn resolve_review_verdict_in_lease(
+    runtime: &dyn AgentRuntime,
+    agent_workspace: &Path,
+    session_manager: &SessionManager,
+    session_lock: &SessionLock,
+    session: &AgentSession,
+    first: &AgentRunResult,
+) -> anyhow::Result<ReviewVerdict> {
+    if let Ok(verdict) = parse_review_verdict(&first.summary) {
+        return Ok(verdict);
+    }
+    // Same backend logical reviewer session when supported: prefer a rotated
+    // opaque ID from the substantive run, otherwise the bound logical ID.
+    let repair_session = first
+        .backend_session_id
+        .as_deref()
+        .or(session.backend_session_id.as_deref());
+    // Exactly one formatting repair per lease: no loop, no new review row.
+    let repaired = match runtime.repair_review_verdict(agent_workspace, repair_session).await {
+        Ok(repaired) => repaired,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "{}; format repair request failed: {error:#}",
+                malformed_verdict_diagnostic(&first.summary),
+            ));
+        }
+    };
+    if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
+        return Err(error);
+    }
+    match parse_review_verdict(&repaired.summary) {
+        Ok(verdict) => {
+            info!("reviewer verdict repaired in-lease; completing existing review row");
+            Ok(verdict)
+        }
+        Err(_) => Err(anyhow::anyhow!(malformed_verdict_diagnostic(&repaired.summary))),
+    }
+}
+
+/// Durable diagnostic for a malformed verdict: generic prefix plus bounded,
+/// sanitized excerpt/hash/length of the malformed final output. The excerpt is
+/// capped and control characters are stripped so logs and the persisted
+/// `failed` review error never carry secrets or giant model output.
+fn malformed_verdict_diagnostic(raw: &str) -> String {
+    let len = raw.len();
+    let hash = fnv1a64_hex(raw.as_bytes());
+    let excerpt = sanitized_verdict_excerpt(raw);
+    format!(
+        "reviewer did not return the required JSON verdict (len={len} hash={hash} excerpt={excerpt:?})"
+    )
+}
+
+fn sanitized_verdict_excerpt(raw: &str) -> String {
+    let mut excerpt: String = raw.chars().take(MALFORMED_VERDICT_EXCERPT_CHARS).collect();
+    // Never persist key blocks even in truncated form.
+    if excerpt.contains("BEGIN") && excerpt.contains("PRIVATE KEY") {
+        return "[redacted-key-material]".to_string();
+    }
+    excerpt = excerpt
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c })
+        .collect();
+    let trimmed = excerpt.trim();
+    if trimmed.is_empty() { "(empty)".to_string() } else { trimmed.to_string() }
+}
+
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 async fn execute_assignment(
@@ -1940,6 +2034,108 @@ mod tests {
         let wrapped = parse_review_verdict("Result:\n{\"verdict\":\"retry\",\"reason\":\"missing test\",\"validation\":[]}").unwrap();
         assert_eq!(wrapped.verdict, lazyteam_core::ReviewVerdictKind::Retry);
         assert!(parse_review_verdict(r#"{"verdict":"approve","reason":"","validation":[]}"#).is_err());
+    }
+
+    /// Fake reviewer backend for in-lease format-repair tests: records the
+    /// session ID each repair call receives so tests can assert the same
+    /// logical reviewer session is reused, and serves scripted repair
+    /// outputs so each test performs at most one repair attempt.
+    struct FakeReviewRuntime {
+        repair_outputs: std::sync::Mutex<Vec<String>>,
+        repair_calls: std::sync::atomic::AtomicUsize,
+        last_repair_session: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl FakeReviewRuntime {
+        fn with_repairs(outputs: Vec<String>) -> Self {
+            Self {
+                repair_outputs: std::sync::Mutex::new(outputs),
+                repair_calls: std::sync::atomic::AtomicUsize::new(0),
+                last_repair_session: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn repair_call_count(&self) -> usize {
+            self.repair_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for FakeReviewRuntime {
+        fn kind(&self) -> &'static str { "fake-review" }
+        async fn capabilities(&self) -> AgentCapabilities { AgentCapabilities::default() }
+        async fn run(&self, _workspace: &Path, _prompt: &str, _backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+            unreachable!("in-lease tests drive resolve_review_verdict_in_lease directly")
+        }
+        async fn repair_review_verdict(&self, _workspace: &Path, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+            self.repair_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.last_repair_session.lock().unwrap().push(backend_session_id.map(str::to_string));
+            let mut outputs = self.repair_outputs.lock().unwrap();
+            assert!(!outputs.is_empty(), "repair must be attempted at most once per lease");
+            Ok(AgentRunResult { summary: outputs.remove(0), backend_session_id: None })
+        }
+    }
+
+    async fn lease_harness(runtime: &FakeReviewRuntime, first_summary: &str) -> anyhow::Result<ReviewVerdict> {
+        let root = std::env::temp_dir().join(format!("lazyteam-review-lease-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let manager = SessionManager::new(root.join("state"));
+        let task_id = Uuid::new_v4();
+        let lock = manager.lock_session(task_id, SessionRole::Review).await;
+        let session = manager.acquire_with(&lock, task_id, SessionRole::Review, "pi").await.unwrap();
+        let first = AgentRunResult { summary: first_summary.to_string(), backend_session_id: None };
+        let outcome = resolve_review_verdict_in_lease(runtime, &root, &manager, &lock, &session, &first).await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        outcome
+    }
+
+    #[tokio::test]
+    async fn in_lease_pure_valid_json_needs_no_repair() {
+        let runtime = FakeReviewRuntime::with_repairs(vec![]);
+        let verdict = lease_harness(&runtime, r#"{"verdict":"approve","reason":"verified","validation":[]}"#).await.unwrap();
+        assert_eq!(verdict.verdict, lazyteam_core::ReviewVerdictKind::Approve);
+        assert_eq!(runtime.repair_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_lease_prose_wrapped_valid_json_needs_no_repair() {
+        let runtime = FakeReviewRuntime::with_repairs(vec![]);
+        let verdict = lease_harness(&runtime, "Result:\n{\"verdict\":\"retry\",\"reason\":\"missing test\",\"validation\":[]}\nThanks").await.unwrap();
+        assert_eq!(verdict.verdict, lazyteam_core::ReviewVerdictKind::Retry);
+        assert_eq!(runtime.repair_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_lease_malformed_first_then_repaired_in_same_session() {
+        let runtime = FakeReviewRuntime::with_repairs(vec![
+            r#"{"verdict":"approve","reason":"reformatted after repair","validation":[]}"#.to_string(),
+        ]);
+        let verdict = lease_harness(&runtime, "I approve this change but forgot the JSON shape").await.unwrap();
+        assert_eq!(verdict.verdict, lazyteam_core::ReviewVerdictKind::Approve);
+        assert_eq!(verdict.reason, "reformatted after repair");
+        assert_eq!(runtime.repair_call_count(), 1);
+        // Same backend logical reviewer session is reused for the repair.
+        let sessions = runtime.last_repair_session.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].as_deref().is_some_and(|id| id.starts_with("review-")));
+    }
+
+    #[tokio::test]
+    async fn in_lease_malformed_twice_fails_once_with_bounded_diagnostics() {
+        let malformed = format!("still not json {}", "x".repeat(5000));
+        let runtime = FakeReviewRuntime::with_repairs(vec![malformed.clone()]);
+        let error = lease_harness(&runtime, "first malformed output with no JSON").await.unwrap_err();
+        assert_eq!(runtime.repair_call_count(), 1, "at most one repair per lease");
+        let message = error.to_string();
+        assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
+        assert!(message.contains("len="), "diagnostic must carry length: {message}");
+        assert!(message.contains("hash="), "diagnostic must carry hash: {message}");
+        assert!(message.contains("excerpt="), "diagnostic must carry excerpt: {message}");
+        // Bounded: the 5000-char filler must not appear in full.
+        assert!(message.len() < malformed.len(), "diagnostic must be bounded");
+        assert!(!message.contains(&"x".repeat(1000)), "excerpt must be truncated");
+        // Strict: prose is never regex-guessed into a verdict.
+        assert!(parse_review_verdict(&malformed).is_err());
     }
 
     #[test]
