@@ -22,7 +22,6 @@ const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
 const WORKER_PROTOCOL_VERSION: u32 = 6;
 const AGENT_ROOTFS_BUILD_SCRIPT: &str = include_str!("../../../scripts/agent-rootfs-build.sh");
-const AGENT_ROOTFS_SCHEMA: &str = "intuitive-git-v1";
 const AGENT_GIT_BOUNDARY: &str = "LazyTeam sandbox Git: this workspace includes a task-scoped synthetic Git repository for familiar inspection. You may freely use read-oriented commands such as `git status`, `git diff`, `git diff lazyteam-base..HEAD`, `git log`, `git show`, and `git grep`. The synthetic repository contains only task snapshots, has no remotes or credentials, disables hooks and external Git transport, and its `.git` metadata is mounted read-only. Its local commit IDs are sandbox snapshots rather than upstream commit IDs. Edit normal working-tree files; LazyTeam's trusted worker layer ignores sandbox Git metadata and owns the real commit, push, and publication flow.";
 
 #[derive(Parser, Debug)]
@@ -207,7 +206,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut local_installed_capabilities = load_local_installed_capabilities(&args.state_dir).await?;
     let mut agent_rootfs = build_agent_rootfs(&args.state_dir, &local_installed_capabilities).await?;
     let mut agent_sandbox = AgentSandbox::prepare(&args.state_dir, &args.pi_bin, Some(&agent_rootfs)).await?;
-    info!(rootfs = %agent_rootfs.display(), schema = AGENT_ROOTFS_SCHEMA, "agent Ubuntu rootfs + intuitive tooling + sandboxed Git ready");
+    info!(rootfs = %agent_rootfs.display(), "agent Ubuntu rootfs + intuitive tooling + sandboxed Git ready");
     if args.sandbox_diagnose {
         println!("LazyTeam agent sandbox {}", agent_sandbox.diagnostic_summary());
         return Ok(());
@@ -620,7 +619,6 @@ async fn build_agent_rootfs(state_dir: &Path, capabilities: &BTreeSet<String>) -
     let stderr_log = stdout_log.try_clone().context("clone capability build log")?;
 
     let mut command = Command::new("/bin/bash");
-    command.env("LAZYTEAM_AGENT_ROOTFS_SCHEMA", AGENT_ROOTFS_SCHEMA);
     command.arg(&script_path).arg(state_dir);
     for capability in capabilities {
         command.arg(capability);
@@ -731,7 +729,7 @@ async fn reconcile_managed_capabilities(
             session_dir: None,
             sandbox,
         };
-        info!(rootfs = %agent_rootfs.display(), schema = AGENT_ROOTFS_SCHEMA, ?local_installed, "agent rootfs rebuild activated");
+        info!(rootfs = %agent_rootfs.display(), ?local_installed, "agent rootfs rebuild activated");
     }
 
     if runtime_config.installed_capabilities != *local_installed

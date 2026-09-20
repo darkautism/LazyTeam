@@ -1,13 +1,12 @@
 FROM ubuntu:24.04 AS agent-base
-ARG LAZYTEAM_AGENT_ROOTFS_SCHEMA=intuitive-git-v1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash ca-certificates coreutils curl diffutils file findutils gawk git grep gzip jq patch procps python3 ripgrep sed tar unzip \
-    && printf '%s\n' "$LAZYTEAM_AGENT_ROOTFS_SCHEMA" > /.lazyteam-rootfs-schema \
     && rm -rf /var/lib/apt/lists/* \
     && tar --numeric-owner --one-file-system \
         --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run --exclude=./tmp \
-        -C / -czf /tmp/lazyteam-ubuntu-rootfs.tar.gz .
+        -C / -czf /tmp/lazyteam-ubuntu-rootfs.tar.gz . \
+    && sha256sum /tmp/lazyteam-ubuntu-rootfs.tar.gz | awk '{print $1}' > /tmp/lazyteam-ubuntu-rootfs.tar.gz.sha256
 
 FROM rust:1-bookworm AS builder
 ARG LAZYTEAM_GIT_SHA
@@ -30,6 +29,7 @@ RUN apt-get update \
     && chown -R lazyteam:lazyteam /app
 COPY --from=builder /src/target/release/lazyteam-worker /usr/local/bin/lazyteam-worker
 COPY --from=agent-base /tmp/lazyteam-ubuntu-rootfs.tar.gz /opt/lazyteam/ubuntu-rootfs.tar.gz
+COPY --from=agent-base /tmp/lazyteam-ubuntu-rootfs.tar.gz.sha256 /opt/lazyteam/ubuntu-rootfs.tar.gz.sha256
 COPY deploy/docker-entrypoint.sh /usr/local/bin/lazyteam-entrypoint
 RUN chmod 0755 /usr/local/bin/lazyteam-entrypoint
 WORKDIR /app

@@ -13,6 +13,25 @@ const EXEC_ARG: &str = "__lazyteam-sandbox-exec";
 const CONTAINER_EXEC_ARG: &str = "__lazyteam-container-exec";
 const SPEC_ENV: &str = "LAZYTEAM_SANDBOX_SPEC";
 const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".pytest_cache", ".venv"];
+/// Image-native paths that may be visible to agents when present in the frozen
+/// container rootfs. These paths join the same canonical read_only policy
+/// consumed by every filesystem enforcement backend; they are not host
+/// overlays and must never grow a backend-specific allowlist.
+const CONTAINER_NATIVE_READ_ONLY: &[&str] = &["/opt/lazyteam"];
+
+fn add_container_native_read_only(
+    read_only: &mut BTreeSet<PathBuf>,
+    container_rootfs: Option<&Path>,
+) {
+    let Some(rootfs) = container_rootfs else { return; };
+    for path in CONTAINER_NATIVE_READ_ONLY {
+        let absolute = Path::new(path);
+        let Ok(relative) = absolute.strip_prefix("/") else { continue; };
+        if rootfs.join(relative).exists() {
+            read_only.insert(absolute.to_path_buf());
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SandboxSpec {
@@ -100,6 +119,12 @@ impl AgentSandbox {
                 }
             }
         }
+
+        // Container-native image content participates in the exact same
+        // filesystem policy as every other read-only path. enter_agent_container
+        // freezes the image and does not bind these paths from the host; after
+        // chroot, both Landlock and the namespace fallback consume read_only.
+        add_container_native_read_only(&mut read_only, container_rootfs.as_deref());
 
         if let Some(program) = resolve_program(pi_bin, &host_path) {
             if let Ok(target) = std::fs::canonicalize(&program) {
@@ -1165,6 +1190,34 @@ async fn set_private_file(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_native_paths_join_the_canonical_read_only_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "lazyteam-container-native-policy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("opt/lazyteam")).unwrap();
+
+        let mut read_only = BTreeSet::new();
+        add_container_native_read_only(&mut read_only, Some(&root));
+        assert_eq!(
+            read_only.into_iter().collect::<Vec<_>>(),
+            vec![PathBuf::from("/opt/lazyteam")]
+        );
+
+        let mut absent = BTreeSet::new();
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        add_container_native_read_only(&mut absent, Some(&empty));
+        assert!(absent.is_empty());
+
+        let mut host_mode = BTreeSet::new();
+        add_container_native_read_only(&mut host_mode, None);
+        assert!(host_mode.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn common_ancestor_finds_runtime_root() {

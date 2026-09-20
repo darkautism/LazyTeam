@@ -12,7 +12,6 @@ shift
 ubuntu_version="${LAZYTEAM_UBUNTU_VERSION:-24.04.3}"
 preseed_archive="${LAZYTEAM_UBUNTU_BASE_ARCHIVE:-}"
 base_id="${LAZYTEAM_UBUNTU_BASE_ID:-$ubuntu_version}"
-rootfs_schema="${LAZYTEAM_AGENT_ROOTFS_SCHEMA:-intuitive-git-v1}"
 root="$state_dir/agent-rootfs"
 cache="$root/cache"
 generations="$root/generations"
@@ -32,19 +31,8 @@ for capability in "$@"; do
 done
 
 mapfile -t capabilities < <(printf '%s\n' "${!requested[@]}" | sed '/^$/d' | sort)
-cap_key="$(printf '%s\n' "$base_id" "$ubuntu_arch" "$rootfs_schema" "${capabilities[@]}" | sha256sum | cut -c1-20)"
-generation="$generations/$ubuntu_version-$ubuntu_arch-$cap_key"
-rootfs="$generation/rootfs"
-ready="$generation/.ready"
 
 mkdir -p "$cache" "$generations"
-if [[ -f "$ready" && -x "$rootfs/bin/bash" && -f "$rootfs/.lazyteam-rootfs-schema" && "$(cat "$rootfs/.lazyteam-rootfs-schema")" == "$rootfs_schema" ]]; then
-  ln -sfn "$rootfs" "$root/current.new"
-  mv -Tf "$root/current.new" "$root/current"
-  printf '%s\n' "$rootfs"
-  exit 0
-fi
-
 name="ubuntu-base-${ubuntu_version}-base-${ubuntu_arch}.tar.gz"
 release_base="https://cdimage.ubuntu.com/ubuntu-base/releases/${ubuntu_version%.*}/release"
 archive="$cache/$name"
@@ -56,6 +44,11 @@ done
 if [[ -n "$preseed_archive" ]]; then
   [[ -r "$preseed_archive" ]] || { echo "preseeded Ubuntu rootfs archive is not readable: $preseed_archive" >&2; exit 2; }
   archive="$preseed_archive"
+  if [[ -r "$archive.sha256" ]]; then
+    base_hash="$(tr -d '[:space:]' < "$archive.sha256")"
+  else
+    base_hash="$(sha256sum "$archive" | awk '{print $1}')"
+  fi
 else
   command -v curl >/dev/null || { echo "missing required host tool: curl" >&2; exit 2; }
   if [[ ! -f "$archive" ]]; then
@@ -67,6 +60,26 @@ else
     cd "$cache"
     grep " \*$name\|  $name$" SHA256SUMS | sha256sum -c -
   )
+  base_hash="$(grep " \*$name\|  $name$" "$cache/SHA256SUMS" | awk '{print $1}' | head -n 1)"
+  [[ -n "$base_hash" ]] || { echo "could not read Ubuntu base digest for $name" >&2; exit 1; }
+  printf '%s\n' "$base_hash" > "$archive.sha256"
+fi
+
+# Generation identity is content-derived, not manually versioned. Any builder
+# logic change or base-rootfs content change automatically selects a new
+# generation; unchanged inputs reuse the existing one.
+builder_hash="$(sha256sum "$0" | awk '{print $1}')"
+[[ "$base_hash" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "invalid Ubuntu base digest: $base_hash" >&2; exit 1; }
+cap_key="$(printf '%s\n' "$base_id" "$ubuntu_arch" "$builder_hash" "$base_hash" "${capabilities[@]}" | sha256sum | cut -c1-20)"
+generation="$generations/$ubuntu_version-$ubuntu_arch-$cap_key"
+rootfs="$generation/rootfs"
+ready="$generation/.ready"
+
+if [[ -f "$ready" && -x "$rootfs/bin/bash" ]]; then
+  ln -sfn "$rootfs" "$root/current.new"
+  mv -Tf "$root/current.new" "$root/current"
+  printf '%s\n' "$rootfs"
+  exit 0
 fi
 
 staging="$generation.tmp-$$"
@@ -137,7 +150,8 @@ fi
 
 printf '%s\n' "${capabilities[@]}" > "$rootfs_stage/.lazyteam-capabilities"
 printf '%s\n' "$base_id" > "$rootfs_stage/.lazyteam-ubuntu-version"
-printf '%s\n' "$rootfs_schema" > "$rootfs_stage/.lazyteam-rootfs-schema"
+printf '%s\n' "$builder_hash" > "$rootfs_stage/.lazyteam-builder-sha256"
+printf '%s\n' "$base_hash" > "$rootfs_stage/.lazyteam-base-sha256"
 rm -rf "$generation"
 mv "$staging" "$generation"
 touch "$ready"
