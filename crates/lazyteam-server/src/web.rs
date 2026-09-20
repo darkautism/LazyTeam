@@ -276,5 +276,7 @@ mod tests {
         assert!(INDEX.contains("x.waiting"));
         assert!(INDEX.contains("no_eligible_worker"));
         assert!(INDEX.contains("review_failure_limit"));
+        // Insights evidence drill-down renders the same waiting diagnostic.
+        assert!(INDEX.contains("h.waiting"));
     }
 }

@@ -886,6 +886,11 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
     let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state, COALESCE((SELECT MAX(e2.attempt) FROM executions e2 WHERE e2.task_id=t.id),0) AS board_attempt, (SELECT COUNT(*) FROM reviews r2 WHERE r2.task_id=t.id AND r2.state='completed') AS board_review_rounds, (SELECT COUNT(*) FROM reviews r2f WHERE r2f.task_id=t.id AND r2f.state='failed') AS board_review_failures, (SELECT COUNT(*) FROM reviews r2l WHERE r2l.task_id=t.id AND r2l.state='lost') AS board_review_lost, (SELECT COUNT(*) FROM reviews r3 WHERE r3.task_id=t.id AND r3.state='completed' AND (r3.verdict LIKE '%\"verdict\":\"retry\"%' OR r3.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_lifetime_retries, (SELECT COUNT(*) FROM reviews r4 WHERE r4.task_id=t.id AND r4.review_cycle=t.review_cycle AND r4.state='completed' AND (r4.verdict LIKE '%\"verdict\":\"retry\"%' OR r4.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_current_retries FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
         .fetch_all(&state.db).await.map_err(db_error)?;
     let mut items = Vec::with_capacity(rows.len());
+    // One shared diagnostic context for the whole board: a single fleet
+    // scan, project load, and settings read no matter how many waiting
+    // tasks are rendered. Waiting itself is computed only for queued/review
+    // rows; all other states skip it without extra queries.
+    let diag_ctx = load_diag_context(&state.db).await?;
     for row in &rows {
         let task = task_from_row(row)?;
         let worker_id: Option<String> = row.try_get("board_worker_id").map_err(internal)?;
@@ -929,7 +934,7 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
         // running/reviewing cards stay unspammed. Read-only, same
         // predicates as claim selection, inline in the existing board
         // refresh (no extra polling).
-        let waiting = waiting_for_task(&state.db, &task).await?;
+        let waiting = waiting_for_task_with_ctx(&state.db, &diag_ctx, &task).await?;
         items.push(TaskBoardItem { task, worker, reviewer, result, attempt: attempt.max(0) as u32, review_rounds: review_rounds.max(0), review_runtime_failures: review_runtime_failures.max(0), review_lost_leases: review_lost_leases.max(0), reviewer_retries: current_cycle_reviewer_retries, current_cycle_reviewer_retries, lifetime_reviewer_retries, waiting });
     }
     Ok(Json(items))
@@ -1796,13 +1801,83 @@ async fn dependencies_satisfied(db: &SqlitePool, task: &Task) -> Result<bool, Ap
 
 fn short_id(id: &str) -> String { id.chars().take(8).collect() }
 
-/// Bounded read-only worker snapshot for diagnostics. Caps the fleet scan so
-/// Home/Insights waiting reasons stay lightweight (no simulator, no polling
-/// beyond the existing task-board/status refresh).
+/// Diagnostic worker universe, equivalent to the claimant universe.
+///
+/// Only rows that can actually satisfy `require_worker` are included:
+/// retired workers and rows with no `credential_hash` (never-enrolled or
+/// retired workers whose credential was cleared) are excluded, since the
+/// claim endpoints reject them before any scheduler predicate runs. The
+/// full fleet is loaded in deterministic `id` order with no `LIMIT`, so a
+/// large fleet can never silently omit a free eligible worker and produce
+/// a false `no_eligible_worker` / `no_free_slot` / backend reason. Fleets
+/// are small (one row per worker); this is a single indexed scan per
+/// board/status/history request, shared across all waiting tasks in it.
 async fn load_diagnostic_workers(db: &SqlitePool) -> Result<Vec<Worker>, ApiError> {
-    let rows = sqlx::query("SELECT * FROM workers WHERE retired_at IS NULL LIMIT 500")
+    let rows = sqlx::query("SELECT * FROM workers WHERE retired_at IS NULL AND credential_hash IS NOT NULL ORDER BY id")
         .fetch_all(db).await.map_err(db_error)?;
     rows.iter().map(worker_from_row).collect::<Result<Vec<_>, _>>()
+}
+
+/// Preloaded per-request diagnostic context. The worker fleet, project map,
+/// and reviewer failure limit are each read once per board/status/history
+/// request and shared across every waiting task in it, so per-task work
+/// stays a bounded handful of indexed lookups (dependency states, sticky
+/// id, review counts) instead of a fresh fleet scan per row.
+pub(crate) struct DiagContext {
+    workers: Vec<Worker>,
+    projects: HashMap<Uuid, Project>,
+    review_failure_limit: i64,
+}
+
+pub(crate) async fn load_diag_context(db: &SqlitePool) -> Result<DiagContext, ApiError> {
+    let workers = load_diagnostic_workers(db).await?;
+    let project_rows = sqlx::query("SELECT * FROM projects").fetch_all(db).await.map_err(db_error)?;
+    let mut projects = HashMap::new();
+    for row in &project_rows {
+        let project = project_from_row(row)?;
+        projects.insert(project.id, project);
+    }
+    let review_failure_limit: i64 = sqlx::query_scalar("SELECT review_failure_limit FROM host_settings WHERE id=1")
+        .fetch_optional(db).await.map_err(db_error)?.flatten().unwrap_or(DEFAULT_REVIEW_FAILURE_LIMIT);
+    Ok(DiagContext { workers, projects, review_failure_limit })
+}
+
+/// Effective claim capability for diagnostics: the server predicates plus
+/// the worker-side gates the server claim path cannot see. A worker that
+/// fails `can_claim_work` never calls the claim endpoints (the worker
+/// runtime stays idle), and a worker without a credential is rejected by
+/// `require_worker`, so neither can take a task even when tags, scope,
+/// slots, and affinity all match. Diagnostics must reflect that, or a
+/// legacy/uncredentialed row would produce a false `awaiting_claim`.
+fn diagnostic_claim_capable(worker: &Worker) -> bool {
+    worker.role == AgentRole::Worker
+        && worker.protocol_version >= PROTOCOL_VERSION
+        && matches!(worker.state, WorkerState::Idle | WorkerState::Busy)
+        && worker.running_slots < worker.slots
+        && can_claim_work(&worker.agent, &worker.agent_capabilities)
+}
+
+fn diagnostic_reviewer_capable(worker: &Worker) -> bool {
+    worker.role == AgentRole::Reviewer
+        && worker.protocol_version >= PROTOCOL_VERSION
+        && matches!(worker.state, WorkerState::Idle | WorkerState::Busy)
+        && worker.running_slots < worker.slots
+        && can_claim_work(&worker.agent, &worker.agent_capabilities)
+}
+
+/// True when the task's most recent reviewer is present in the diagnostic
+/// (credentialed) fleet and could actually claim a review slot. Read-only.
+async fn preferred_reviewer_claim_capable(
+    db: &SqlitePool,
+    ctx: &DiagContext,
+    task: &Task,
+) -> Result<bool, ApiError> {
+    let preferred_id: Option<String> = sqlx::query_scalar(
+        "SELECT reviewer_worker_id FROM reviews WHERE task_id=? ORDER BY created_at DESC LIMIT 1")
+        .bind(task.id.to_string()).fetch_optional(db).await.map_err(db_error)?;
+    let Some(preferred_id) = preferred_id else { return Ok(false); };
+    Ok(ctx.workers.iter()
+        .any(|w| w.id.to_string() == preferred_id && diagnostic_reviewer_capable(w)))
 }
 
 fn backend_unavailable_detail(worker: &Worker) -> String {
@@ -1822,6 +1897,7 @@ fn backend_unavailable_detail(worker: &Worker) -> String {
 /// sticky reservation the way the claim path does.
 async fn queued_waiting_info(
     db: &SqlitePool,
+    ctx: &DiagContext,
     task: &Task,
     project: &Project,
     sticky_worker_id: Option<&str>,
@@ -1845,7 +1921,15 @@ async fn queued_waiting_info(
         return Ok(Some(waiting("blocked_dependencies", detail)));
     }
     if let Some(sticky) = sticky_worker_id {
-        if sticky_worker_reservation_active(db, sticky, project, task).await? {
+        // Report the sticky reservation only when the preferred worker could
+        // actually take the task: the server claim path reserves on liveness
+        // alone, but a preferred worker with no credential or no Pi backend
+        // can never claim, so the actionable reason is the pool analysis
+        // below (usually `backend_unavailable`/`no_eligible_worker`), not
+        // affinity for a worker that cannot work.
+        if sticky_worker_reservation_active(db, sticky, project, task).await?
+            && ctx.workers.iter().any(|w| w.id.to_string() == sticky && diagnostic_claim_capable(w))
+        {
             let name: Option<String> = sqlx::query_scalar("SELECT name FROM workers WHERE id=?")
                 .bind(sticky).fetch_optional(db).await.map_err(db_error)?;
             let detail = match name {
@@ -1855,7 +1939,7 @@ async fn queued_waiting_info(
             return Ok(Some(waiting("sticky_reserved", detail)));
         }
     }
-    let workers = load_diagnostic_workers(db).await?;
+    let workers = &ctx.workers;
     let live: Vec<&Worker> = workers.iter()
         .filter(|w| w.role == AgentRole::Worker && w.protocol_version >= PROTOCOL_VERSION
             && matches!(w.state, WorkerState::Idle | WorkerState::Busy))
@@ -1876,7 +1960,7 @@ async fn queued_waiting_info(
             else { tag_excluded += 1; }
         }
         let mut sample = String::new();
-        for worker in live.iter().take(500) {
+        for worker in live.iter() {
             if !worker_tags_scope_match(worker, project, task) {
                 let mismatches = tag_mismatches(worker, project, task);
                 if let Some((key, wanted)) = mismatches.first() {
@@ -1940,10 +2024,11 @@ async fn queued_waiting_info(
 #[allow(clippy::too_many_arguments)]
 async fn review_waiting_info(
     db: &SqlitePool,
+    ctx: &DiagContext,
     task: &Task,
     project: &Project,
-    review_failure_limit: i64,
 ) -> Result<Option<WaitingInfo>, ApiError> {
+    let review_failure_limit = ctx.review_failure_limit;
     let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
         .bind(task.id.to_string()).fetch_one(db).await.map_err(db_error)?;
     if active > 0 {
@@ -1971,8 +2056,12 @@ async fn review_waiting_info(
     }
     // Reviewer affinity reservation: the most recent reviewer keeps priority
     // while live and within the session-affinity window. Reuse the claim
-    // predicate with a nil claimant so the reservation check cannot drift.
-    let reserved = review_reserved_for_live_preferred_reviewer(db, task, project, Uuid::nil()).await?;
+    // predicate with a nil claimant so the reservation check cannot drift,
+    // and only report it when the preferred reviewer could actually claim
+    // (credential + Pi backend); otherwise the pool analysis below gives
+    // the actionable reason.
+    let reserved = review_reserved_for_live_preferred_reviewer(db, task, project, Uuid::nil()).await?
+        && preferred_reviewer_claim_capable(db, ctx, task).await?;
     if reserved {
         let preferred_id: Option<String> = sqlx::query_scalar(
             "SELECT reviewer_worker_id FROM reviews WHERE task_id=? ORDER BY created_at DESC LIMIT 1")
@@ -1988,7 +2077,7 @@ async fn review_waiting_info(
         };
         return Ok(Some(waiting("reviewer_reserved", detail)));
     }
-    let workers = load_diagnostic_workers(db).await?;
+    let workers = &ctx.workers;
     let live: Vec<&Worker> = workers.iter()
         .filter(|w| w.role == AgentRole::Reviewer && w.protocol_version >= PROTOCOL_VERSION
             && matches!(w.state, WorkerState::Idle | WorkerState::Busy))
@@ -2029,41 +2118,43 @@ async fn review_waiting_info(
 }
 
 /// Dispatcher for waiting diagnostics. Returns `None` for states that are
-/// actively progressing so those cards are never spammed.
-async fn waiting_for_task(db: &SqlitePool, task: &Task) -> Result<Option<WaitingInfo>, ApiError> {
+/// actively progressing so those cards are never spammed. Takes the shared
+/// per-request [`DiagContext`] so board requests scan the fleet, projects,
+/// and settings once no matter how many waiting tasks they render.
+pub(crate) async fn waiting_for_task_with_ctx(db: &SqlitePool, ctx: &DiagContext, task: &Task) -> Result<Option<WaitingInfo>, ApiError> {
     match task.state {
         TaskState::Queued => {
-            let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
-                .bind(task.project_id.to_string()).fetch_optional(db).await.map_err(db_error)?;
-            let Some(project_row) = project_row else {
+            let Some(project) = ctx.projects.get(&task.project_id) else {
                 return Ok(Some(waiting("no_eligible_worker", "project is missing".into())));
             };
-            let project = project_from_row(&project_row)?;
             if !project.enabled {
                 return Ok(Some(waiting("no_eligible_worker",
                     format!("project {} is disabled", project.slug))));
             }
             let sticky: Option<String> = sqlx::query_scalar("SELECT sticky_worker_id FROM tasks WHERE id=?")
                 .bind(task.id.to_string()).fetch_optional(db).await.map_err(db_error)?.flatten();
-            queued_waiting_info(db, task, &project, sticky.as_deref()).await
+            queued_waiting_info(db, ctx, task, project, sticky.as_deref()).await
         }
         TaskState::Review => {
-            let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
-                .bind(task.project_id.to_string()).fetch_optional(db).await.map_err(db_error)?;
-            let Some(project_row) = project_row else {
+            let Some(project) = ctx.projects.get(&task.project_id) else {
                 return Ok(Some(waiting("no_eligible_reviewer", "project is missing".into())));
             };
-            let project = project_from_row(&project_row)?;
             if !project.enabled {
                 return Ok(Some(waiting("no_eligible_reviewer",
                     format!("project {} is disabled", project.slug))));
             }
-            let limit: i64 = sqlx::query_scalar("SELECT review_failure_limit FROM host_settings WHERE id=1")
-                .fetch_optional(db).await.map_err(db_error)?.flatten().unwrap_or(DEFAULT_REVIEW_FAILURE_LIMIT);
-            review_waiting_info(db, task, &project, limit).await
+            review_waiting_info(db, ctx, task, project).await
         }
         _ => Ok(None),
     }
+}
+
+/// Single-task convenience wrapper that loads a fresh [`DiagContext`].
+/// Board requests should prefer [`waiting_for_task_with_ctx`] with one
+/// shared context per request.
+pub(crate) async fn waiting_for_task(db: &SqlitePool, task: &Task) -> Result<Option<WaitingInfo>, ApiError> {
+    let ctx = load_diag_context(db).await?;
+    waiting_for_task_with_ctx(db, &ctx, task).await
 }
 
 async fn is_latest_execution(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, task_id: &str, execution_id: Uuid) -> Result<bool, ApiError> {
@@ -2424,7 +2515,7 @@ fn agent_role(value: String) -> Result<AgentRole, ApiError> {
     match value.as_str() { "worker" => Ok(AgentRole::Worker), "reviewer" => Ok(AgentRole::Reviewer), _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid agent role {value}"))) }
 }
 
-fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
+pub(crate) fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
     let state: String = row.try_get("state").map_err(internal)?;
     // review_cycle was added by migration 0018; default to 0 for rows that
     // predate the column so old history keeps counting as cycle 0.
@@ -3244,10 +3335,14 @@ mod tests {
     }
 
     async fn seed_backend_ready_worker(db: &SqlitePool, id: &str, name: &str, role: &str, now: &str, cred: Option<&str>) {
+        seed_backend_ready_worker_scoped(db, id, name, role, now, cred, r#"["*"]"#).await;
+    }
+
+    async fn seed_backend_ready_worker_scoped(db: &SqlitePool, id: &str, name: &str, role: &str, now: &str, cred: Option<&str>, allowed_projects: &str) {
         let hash = cred.map(hash_secret);
         sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash,agent_provider,agent_model,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(id).bind(name).bind(role).bind("idle").bind("linux").bind("x86_64")
-            .bind(PROTOCOL_VERSION as i64).bind("test").bind(now).bind(now).bind(r#"["*"]"#).bind(hash)
+            .bind(PROTOCOL_VERSION as i64).bind("test").bind(now).bind(now).bind(allowed_projects).bind(hash)
             .bind("prov").bind("mod")
             .bind(r#"{"models":[{"provider":"prov","id":"mod"}]}"#)
             .execute(db).await.unwrap();
@@ -3293,6 +3388,10 @@ mod tests {
         let Json(status) = task_status(State(state.clone()), Path(task_id)).await.unwrap();
         assert_eq!(status.waiting.as_ref().map(|w| w.reason.as_str()), Some("blocked_dependencies"));
         assert!(!status.waiting.as_ref().unwrap().detail.contains("ltw_") && !status.waiting.as_ref().unwrap().detail.contains("token"));
+        // The same reason is exposed in the task-board payload Home renders.
+        let board = task_board(State(state.clone())).await.unwrap().0;
+        let item = board.iter().find(|item| item.task.id == task_id).expect("task on board");
+        assert_eq!(item.waiting.as_ref().map(|w| w.reason.as_str()), Some("blocked_dependencies"));
     }
 
     #[tokio::test]
@@ -3320,6 +3419,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waiting_project_scope_matches_claim_refusal() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let cred = "scope-cred";
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        // Worker matches every tag but is scoped to another project, so the
+        // project-scope predicate (shared with claim selection) refuses it.
+        seed_backend_ready_worker_scoped(&db, &worker_id.to_string(), "w", "worker", &now, Some(cred), r#"["other"]"#).await;
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_task(Path(worker_id), State(state.clone()), worker_headers(cred)).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, detail) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "no_eligible_worker");
+        assert!(detail.contains("project scope"), "detail: {detail}");
+        let board = task_board(State(state.clone())).await.unwrap().0;
+        let item = board.iter().find(|item| item.task.id == task_id).expect("task on board");
+        assert_eq!(item.waiting.as_ref().map(|w| w.reason.as_str()), Some("no_eligible_worker"));
+    }
+
+    #[tokio::test]
     async fn waiting_sticky_affinity_matches_claim_refusal() {
         let db = waiting_test_db().await;
         let now = Utc::now().to_rfc3339();
@@ -3330,7 +3457,7 @@ mod tests {
         sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
             .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
-        seed_backend_ready_worker(&db, &sticky_id.to_string(), "sticky", "worker", &now, None).await;
+        seed_backend_ready_worker(&db, &sticky_id.to_string(), "sticky", "worker", &now, Some("sticky-cred")).await;
         seed_backend_ready_worker(&db, &claimant_id.to_string(), "claimant", "worker", &now, Some("claim-cred")).await;
         sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,sticky_worker_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
             .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued")
@@ -3404,6 +3531,10 @@ mod tests {
         assert_eq!(reason, "review_failure_limit");
         assert!(detail.contains("limit 3"), "detail: {detail}");
         let state = waiting_state(db.clone());
+        // The same cooldown reason is exposed in the task-board payload.
+        let board = task_board(State(state.clone())).await.unwrap().0;
+        let item = board.iter().find(|item| item.task.id == task_id).expect("task on board");
+        assert_eq!(item.waiting.as_ref().map(|w| w.reason.as_str()), Some("review_failure_limit"));
         let response = claim_review(Path(reviewer_id), State(state), worker_headers(cred)).await.unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
     }
