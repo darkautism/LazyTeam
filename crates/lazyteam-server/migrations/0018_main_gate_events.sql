@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS main_gate_events (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     execution_id TEXT REFERENCES executions(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL CHECK(kind IN ('merged','sent_back','merge_conflict')),
+    kind TEXT NOT NULL CHECK(kind IN ('merged','upstream_moved','sent_back','merge_conflict')),
     reason TEXT NOT NULL DEFAULT '',
     merge_commit_sha TEXT,
     created_at TEXT NOT NULL

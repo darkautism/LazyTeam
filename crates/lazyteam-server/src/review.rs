@@ -83,6 +83,16 @@ pub(crate) async fn merged_task(state: &AppState, id: Uuid, merge_commit_sha: &s
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|value| value.get("commit_sha").and_then(|v| v.as_str()).map(str::to_string));
     let now = Utc::now().to_rfc3339();
+    // Distinct durable gate outcome: a clean fast-forward of the reviewed
+    // candidate is `merged`; publishing a reconciled commit after upstream
+    // moved is `upstream_moved`. Insights counts them as separate outcomes.
+    let (gate_kind, gate_reason) = match candidate_sha.as_deref() {
+        Some(candidate) if candidate == merge_commit_sha => ("merged", "fast-forward of reviewed candidate".to_string()),
+        Some(candidate) => ("upstream_moved", format!("upstream moved after review of {candidate}; host published {merge_commit_sha}")),
+        None => ("merged", format!("host published {merge_commit_sha}")),
+    };
+    let gate_reason: String = gate_reason.chars().take(2000).collect();
+    let gate_available = gate_table_exists(&state.db).await;
     let mut tx = state.db.begin().await.map_err(internal)?;
     let changed = sqlx::query("UPDATE tasks SET state='done',merge_commit_sha=?,sticky_worker_id=NULL,updated_at=? WHERE id=? AND state='merge_pending'")
         .bind(merge_commit_sha)
@@ -101,15 +111,22 @@ pub(crate) async fn merged_task(state: &AppState, id: Uuid, merge_commit_sha: &s
         .bind(id.to_string()).bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(internal)?;
     sqlx::query("INSERT OR IGNORE INTO agent_session_cleanup(task_id,worker_id,role,created_at) SELECT ?,reviewer_worker_id,'review',? FROM reviews WHERE task_id=?")
         .bind(id.to_string()).bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(internal)?;
+    // The gate event commits atomically with the merge_pending -> done
+    // transition, so a crash or database error cannot lose the outcome.
+    // Databases from before the main-gate migration skip the row (Insights
+    // then reports gate history as unavailable) without blocking the merge.
+    if gate_available {
+        sqlx::query("INSERT INTO main_gate_events(id,task_id,execution_id,kind,reason,merge_commit_sha,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(id.to_string())
+            .bind(Some(latest_execution_id.clone()))
+            .bind(gate_kind)
+            .bind(&gate_reason)
+            .bind(Some(merge_commit_sha.to_string()))
+            .bind(&now)
+            .execute(&mut *tx).await.map_err(internal)?;
+    }
     tx.commit().await.map_err(internal)?;
-    // Durable main-gate history for Insights. Best-effort: older databases
-    // without the migration keep serving merges without this row.
-    let gate_reason = match candidate_sha.as_deref() {
-        Some(candidate) if candidate == merge_commit_sha => "fast-forward of reviewed candidate".to_string(),
-        Some(candidate) => format!("upstream moved after review of {candidate}; host published {merge_commit_sha}"),
-        None => format!("host published {merge_commit_sha}"),
-    };
-    record_main_gate_event(state, id, Some(&latest_execution_id), "merged", &gate_reason, Some(merge_commit_sha)).await;
     Ok(TaskTransition { task_id: id, state: "done".into() })
 }
 
@@ -206,29 +223,53 @@ pub(crate) async fn retry_task_with_gate(state: &AppState, id: Uuid, reason: Opt
     // expires, but a manual retry should not discard a reusable backend session.
     let sticky_worker_id: Option<String> = sqlx::query_scalar("SELECT worker_id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
         .bind(id.to_string()).fetch_optional(&state.db).await.map_err(internal)?;
-    let changed = if let Some(reason) = reason {
-        sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
-            .bind(reason).bind(sticky_worker_id).bind(Utc::now().to_rfc3339()).bind(id.to_string()).bind(&current)
-            .execute(&state.db).await.map_err(internal)?.rows_affected()
-    } else {
-        sqlx::query("UPDATE tasks SET state='queued',sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
-            .bind(sticky_worker_id).bind(Utc::now().to_rfc3339()).bind(id.to_string()).bind(&current)
-            .execute(&state.db).await.map_err(internal)?.rows_affected()
-    };
-    if changed == 0 { return Err((StatusCode::CONFLICT, "task changed while retrying".into())); }
+    let latest_execution_id: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(internal)?;
     // Durable main-gate history: only merge_pending -> queued is a gate
     // outcome (sent back / overturned after reviewer approval, or a Host
     // merge conflict). Review-state retries are reviewer-quality signals
     // already captured in durable review verdict rows.
-    if current == "merge_pending" {
+    let gate = if current == "merge_pending" {
         let kind = match gate_kind {
             Some("merge_conflict") => "merge_conflict",
             _ => "sent_back",
         };
-        let latest_execution_id: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
-            .bind(id.to_string()).fetch_optional(&state.db).await.map_err(internal)?;
-        record_main_gate_event(state, id, latest_execution_id.as_deref(), kind, reason.unwrap_or(""), None).await;
+        Some((kind, reason.unwrap_or("").chars().take(2000).collect::<String>()))
+    } else {
+        None
+    };
+    // Gate pre-migration databases keep serving the retry without the row;
+    // Insights reports gate history as unavailable in that case.
+    let gate_available = if gate.is_some() { gate_table_exists(&state.db).await } else { false };
+    let now = Utc::now().to_rfc3339();
+    let mut tx = state.db.begin().await.map_err(internal)?;
+    let changed = if let Some(reason) = reason {
+        sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
+            .bind(reason).bind(sticky_worker_id).bind(&now).bind(id.to_string()).bind(&current)
+            .execute(&mut *tx).await.map_err(internal)?.rows_affected()
+    } else {
+        sqlx::query("UPDATE tasks SET state='queued',sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
+            .bind(sticky_worker_id).bind(&now).bind(id.to_string()).bind(&current)
+            .execute(&mut *tx).await.map_err(internal)?.rows_affected()
+    };
+    if changed == 0 {
+        tx.rollback().await.map_err(internal)?;
+        return Err((StatusCode::CONFLICT, "task changed while retrying".into()));
     }
+    // The gate event commits atomically with the merge_pending -> queued
+    // transition so the outcome cannot be lost between the two writes.
+    if let (Some((kind, gate_reason)), true) = (gate, gate_available) {
+        sqlx::query("INSERT INTO main_gate_events(id,task_id,execution_id,kind,reason,merge_commit_sha,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(id.to_string())
+            .bind(latest_execution_id)
+            .bind(kind)
+            .bind(gate_reason)
+            .bind(Option::<String>::None)
+            .bind(&now)
+            .execute(&mut *tx).await.map_err(internal)?;
+    }
+    tx.commit().await.map_err(internal)?;
     Ok(TaskTransition { task_id: id, state: "queued".into() })
 }
 
@@ -245,31 +286,129 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
-/// Best-effort durable main-gate event insert. Missing-table errors (databases
-/// from before the main-gate migration) are ignored so merges/retries keep
-/// working; Insights reports gate history as unavailable in that case.
-async fn record_main_gate_event(
-    state: &AppState,
-    task_id: Uuid,
-    execution_id: Option<&str>,
-    kind: &str,
-    reason: &str,
-    merge_commit_sha: Option<&str>,
-) {
-    let reason = reason.trim().chars().take(2000).collect::<String>();
-    let result = sqlx::query("INSERT INTO main_gate_events(id,task_id,execution_id,kind,reason,merge_commit_sha,created_at) VALUES(?,?,?,?,?,?,?)")
-        .bind(Uuid::new_v4().to_string())
-        .bind(task_id.to_string())
-        .bind(execution_id.map(str::to_string))
-        .bind(kind)
-        .bind(reason)
-        .bind(merge_commit_sha.map(str::to_string))
-        .bind(Utc::now().to_rfc3339())
-        .execute(&state.db)
-        .await;
-    if let Err(error) = result {
-        if !error.to_string().contains("no such table") {
-            eprintln!("main-gate event insert failed: {error}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn memory_db() -> sqlx::SqlitePool {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        db
+    }
+
+    fn state_with(db: sqlx::SqlitePool) -> AppState {
+        AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: std::env::temp_dir(),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
         }
     }
+
+    async fn seed_merge_pending(db: &sqlx::SqlitePool, candidate: &str) -> (Uuid, String) {
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(db).await.unwrap();
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .bind(&worker_id).bind("w").bind("worker").bind("idle").bind("linux").bind("x86_64")
+            .bind(6_i64).bind("test").bind(&now).bind(&now)
+            .execute(db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("merge_pending").bind(&now).bind(&now)
+            .execute(db).await.unwrap();
+        let exec_id = Uuid::new_v4().to_string();
+        let result = format!(r#"{{"status":"completed","summary":"s","commit_sha":"{candidate}","base_sha":"base","review_ref":"r"}}"#);
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,result,created_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&exec_id).bind(task_id.to_string()).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(result).bind(&now)
+            .execute(db).await.unwrap();
+        (task_id, exec_id)
+    }
+
+    async fn gate_kind(db: &sqlx::SqlitePool, task_id: Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, String>("SELECT kind FROM main_gate_events WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn merged_task_records_merged_atomically() {
+        let db = memory_db().await;
+        let (task_id, _) = seed_merge_pending(&db, "abc").await;
+        let state = state_with(db.clone());
+        let transition = merged_task(&state, task_id, "abc").await.unwrap();
+        assert_eq!(transition.state, "done");
+        assert_eq!(gate_kind(&db, task_id).await.as_deref(), Some("merged"));
+    }
+
+    #[tokio::test]
+    async fn merged_task_records_upstream_moved_as_distinct_kind() {
+        let db = memory_db().await;
+        let (task_id, _) = seed_merge_pending(&db, "abc").await;
+        let state = state_with(db.clone());
+        merged_task(&state, task_id, "merged-sha").await.unwrap();
+        assert_eq!(gate_kind(&db, task_id).await.as_deref(), Some("upstream_moved"));
+    }
+
+    #[tokio::test]
+    async fn retry_from_merge_pending_records_sent_back_atomically() {
+        let db = memory_db().await;
+        let (task_id, _) = seed_merge_pending(&db, "abc").await;
+        let state = state_with(db.clone());
+        let transition = retry_task(&state, task_id, Some("stale candidate")).await.unwrap();
+        assert_eq!(transition.state, "queued");
+        assert_eq!(gate_kind(&db, task_id).await.as_deref(), Some("sent_back"));
+    }
+
+    #[tokio::test]
+    async fn retry_with_conflict_kind_records_merge_conflict() {
+        let db = memory_db().await;
+        let (task_id, _) = seed_merge_pending(&db, "abc").await;
+        let state = state_with(db.clone());
+        retry_task_with_gate(&state, task_id, Some("merge conflict with current main"), Some("merge_conflict"))
+            .await
+            .unwrap();
+        assert_eq!(gate_kind(&db, task_id).await.as_deref(), Some("merge_conflict"));
+    }
+
+    #[tokio::test]
+    async fn retry_from_review_records_no_gate_event() {
+        let db = memory_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = state_with(db.clone());
+        retry_task(&state, task_id, Some("needs work")).await.unwrap();
+        assert_eq!(gate_kind(&db, task_id).await, None);
+    }
+}
+
+/// True when the main-gate event table exists. Lets merges/retries on
+/// pre-migration databases skip the gate row (Insights then reports gate
+/// history as unavailable) without blocking the transition itself.
+async fn gate_table_exists(db: &sqlx::SqlitePool) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='main_gate_events'")
+        .fetch_one(db)
+        .await
+        .unwrap_or(0)
+        > 0
 }

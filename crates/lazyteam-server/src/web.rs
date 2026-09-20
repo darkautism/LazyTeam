@@ -231,6 +231,13 @@ mod tests {
         assert!(INDEX.contains("merge-conflict redispatch"));
         assert!(INDEX.contains("never model-quality failures"));
         assert!(INDEX.contains("main_gate_merge_conflict"));
+        assert!(INDEX.contains("main_gate_upstream_moved"));
         assert!(INDEX.contains("reviewer_retries_current_cycle"));
+        assert!(INDEX.contains("reviews_runtime_failed"));
+        assert!(INDEX.contains("/api/tasks/'"));
+        assert!(INDEX.contains("Gate outcome"));
+        assert!(INDEX.contains("Backend / provider / model"));
+        // Task detail exposes durable gate outcomes, never current task state.
+        assert!(!INDEX.contains("esc(t.state)"));
     }
 }
