@@ -1296,14 +1296,25 @@ fn redact_secret_fields(text: &str) -> String {
 }
 
 /// Redact the value of one `name: value` / `name=value` pair (quoted JSON
-/// strings or bare tokens). Occurrences without a `:`/`=` delimiter are
-/// ordinary prose and are left untouched.
+/// strings or bare tokens). The sensitive name matches as a substring, so a
+/// longer identifier such as `STRIPE_SECRET_KEY` is claimed via `secret`:
+/// trailing identifier characters (`[A-Za-z0-9_-]`) are skipped before the
+/// delimiter check. Occurrences without a `:`/`=` delimiter are ordinary
+/// prose and are left untouched.
 fn redact_secret_field(text: &str, name: &str) -> String {
     let mut out = String::new();
     let mut cursor = 0;
     while let Some(rel) = find_ascii_ci(text, name, cursor) {
         let bytes = text.as_bytes();
         let mut j = rel + name.len();
+        // Skip the rest of a longer identifier (`SECRET_KEY`, `secret-key`,
+        // `secretAccessKey`, ...) so compound credential names are covered
+        // without enumerating every vendor prefix.
+        while j < bytes.len()
+            && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+        {
+            j += 1;
+        }
         while j < bytes.len()
             && (bytes[j] == b'"' || bytes[j] == b'\'' || bytes[j] == b']' || bytes[j].is_ascii_whitespace())
         {
@@ -1442,6 +1453,8 @@ fn redact_bearer_tokens(text: &str) -> String {
 const TOKEN_PREFIXES: &[&str] = &[
     "sk-ant-",
     "github_pat_",
+    "sk_live_",
+    "sk_test_",
     "sk-",
     "ghp_",
     "gho_",
@@ -2518,6 +2531,21 @@ mod tests {
         // The non-secret URL skeleton stays diagnosable.
         assert!(excerpt.contains("postgres://"), "unexpected: {excerpt}");
         assert!(excerpt.contains("db.internal"), "unexpected: {excerpt}");
+        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
+    }
+
+    #[test]
+    fn malformed_excerpt_redacts_compound_key_names_and_stripe_prefixes() {
+        // `secret` is followed by `_`, not a delimiter, so only a
+        // substring-aware identifier match can claim the value.
+        let raw = "deploy failed; STRIPE_SECRET_KEY=sk_live_abc123def456ghi789 secretAccessKey: AKIAIOSFODNN7EXAMPLE-ish";
+        let excerpt = sanitized_verdict_excerpt(raw);
+        assert!(!excerpt.contains("sk_live_abc123def456ghi789"), "secret leaked: {excerpt}");
+        assert!(!excerpt.contains("AKIAIOSFODNN7EXAMPLE-ish"), "secret leaked: {excerpt}");
+        assert!(excerpt.contains("[redacted"), "expected redaction placeholders: {excerpt}");
+        // A bare Stripe test key with no field name is caught by prefix.
+        let bare = sanitized_verdict_excerpt("saw sk_test_abc123def456ghi789 in output");
+        assert!(!bare.contains("sk_test_abc123def456ghi789"), "secret leaked: {bare}");
         assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
     }
 
