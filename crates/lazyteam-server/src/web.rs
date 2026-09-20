@@ -268,5 +268,15 @@ mod tests {
         assert!(INDEX.contains("review_cycle"));
         assert!(INDEX.contains("cycle "));
         assert!(!INDEX.contains("/api/tasks/'+esc(r.task_id)+'/review"));
+        // Scheduler waiting diagnostics: machine-readable reason + detail on
+        // waiting cards only; actively running/reviewing cards stay unspammed.
+        assert!(INDEX.contains("waitingMeta"));
+        assert!(INDEX.contains("waiting-pill"));
+        assert!(INDEX.contains("Waiting · "));
+        assert!(INDEX.contains("x.waiting"));
+        assert!(INDEX.contains("no_eligible_worker"));
+        assert!(INDEX.contains("review_failure_limit"));
+        // Insights evidence drill-down renders the same waiting diagnostic.
+        assert!(INDEX.contains("h.waiting"));
     }
 }

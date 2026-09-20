@@ -383,6 +383,63 @@ pub struct ReviewVerdict {
     pub validation: Vec<String>,
 }
 
+/// Merged required tags for scheduler matching: project runner labels plus
+/// task-required tags. Single source of truth for tag matching so claim
+/// selection and waiting diagnostics cannot drift apart.
+pub fn required_tags_for(project: &Project, task: &Task) -> Tags {
+    let mut required = project.required_worker_tags.clone();
+    required.extend(task.required_tags.clone());
+    required
+}
+
+/// Single tag predicate shared by matching and diagnostics. Wildcards (`*`
+/// or `any`, case-insensitive) on either side match anything.
+pub fn tag_value_matches(actual: Option<&String>, wanted: &str) -> bool {
+    if wanted == "*" || wanted.eq_ignore_ascii_case("any") {
+        return true;
+    }
+    actual.is_some_and(|actual| actual == wanted || actual == "*" || actual.eq_ignore_ascii_case("any"))
+}
+
+/// Required (key, wanted) pairs the worker does not satisfy. Empty means all
+/// required tags match. Uses the same predicate as `worker_matches_task`.
+pub fn tag_mismatches(worker: &Worker, project: &Project, task: &Task) -> Vec<(String, String)> {
+    required_tags_for(project, task)
+        .into_iter()
+        .filter(|(key, wanted)| !tag_value_matches(worker.tags.get(key), wanted))
+        .collect()
+}
+
+/// Tag/scope match ignoring slot capacity and worker liveness state. Used by
+/// diagnostics to separate "no eligible worker" from "no free slot" while
+/// reusing the same tag/project predicates as claim selection.
+pub fn worker_tags_scope_match(worker: &Worker, project: &Project, task: &Task) -> bool {
+    worker_can_run_project(worker, project) && tag_mismatches(worker, project, task).is_empty()
+}
+
+/// Host-owned agent selection is claim-eligible only when both provider and
+/// model are configured. Mirrors the worker-side claim gate so server
+/// diagnostics report the same backend truth.
+pub fn host_agent_selection_ready(agent: &AgentConfig) -> bool {
+    agent.provider.as_ref().is_some_and(|provider| !provider.trim().is_empty())
+        && agent.model.as_ref().is_some_and(|model| !model.trim().is_empty())
+}
+
+/// The exact Host-configured provider/model pair must be present in the Pi
+/// capability catalog. Shared with the worker claim gate.
+pub fn host_selection_available(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
+    match (&agent.provider, &agent.model) {
+        (Some(provider), Some(model)) => capabilities.models.iter()
+            .any(|candidate| &candidate.provider == provider && &candidate.id == model),
+        _ => false,
+    }
+}
+
+/// Combined backend eligibility for implementation and review slots.
+pub fn can_claim_work(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
+    host_agent_selection_ready(agent) && host_selection_available(agent, capabilities)
+}
+
 pub fn worker_can_run_project(worker: &Worker, project: &Project) -> bool {
     worker.allowed_projects.is_empty()
         || worker.allowed_projects.contains("*")
@@ -396,19 +453,7 @@ pub fn worker_matches_task(worker: &Worker, project: &Project, task: &Task) -> b
     if worker.running_slots >= worker.slots || !worker_can_run_project(worker, project) {
         return false;
     }
-
-    let mut required = project.required_worker_tags.clone();
-    required.extend(task.required_tags.clone());
-
-    required.into_iter().all(|(key, wanted)| {
-        if wanted == "*" || wanted.eq_ignore_ascii_case("any") {
-            return true;
-        }
-        worker
-            .tags
-            .get(&key)
-            .is_some_and(|actual| actual == &wanted || actual == "*" || actual.eq_ignore_ascii_case("any"))
-    })
+    tag_mismatches(worker, project, task).is_empty()
 }
 
 pub fn worker_preference_score(worker: &Worker, task: &Task) -> i32 {
