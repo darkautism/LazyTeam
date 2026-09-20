@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -13,7 +13,9 @@ use uuid::Uuid;
 use crate::{ApiError, AppState};
 
 pub(crate) fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/insights", get(insights))
+    Router::new()
+        .route("/api/insights", get(insights))
+        .route("/api/tasks/{id}/history", get(task_history))
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,15 +299,17 @@ async fn insights(
     }
 
     // ---- Tasks completed + task completion time from durable gate events. ----
-    // `tasks.created_at` is immutable, so the created count is durable.
-    // Completion counts/durations join the immutable creation timestamp to the
-    // durable gate completion event; mutable tasks.state/updated_at (rewritten
-    // by every retry) are never read here.
+    // `tasks.created_at` is immutable, so the created count is durable. No
+    // `tasks.state` filter is applied anywhere here: cancelling a task must
+    // not rewrite historical metrics. Completion counts/durations join the
+    // immutable creation timestamp to the durable gate completion event;
+    // mutable tasks.state/updated_at (rewritten by every retry) are never
+    // read here.
     let tasks_created: i64 = if table_exists(db, "tasks").await {
         match &cutoff_str {
-            Some(cut) => sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE state!='cancelled' AND created_at>=?")
+            Some(cut) => sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE created_at>=?")
                 .bind(cut).fetch_one(db).await.map_err(internal)?,
-            None => sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE state!='cancelled'")
+            None => sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
                 .fetch_one(db).await.map_err(internal)?,
         }
     } else {
@@ -362,11 +366,14 @@ async fn insights(
     } else {
         "SELECT worker_id,state,created_at,started_at,finished_at FROM executions"
     };
-    // Counts cover executions started in window; durations cover executions
-    // finished in window. Both filters use immutable timestamps.
+    // Counts cover executions started in window, where "started" is
+    // `started_at` with fallback to the claim-time `created_at` for attempts
+    // that never renewed (both immutable once written); durations cover
+    // executions finished in window (`finished_at`). All filters use durable
+    // timestamps only.
     let started_rows: Vec<ExecRow> = if table_exists(db, "executions").await {
         let sql = match &cutoff_str {
-            Some(_) => format!("{exec_select} WHERE created_at>=?"),
+            Some(_) => format!("{exec_select} WHERE COALESCE(started_at,created_at)>=?"),
             None => exec_select.to_string(),
         };
         let mut query = sqlx::query(&sql);
@@ -861,10 +868,11 @@ async fn insights(
     }
     let mut tasks_detail: Vec<TaskDetail> = Vec::new();
     if table_exists(db, "tasks").await {
+        // No state filter: cancelled tasks remain part of durable history.
         let rows = match &cutoff_str {
-            Some(cut) => sqlx::query("SELECT id,title FROM tasks WHERE state!='cancelled' AND created_at>=? ORDER BY created_at DESC LIMIT 100")
+            Some(cut) => sqlx::query("SELECT id,title FROM tasks WHERE created_at>=? ORDER BY created_at DESC LIMIT 100")
                 .bind(cut).fetch_all(db).await.map_err(internal)?,
-            None => sqlx::query("SELECT id,title FROM tasks WHERE state!='cancelled' ORDER BY created_at DESC LIMIT 100")
+            None => sqlx::query("SELECT id,title FROM tasks ORDER BY created_at DESC LIMIT 100")
                 .fetch_all(db).await.map_err(internal)?,
         };
         for row in rows {
@@ -916,6 +924,215 @@ async fn insights(
         reasons,
         tasks: tasks_detail,
     }))
+}
+
+/// Durable per-task evidence bundle for Insights drill-down.
+///
+/// Unlike review evidence, this has no task-state gate: a task sent back to
+/// `queued` (or cancelled) still exposes its durable executions, review
+/// verdicts, and gate events, so every reason row stays openable.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HistoryTask {
+    pub(crate) id: String,
+    pub(crate) project_id: String,
+    pub(crate) title: String,
+    pub(crate) created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HistoryExecution {
+    pub(crate) id: String,
+    pub(crate) attempt: i64,
+    pub(crate) worker_id: String,
+    pub(crate) worker_name: Option<String>,
+    pub(crate) state: String,
+    pub(crate) created_at: String,
+    pub(crate) started_at: Option<String>,
+    pub(crate) finished_at: Option<String>,
+    pub(crate) agent_type: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) summary: Option<String>,
+    pub(crate) commit_sha: Option<String>,
+    pub(crate) base_sha: Option<String>,
+    pub(crate) review_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HistoryReview {
+    pub(crate) id: String,
+    pub(crate) execution_id: Option<String>,
+    pub(crate) reviewer_worker_id: String,
+    pub(crate) reviewer_name: Option<String>,
+    pub(crate) state: String,
+    pub(crate) created_at: String,
+    pub(crate) finished_at: Option<String>,
+    pub(crate) verdict: Option<String>,
+    pub(crate) agent_type: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HistoryGateEvent {
+    pub(crate) id: String,
+    pub(crate) execution_id: Option<String>,
+    pub(crate) kind: String,
+    pub(crate) reason: String,
+    pub(crate) merge_commit_sha: Option<String>,
+    pub(crate) created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TaskHistory {
+    pub(crate) task: HistoryTask,
+    pub(crate) executions: Vec<HistoryExecution>,
+    pub(crate) reviews: Vec<HistoryReview>,
+    pub(crate) gate_events: Vec<HistoryGateEvent>,
+    pub(crate) gate_available: bool,
+}
+
+/// Compact execution-result evidence: status/summary/candidate pointers only.
+/// The full patch blob is deliberately excluded; it stays available to the
+/// reviewer broker and review tools.
+fn execution_evidence(raw: Option<&str>) -> (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) {
+    let value = raw.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+    let get = |key: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let summary = get("summary").map(|s| truncate(&s, 2000));
+    (get("status"), summary, get("commit_sha"), get("base_sha"), get("review_ref"))
+}
+
+async fn task_history(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<TaskHistory>, ApiError> {
+    let db = &state.db;
+    let task_row = sqlx::query("SELECT id,project_id,title,created_at FROM tasks WHERE id=?")
+        .bind(id.to_string())
+        .fetch_optional(db)
+        .await
+        .map_err(internal)?
+        .ok_or((axum::http::StatusCode::NOT_FOUND, "task not found".into()))?;
+    let task = HistoryTask {
+        id: task_row.try_get("id").unwrap_or_default(),
+        project_id: task_row.try_get("project_id").unwrap_or_default(),
+        title: task_row.try_get("title").unwrap_or_default(),
+        created_at: task_row.try_get("created_at").unwrap_or_default(),
+    };
+
+    let mut names: HashMap<String, String> = HashMap::new();
+    if table_exists(db, "workers").await {
+        if let Ok(rows) = sqlx::query("SELECT id,name FROM workers").fetch_all(db).await {
+            for row in rows {
+                let worker_id: String = row.try_get("id").unwrap_or_default();
+                let name: String = row.try_get("name").unwrap_or_default();
+                if !worker_id.is_empty() {
+                    names.insert(worker_id, name);
+                }
+            }
+        }
+    }
+
+    let execs_have_snap = column_exists(db, "executions", "worker_agent_type").await
+        && column_exists(db, "executions", "worker_provider").await
+        && column_exists(db, "executions", "worker_model").await;
+    let mut executions = Vec::new();
+    if table_exists(db, "executions").await {
+        let select = if execs_have_snap {
+            "SELECT id,attempt,worker_id,state,created_at,started_at,finished_at,result,worker_agent_type,worker_provider,worker_model FROM executions WHERE task_id=? ORDER BY attempt ASC"
+        } else {
+            "SELECT id,attempt,worker_id,state,created_at,started_at,finished_at,result FROM executions WHERE task_id=? ORDER BY attempt ASC"
+        };
+        if let Ok(rows) = sqlx::query(select).bind(id.to_string()).fetch_all(db).await {
+            for row in rows {
+                let worker_id: String = row.try_get("worker_id").unwrap_or_default();
+                let (status, summary, commit_sha, base_sha, review_ref) =
+                    execution_evidence(row.try_get::<Option<String>, _>("result").unwrap_or(None).as_deref());
+                executions.push(HistoryExecution {
+                    id: row.try_get("id").unwrap_or_default(),
+                    attempt: row.try_get("attempt").unwrap_or(0),
+                    worker_name: names.get(&worker_id).cloned(),
+                    worker_id,
+                    state: row.try_get("state").unwrap_or_default(),
+                    created_at: row.try_get("created_at").unwrap_or_default(),
+                    started_at: row.try_get("started_at").unwrap_or(None),
+                    finished_at: row.try_get("finished_at").unwrap_or(None),
+                    agent_type: row.try_get("worker_agent_type").unwrap_or(None),
+                    provider: row.try_get("worker_provider").unwrap_or(None),
+                    model: row.try_get("worker_model").unwrap_or(None),
+                    status,
+                    summary,
+                    commit_sha,
+                    base_sha,
+                    review_ref,
+                });
+            }
+        }
+    }
+
+    let reviews_have_execution = column_exists(db, "reviews", "execution_id").await;
+    let reviews_have_snap = column_exists(db, "reviews", "reviewer_agent_type").await
+        && column_exists(db, "reviews", "reviewer_provider").await
+        && column_exists(db, "reviews", "reviewer_model").await;
+    let mut reviews = Vec::new();
+    if table_exists(db, "reviews").await {
+        let select = match (reviews_have_execution, reviews_have_snap) {
+            (true, true) => "SELECT id,execution_id,reviewer_worker_id,state,created_at,finished_at,verdict,reviewer_agent_type,reviewer_provider,reviewer_model FROM reviews WHERE task_id=? ORDER BY created_at ASC",
+            (true, false) => "SELECT id,execution_id,reviewer_worker_id,state,created_at,finished_at,verdict FROM reviews WHERE task_id=? ORDER BY created_at ASC",
+            (false, true) => "SELECT id,reviewer_worker_id,state,created_at,finished_at,verdict,reviewer_agent_type,reviewer_provider,reviewer_model FROM reviews WHERE task_id=? ORDER BY created_at ASC",
+            (false, false) => "SELECT id,reviewer_worker_id,state,created_at,finished_at,verdict FROM reviews WHERE task_id=? ORDER BY created_at ASC",
+        };
+        if let Ok(rows) = sqlx::query(select).bind(id.to_string()).fetch_all(db).await {
+            for row in rows {
+                let reviewer_id: String = row.try_get("reviewer_worker_id").unwrap_or_default();
+                reviews.push(HistoryReview {
+                    id: row.try_get("id").unwrap_or_default(),
+                    execution_id: row.try_get::<Option<String>, _>("execution_id").unwrap_or(None),
+                    reviewer_name: names.get(&reviewer_id).cloned(),
+                    reviewer_worker_id: reviewer_id,
+                    state: row.try_get("state").unwrap_or_default(),
+                    created_at: row.try_get("created_at").unwrap_or_default(),
+                    finished_at: row.try_get::<Option<String>, _>("finished_at").unwrap_or(None),
+                    verdict: row.try_get("verdict").unwrap_or(None),
+                    agent_type: row.try_get("reviewer_agent_type").unwrap_or(None),
+                    provider: row.try_get("reviewer_provider").unwrap_or(None),
+                    model: row.try_get("reviewer_model").unwrap_or(None),
+                });
+            }
+        }
+    }
+
+    let gate_available = table_exists(db, "main_gate_events").await;
+    let mut gate_events = Vec::new();
+    if gate_available {
+        if let Ok(rows) = sqlx::query(
+            "SELECT id,execution_id,kind,reason,merge_commit_sha,created_at FROM main_gate_events WHERE task_id=? ORDER BY created_at ASC",
+        )
+        .bind(id.to_string())
+        .fetch_all(db)
+        .await
+        {
+            for row in rows {
+                gate_events.push(HistoryGateEvent {
+                    id: row.try_get("id").unwrap_or_default(),
+                    execution_id: row.try_get("execution_id").unwrap_or(None),
+                    kind: row.try_get("kind").unwrap_or_default(),
+                    reason: row.try_get("reason").unwrap_or_default(),
+                    merge_commit_sha: row.try_get("merge_commit_sha").unwrap_or(None),
+                    created_at: row.try_get("created_at").unwrap_or_default(),
+                });
+            }
+        }
+    }
+
+    Ok(Json(TaskHistory { task, executions, reviews, gate_events, gate_available }))
 }
 
 async fn latest_exec_worker(db: &sqlx::SqlitePool, execution_id: &Option<String>) -> Option<String> {
@@ -1246,5 +1463,123 @@ mod tests {
         assert_eq!(body.reviews_retry.count, 1);
         assert_eq!(body.tasks[0].lifetime_retries, 1);
         assert_eq!(body.tasks[0].current_cycle_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn history_bundle_opens_queued_retry_evidence() {
+        let db = memory_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for (id, role) in [(&worker_id, "worker"), (&reviewer_id, "reviewer")] {
+            sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(role).bind(role).bind("idle").bind("linux").bind("x86_64")
+                .bind(6_i64).bind("test").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
+        // Task was sent back to queued: the state-gated review endpoint
+        // refuses it, but the history bundle must stay openable.
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let exec_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,started_at,finished_at,result,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .bind(&exec_id).bind(task_id.to_string()).bind(&worker_id).bind(1_i64).bind("completed").bind(&now)
+            .bind(&now).bind(&now)
+            .bind(r#"{"status":"completed","summary":"s","commit_sha":"abc","base_sha":"base","review_ref":"r"}"#)
+            .bind(&now)
+            .execute(&db).await.unwrap();
+        let review_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,finished_at,verdict) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(&review_id).bind(task_id.to_string()).bind(&exec_id).bind(&reviewer_id)
+            .bind("completed").bind(&now).bind(&now).bind(&now)
+            .bind(r#"{"verdict":"retry","reason":"needs work","validation":[]}"#)
+            .execute(&db).await.unwrap();
+        let event_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO main_gate_events(id,task_id,execution_id,kind,reason,created_at) VALUES(?,?,?,?,?,?)")
+            .bind(&event_id).bind(task_id.to_string()).bind(&exec_id)
+            .bind("sent_back").bind("stale candidate").bind(&now)
+            .execute(&db).await.unwrap();
+        let state = state_with(db);
+        let Json(bundle) = task_history(Path(task_id), State(state)).await.unwrap();
+        assert_eq!(bundle.task.id, task_id.to_string());
+        assert_eq!(bundle.executions.len(), 1);
+        assert_eq!(bundle.executions[0].id, exec_id);
+        assert_eq!(bundle.executions[0].commit_sha.as_deref(), Some("abc"));
+        assert_eq!(bundle.reviews.len(), 1);
+        assert_eq!(bundle.reviews[0].id, review_id);
+        assert!(bundle.reviews[0].verdict.as_deref().unwrap_or("").contains("needs work"));
+        assert!(bundle.gate_available);
+        assert_eq!(bundle.gate_events.len(), 1);
+        assert_eq!(bundle.gate_events[0].id, event_id);
+        assert_eq!(bundle.gate_events[0].kind, "sent_back");
+    }
+
+    #[tokio::test]
+    async fn history_returns_not_found_for_unknown_task() {
+        let state = state_with(memory_db().await);
+        let result = task_history(Path(Uuid::new_v4()), State(state)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_tasks_stay_in_durable_history() {
+        let db = memory_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("t").bind("").bind("").bind("cancelled").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = state_with(db.clone());
+        let Json(body) = insights(State(state), Query(InsightsQuery { window: "all".into() }))
+            .await
+            .unwrap();
+        // Cancelling must not erase the durable creation record.
+        assert_eq!(body.tasks_created, 1);
+        assert_eq!(body.tasks.len(), 1);
+        // ... and its evidence bundle stays openable.
+        let Json(bundle) = task_history(Path(Uuid::parse_str(&task_id).unwrap()), State(state_with(db)))
+            .await
+            .unwrap();
+        assert_eq!(bundle.task.id, task_id);
+    }
+
+    #[tokio::test]
+    async fn execution_window_uses_started_at() {
+        let db = memory_db().await;
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(60)).to_rfc3339();
+        let now_str = now.to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now_str).bind(&now_str)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .bind(&worker_id).bind("w").bind("worker").bind("idle").bind("linux").bind("x86_64")
+            .bind(6_i64).bind("test").bind(&now_str).bind(&now_str)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("t").bind("").bind("").bind("queued").bind(&now_str).bind(&now_str)
+            .execute(&db).await.unwrap();
+        // Claimed long ago but first started inside the window: counted.
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,started_at,created_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&worker_id).bind(1_i64).bind("running").bind(&now_str).bind(&now_str).bind(&old)
+            .execute(&db).await.unwrap();
+        let state = state_with(db);
+        let Json(body) = insights(State(state), Query(InsightsQuery { window: "30d".into() }))
+            .await
+            .unwrap();
+        assert_eq!(body.executions_total, 1);
     }
 }

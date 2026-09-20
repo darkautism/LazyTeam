@@ -239,5 +239,17 @@ mod tests {
         assert!(INDEX.contains("Backend / provider / model"));
         // Task detail exposes durable gate outcomes, never current task state.
         assert!(!INDEX.contains("esc(t.state)"));
+        // Evidence drill-down: every task/execution/review/event ID is an
+        // action opening the state-independent history bundle, which works
+        // for queued retries and cancelled tasks too.
+        assert!(INDEX.contains("Evidence drill-down"));
+        assert!(INDEX.contains("showInsightEvidence"));
+        assert!(INDEX.contains("insightEvidenceLink"));
+        assert!(INDEX.contains("/history"));
+        assert!(INDEX.contains("insights-evidence"));
+        assert!(INDEX.contains("insightVerdictText"));
+        // Insights history never filters on mutable task state.
+        assert!(!INDEX.contains("state!='cancelled'"));
+        assert!(!INDEX.contains("/api/tasks/'+esc(r.task_id)+'/review"));
     }
 }
