@@ -23,7 +23,8 @@ mod tests {
         assert!(INDEX.contains(r#"data-page="home""#));
         assert!(INDEX.contains(r#"data-page="projects""#));
         assert!(INDEX.contains(r#"data-page="workers""#));
-        assert!(INDEX.contains("sessionStorage.setItem(TOKEN_KEY,token)"));
+        assert!(INDEX.contains("localStorage.setItem(TOKEN_KEY,token)"));
+        assert!(INDEX.contains("sessionStorage.removeItem(TOKEN_KEY)"));
         assert!(INDEX.contains("Connected"));
         assert!(!INDEX.contains("Admin token stored for this browser session"));
         assert!(INDEX.contains("/api/task-board"));

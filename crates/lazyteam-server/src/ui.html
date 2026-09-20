@@ -199,7 +199,7 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const short=s=>String(s??'').slice(0,8);
 const tags=t=>Object.entries(t||{}).map(([k,v])=>'<span class="tag">'+esc(k)+'='+esc(v)+'</span>').join('');
-const currentToken=()=>sessionStorage.getItem(TOKEN_KEY)||'';
+function currentToken(){const persistent=localStorage.getItem(TOKEN_KEY);if(persistent)return persistent;const legacy=sessionStorage.getItem(TOKEN_KEY)||'';if(legacy){localStorage.setItem(TOKEN_KEY,legacy);sessionStorage.removeItem(TOKEN_KEY)}return legacy}
 
 async function api(url,opt={}){
   const headers=new Headers(opt.headers||{}), token=currentToken();
@@ -216,11 +216,11 @@ function renderConnection(){
 function toggleConnectPopover(){const p=$('#connect-popover');p.classList.toggle('open');$('#admin-token').value=currentToken();$('#connect-error').textContent=''}
 async function connectAdmin(){
   const token=$('#admin-token').value.trim();if(!token)return;
-  sessionStorage.setItem(TOKEN_KEY,token);
+  localStorage.setItem(TOKEN_KEY,token);sessionStorage.removeItem(TOKEN_KEY);
   try{await api('/api/projects');connected=true;$('#connect-popover').classList.remove('open');renderConnection();await refreshPage()}
   catch(e){connected=false;renderConnection();$('#connect-error').textContent='Connection failed'}
 }
-function disconnectAdmin(){sessionStorage.removeItem(TOKEN_KEY);connected=false;renderConnection();$('#connect-popover').classList.remove('open');clearViews()}
+function disconnectAdmin(){localStorage.removeItem(TOKEN_KEY);sessionStorage.removeItem(TOKEN_KEY);connected=false;renderConnection();$('#connect-popover').classList.remove('open');clearViews()}
 async function verifyConnection(){if(!currentToken()){connected=false;renderConnection();return}try{projects=await api('/api/projects');connected=true}catch{connected=false}renderConnection()}
 
 function showPage(page){currentPage=page;location.hash=page==='home'?'':page;document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id==='page-'+page));document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.page===page));refreshPage()}
