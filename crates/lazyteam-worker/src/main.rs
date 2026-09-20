@@ -1144,8 +1144,15 @@ async fn resolve_review_verdict_in_lease(
             ));
         }
     };
+    // The repaired summary is the malformed final output even when its
+    // binding cannot be persisted: always report it with the bounded
+    // excerpt/hash/length diagnostic rather than a bare binding error.
     if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
-        return Err(error);
+        return Err(anyhow::anyhow!(
+            "{}; could not persist repaired reviewer session: {}",
+            malformed_verdict_diagnostic(&repaired.summary),
+            sanitize_for_diagnostic(&format!("{error:#}"), MALFORMED_REPAIR_ERROR_CHARS),
+        ));
     }
     match parse_review_verdict(&repaired.summary) {
         Ok(verdict) => {
@@ -1190,16 +1197,20 @@ fn sanitize_for_diagnostic(raw: &str, max_chars: usize) -> String {
     if visible.is_empty() { "(empty)".to_string() } else { visible.to_string() }
 }
 
-/// Redact common secret shapes without any regex dependency: PEM blocks,
-/// `name: value` / `name=value` pairs for sensitive field names (JSON or
-/// header style), `Bearer` tokens, credentials embedded in URLs, and
-/// well-known token prefixes.
+/// Redact secret shapes without any regex dependency across generic layers:
+/// PEM blocks, `Bearer` tokens, `name: value` / `name=value` pairs whose
+/// name contains a sensitive substring (so any `*_KEY`, `*_SECRET`,
+/// `*_TOKEN`, `*_PASSWORD` spelling is claimed without enumerating vendor
+/// prefixes), cookie-header values (session credentials by nature, whatever
+/// the cookie name), credentials embedded in URLs, and well-known token
+/// prefixes. Anything without a credential delimiter is left untouched.
 fn redact_secret_values(text: &str) -> String {
     let text = redact_pem_blocks(text);
     // Bearer before fields: `Authorization: Bearer <token>` must redact the
     // credential, not just the `Bearer` scheme word a field pass would see.
     let text = redact_bearer_tokens(&text);
     let text = redact_secret_fields(&text);
+    let text = redact_cookie_values(&text);
     let text = redact_url_credentials(&text);
     redact_prefixed_tokens(&text)
 }
@@ -1285,6 +1296,10 @@ const SECRET_FIELD_NAMES: &[&str] = &[
     "token",
     "apikey",
     "api-key",
+    // Generic credential-identifier tail: with the substring match plus the
+    // identifier-suffix skip in `redact_secret_field`, any `ENCRYPTION_KEY`,
+    // `PRIVATE_KEY`, or vendor `*_KEY` spelling is claimed.
+    "key",
 ];
 
 fn redact_secret_fields(text: &str) -> String {
@@ -1399,6 +1414,66 @@ fn redact_url_credentials(text: &str) -> String {
         }
         out.push_str(&text[cursor..authority]);
         cursor = authority;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Redact cookie values generically: after a `Cookie:` / `Set-Cookie:`
+/// header, every `name=value` pair carries a session credential by nature,
+/// so each value is replaced regardless of cookie name (`connect.sid`,
+/// `sessionid`, ...). Only `=`-bound values on the header line are touched;
+/// a header with no pairs passes through unchanged.
+fn redact_cookie_values(text: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+    while let Some(rel) = find_ascii_ci(text, "cookie", cursor) {
+        let bytes = text.as_bytes();
+        let mut j = rel + "cookie".len();
+        while j < bytes.len()
+            && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+        {
+            j += 1;
+        }
+        while j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'' || bytes[j].is_ascii_whitespace()) {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b':' {
+            j += 1;
+            let mut line_end = j;
+            while line_end < bytes.len() && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
+                line_end += 1;
+            }
+            // `line_end` rests on an ASCII newline or the string end, so
+            // every slice below lands on a char boundary.
+            out.push_str(&text[cursor..j]);
+            let mut k = j;
+            while k < line_end {
+                if bytes[k] == b'=' {
+                    out.push_str("=[redacted]");
+                    k += 1;
+                    while k < line_end
+                        && !matches!(bytes[k], b';' | b'"' | b'\'')
+                        && !bytes[k].is_ascii_whitespace()
+                    {
+                        k += 1;
+                    }
+                } else {
+                    let start = k;
+                    k += 1;
+                    // Never split a multi-byte character: advance to the
+                    // next char boundary before slicing.
+                    while k < line_end && !text.is_char_boundary(k) {
+                        k += 1;
+                    }
+                    out.push_str(&text[start..k]);
+                }
+            }
+            cursor = line_end;
+            continue;
+        }
+        out.push_str(&text[cursor..rel + "cookie".len()]);
+        cursor = rel + "cookie".len();
     }
     out.push_str(&text[cursor..]);
     out
@@ -2418,7 +2493,8 @@ mod tests {
             }
             let mut outputs = self.repair_outputs.lock().unwrap();
             assert!(!outputs.is_empty(), "repair must be attempted at most once per lease");
-            Ok(AgentRunResult { summary: outputs.remove(0), backend_session_id: None })
+            // A rotated backend ID, so the in-lease bind path is exercised.
+            Ok(AgentRunResult { summary: outputs.remove(0), backend_session_id: Some("ses_repaired_opaque".into()) })
         }
     }
 
@@ -2547,6 +2623,59 @@ mod tests {
         let bare = sanitized_verdict_excerpt("saw sk_test_abc123def456ghi789 in output");
         assert!(!bare.contains("sk_test_abc123def456ghi789"), "secret leaked: {bare}");
         assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
+    }
+
+    #[test]
+    fn malformed_excerpt_redacts_generic_key_names_and_cookie_sessions() {
+        // Neither name appears in the field allowlist verbatim: `key` as a
+        // substring plus the identifier-suffix skip must claim the value,
+        // and cookie values redact whatever the cookie is called.
+        let raw = "config ENCRYPTION_KEY=enc-key-secret-001 Cookie: connect.sid=sess-id-secret-002; Path=/";
+        let excerpt = sanitized_verdict_excerpt(raw);
+        assert!(!excerpt.contains("enc-key-secret-001"), "secret leaked: {excerpt}");
+        assert!(!excerpt.contains("sess-id-secret-002"), "secret leaked: {excerpt}");
+        // Non-secret structure stays diagnosable.
+        assert!(excerpt.contains("connect.sid"), "unexpected: {excerpt}");
+        assert!(excerpt.contains("Cookie"), "unexpected: {excerpt}");
+        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
+    }
+
+    #[tokio::test]
+    async fn binding_failure_still_reports_malformed_final_output() {
+        // A malformed repair response that rotates the backend ID but whose
+        // binding cannot persist must still fail exactly once with the
+        // bounded excerpt/hash/length of that final output.
+        let runtime = FakeReviewRuntime::with_repairs(vec![format!(
+            "malformed repair ENCRYPTION_KEY=bind-fail-secret-003 {}",
+            "q".repeat(3000),
+        )]);
+        let root = std::env::temp_dir().join(format!("lazyteam-review-bind-fail-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let manager = SessionManager::new(root.join("state"));
+        let task_id = Uuid::new_v4();
+        let lock = manager.lock_session(task_id, SessionRole::Review).await;
+        // An empty backend forces the post-repair bind to fail.
+        let session = AgentSession {
+            task_id,
+            role: SessionRole::Review,
+            backend: String::new(),
+            backend_session_id: None,
+            data_dir: root.join("data"),
+            last_used_at_unix: 0,
+        };
+        let first = AgentRunResult { summary: "first malformed, no JSON".into(), backend_session_id: None };
+        let error = resolve_review_verdict_in_lease(&runtime, &root, &manager, &lock, &session, &first)
+            .await
+            .unwrap_err();
+        assert_eq!(runtime.repair_call_count(), 1, "at most one repair per lease");
+        let message = error.to_string();
+        assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
+        assert!(message.contains("len="), "diagnostic must carry length: {message}");
+        assert!(message.contains("hash="), "diagnostic must carry hash: {message}");
+        assert!(message.contains("excerpt="), "diagnostic must carry excerpt: {message}");
+        assert!(!message.contains("bind-fail-secret-003"), "secret leaked: {message}");
+        assert!(!message.contains(&"q".repeat(1000)), "giant output must be capped");
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]
