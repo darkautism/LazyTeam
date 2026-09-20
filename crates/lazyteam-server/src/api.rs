@@ -1842,12 +1842,11 @@ fn worker_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Worker, ApiError> {
     let user_tags: Tags = dejson(row.try_get("tags").map_err(internal)?)?;
     let managed_capabilities: BTreeSet<String> = dejson(row.try_get("managed_capabilities").map_err(internal)?)?;
     let installed_capabilities: BTreeSet<String> = dejson(row.try_get("installed_capabilities").map_err(internal)?)?;
-    let system_tags = Tags::from([("os".into(), os.clone()), ("arch".into(), arch.clone())]);
     let tags = effective_worker_tags(&os, &arch, &user_tags, &managed_capabilities, &installed_capabilities);
     Ok(Worker { id: uuid(row.try_get("id").map_err(internal)?)?, name: row.try_get("name").map_err(internal)?,
         role,
         state: match state.as_str() { "busy" => WorkerState::Busy, "pending" => WorkerState::Pending, "draining" => WorkerState::Draining, "degraded" => WorkerState::Degraded, "offline" => WorkerState::Offline, _ => WorkerState::Idle },
-        os, arch, system_tags, user_tags, managed_capabilities, installed_capabilities,
+        os, arch, user_tags, managed_capabilities, installed_capabilities,
         capability_error: row.try_get("capability_error").map_err(internal)?,
         capability_phase: row.try_get("capability_phase").map_err(internal)?,
         capability_log: row.try_get("capability_log").map_err(internal)?, tags,

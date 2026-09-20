@@ -209,8 +209,6 @@ pub struct Worker {
     pub os: String,
     pub arch: String,
     #[serde(default)]
-    pub system_tags: Tags,
-    #[serde(default)]
     pub user_tags: Tags,
     #[serde(default)]
     pub managed_capabilities: BTreeSet<String>,
@@ -222,7 +220,7 @@ pub struct Worker {
     pub capability_phase: Option<String>,
     #[serde(default)]
     pub capability_log: String,
-    /// Effective scheduler tags: system + user + selected managed capabilities that are installed.
+    /// Effective scheduler tags: os/arch + user + selected managed capabilities that are installed.
     #[serde(default)]
     pub tags: Tags,
     #[serde(default)]
@@ -431,10 +429,6 @@ mod tests {
             state: WorkerState::Idle,
             os: "linux".into(),
             arch: "aarch64".into(),
-            system_tags: BTreeMap::from([
-                ("os".into(), "linux".into()),
-                ("arch".into(), "aarch64".into()),
-            ]),
             user_tags: BTreeMap::from([("cpu".into(), "rk3588".into())]),
             managed_capabilities: BTreeSet::new(),
             installed_capabilities: BTreeSet::new(),
