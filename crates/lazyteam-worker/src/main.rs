@@ -1144,22 +1144,33 @@ async fn resolve_review_verdict_in_lease(
             ));
         }
     };
-    // The repaired summary is the malformed final output even when its
-    // binding cannot be persisted: always report it with the bounded
-    // excerpt/hash/length diagnostic rather than a bare binding error.
-    if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
-        return Err(anyhow::anyhow!(
-            "{}; could not persist repaired reviewer session: {}",
-            malformed_verdict_diagnostic(&repaired.summary),
-            sanitize_for_diagnostic(&format!("{error:#}"), MALFORMED_REPAIR_ERROR_CHARS),
-        ));
-    }
+    // Parsing determines the branch: a successfully repaired verdict must
+    // never be misreported as malformed, even if its session binding fails.
     match parse_review_verdict(&repaired.summary) {
         Ok(verdict) => {
+            if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
+                return Err(anyhow::anyhow!(
+                    "repaired reviewer verdict parsed but its session could not persist: {}",
+                    sanitize_for_diagnostic(&format!("{error:#}"), MALFORMED_REPAIR_ERROR_CHARS),
+                ));
+            }
             info!("reviewer verdict repaired in-lease; completing existing review row");
             Ok(verdict)
         }
-        Err(_) => Err(anyhow::anyhow!(malformed_verdict_diagnostic(&repaired.summary))),
+        Err(_) => {
+            // The repaired summary is the malformed final output even when
+            // its binding cannot be persisted: still report it with the
+            // bounded excerpt/hash/length diagnostic. The bind is
+            // best-effort here so a persistence failure cannot displace or
+            // duplicate the malformed-output failure.
+            if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
+                warn!(
+                    "repaired reviewer session binding failed alongside malformed verdict: {}",
+                    sanitize_for_diagnostic(&format!("{error:#}"), MALFORMED_REPAIR_ERROR_CHARS),
+                );
+            }
+            Err(anyhow::anyhow!(malformed_verdict_diagnostic(&repaired.summary)))
+        }
     }
 }
 
@@ -1292,7 +1303,9 @@ const SECRET_FIELD_NAMES: &[&str] = &[
     "authorization",
     "password",
     "passwd",
+    "credential",
     "secret",
+    "session",
     "token",
     "apikey",
     "api-key",
@@ -1450,13 +1463,33 @@ fn redact_cookie_values(text: &str) -> String {
             let mut k = j;
             while k < line_end {
                 if bytes[k] == b'=' {
-                    out.push_str("=[redacted]");
                     k += 1;
-                    while k < line_end
-                        && !matches!(bytes[k], b';' | b'"' | b'\'')
-                        && !bytes[k].is_ascii_whitespace()
-                    {
+                    while k < line_end && bytes[k].is_ascii_whitespace() {
                         k += 1;
+                    }
+                    out.push('=');
+                    if k < line_end && (bytes[k] == b'"' || bytes[k] == b'\'') {
+                        // Quoted value: consume through the closing quote so
+                        // `connect.sid="..."` cannot leak its contents.
+                        let quote = bytes[k];
+                        k += 1;
+                        while k < line_end && bytes[k] != quote {
+                            k += 1;
+                        }
+                        if k < line_end {
+                            k += 1; // consume the closing quote
+                        }
+                        out.push(quote as char);
+                        out.push_str("[redacted]");
+                        out.push(quote as char);
+                    } else {
+                        out.push_str("[redacted]");
+                        while k < line_end
+                            && !matches!(bytes[k], b';' | b'"' | b'\'')
+                            && !bytes[k].is_ascii_whitespace()
+                        {
+                            k += 1;
+                        }
                     }
                 } else {
                     let start = k;
@@ -1527,6 +1560,7 @@ fn redact_bearer_tokens(text: &str) -> String {
 /// untouched.
 const TOKEN_PREFIXES: &[&str] = &[
     "sk-ant-",
+    "AIza",
     "github_pat_",
     "sk_live_",
     "sk_test_",
@@ -2629,11 +2663,21 @@ mod tests {
     fn malformed_excerpt_redacts_generic_key_names_and_cookie_sessions() {
         // Neither name appears in the field allowlist verbatim: `key` as a
         // substring plus the identifier-suffix skip must claim the value,
-        // and cookie values redact whatever the cookie is called.
-        let raw = "config ENCRYPTION_KEY=enc-key-secret-001 Cookie: connect.sid=sess-id-secret-002; Path=/";
+        // and cookie values redact whatever the cookie is called, quoted
+        // or bare.
+        let raw = "config ENCRYPTION_KEY=enc-key-secret-001 CREDENTIAL=cred-secret-004 SESSION_ID=sess-field-secret-005 \
+            Cookie: connect.sid=sess-id-secret-002; Path=/\nCookie: connect.sid=\"sess-quoted-secret-003\"; Path=/ token AIzaSyD-secret-raw-006";
         let excerpt = sanitized_verdict_excerpt(raw);
-        assert!(!excerpt.contains("enc-key-secret-001"), "secret leaked: {excerpt}");
-        assert!(!excerpt.contains("sess-id-secret-002"), "secret leaked: {excerpt}");
+        for leaked in [
+            "enc-key-secret-001",
+            "cred-secret-004",
+            "sess-field-secret-005",
+            "sess-id-secret-002",
+            "sess-quoted-secret-003",
+            "AIzaSyD-secret-raw-006",
+        ] {
+            assert!(!excerpt.contains(leaked), "secret leaked: {excerpt}");
+        }
         // Non-secret structure stays diagnosable.
         assert!(excerpt.contains("connect.sid"), "unexpected: {excerpt}");
         assert!(excerpt.contains("Cookie"), "unexpected: {excerpt}");
@@ -2675,6 +2719,39 @@ mod tests {
         assert!(message.contains("excerpt="), "diagnostic must carry excerpt: {message}");
         assert!(!message.contains("bind-fail-secret-003"), "secret leaked: {message}");
         assert!(!message.contains(&"q".repeat(1000)), "giant output must be capped");
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn valid_repair_with_binding_failure_is_not_malformed() {
+        // A successfully parsed repair whose binding cannot persist must be
+        // reported as a session-persistence failure, never as a malformed
+        // verdict, so it cannot take the runtime-failure path.
+        let runtime = FakeReviewRuntime::with_repairs(vec![
+            r#"{"verdict":"retry","reason":"missing test","validation":[]}"#.to_string(),
+        ]);
+        let root = std::env::temp_dir().join(format!("lazyteam-review-bind-valid-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let manager = SessionManager::new(root.join("state"));
+        let task_id = Uuid::new_v4();
+        let lock = manager.lock_session(task_id, SessionRole::Review).await;
+        // An empty backend forces the post-repair bind to fail.
+        let session = AgentSession {
+            task_id,
+            role: SessionRole::Review,
+            backend: String::new(),
+            backend_session_id: None,
+            data_dir: root.join("data"),
+            last_used_at_unix: 0,
+        };
+        let first = AgentRunResult { summary: "first malformed, no JSON".into(), backend_session_id: None };
+        let error = resolve_review_verdict_in_lease(&runtime, &root, &manager, &lock, &session, &first)
+            .await
+            .unwrap_err();
+        assert_eq!(runtime.repair_call_count(), 1, "at most one repair per lease");
+        let message = error.to_string();
+        assert!(!message.contains("did not return the required JSON verdict"), "valid repair misreported as malformed: {message}");
+        assert!(message.contains("could not persist"), "unexpected: {message}");
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
