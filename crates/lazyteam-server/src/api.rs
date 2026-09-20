@@ -1842,44 +1842,6 @@ pub(crate) async fn load_diag_context(db: &SqlitePool) -> Result<DiagContext, Ap
     Ok(DiagContext { workers, projects, review_failure_limit })
 }
 
-/// Effective claim capability for diagnostics: the server predicates plus
-/// the worker-side gates the server claim path cannot see. A worker that
-/// fails `can_claim_work` never calls the claim endpoints (the worker
-/// runtime stays idle), and a worker without a credential is rejected by
-/// `require_worker`, so neither can take a task even when tags, scope,
-/// slots, and affinity all match. Diagnostics must reflect that, or a
-/// legacy/uncredentialed row would produce a false `awaiting_claim`.
-fn diagnostic_claim_capable(worker: &Worker) -> bool {
-    worker.role == AgentRole::Worker
-        && worker.protocol_version >= PROTOCOL_VERSION
-        && matches!(worker.state, WorkerState::Idle | WorkerState::Busy)
-        && worker.running_slots < worker.slots
-        && can_claim_work(&worker.agent, &worker.agent_capabilities)
-}
-
-fn diagnostic_reviewer_capable(worker: &Worker) -> bool {
-    worker.role == AgentRole::Reviewer
-        && worker.protocol_version >= PROTOCOL_VERSION
-        && matches!(worker.state, WorkerState::Idle | WorkerState::Busy)
-        && worker.running_slots < worker.slots
-        && can_claim_work(&worker.agent, &worker.agent_capabilities)
-}
-
-/// True when the task's most recent reviewer is present in the diagnostic
-/// (credentialed) fleet and could actually claim a review slot. Read-only.
-async fn preferred_reviewer_claim_capable(
-    db: &SqlitePool,
-    ctx: &DiagContext,
-    task: &Task,
-) -> Result<bool, ApiError> {
-    let preferred_id: Option<String> = sqlx::query_scalar(
-        "SELECT reviewer_worker_id FROM reviews WHERE task_id=? ORDER BY created_at DESC LIMIT 1")
-        .bind(task.id.to_string()).fetch_optional(db).await.map_err(db_error)?;
-    let Some(preferred_id) = preferred_id else { return Ok(false); };
-    Ok(ctx.workers.iter()
-        .any(|w| w.id.to_string() == preferred_id && diagnostic_reviewer_capable(w)))
-}
-
 fn backend_unavailable_detail(worker: &Worker) -> String {
     match (&worker.agent.provider, &worker.agent.model) {
         (Some(provider), Some(model)) => format!(
@@ -1921,15 +1883,11 @@ async fn queued_waiting_info(
         return Ok(Some(waiting("blocked_dependencies", detail)));
     }
     if let Some(sticky) = sticky_worker_id {
-        // Report the sticky reservation only when the preferred worker could
-        // actually take the task: the server claim path reserves on liveness
-        // alone, but a preferred worker with no credential or no Pi backend
-        // can never claim, so the actionable reason is the pool analysis
-        // below (usually `backend_unavailable`/`no_eligible_worker`), not
-        // affinity for a worker that cannot work.
-        if sticky_worker_reservation_active(db, sticky, project, task).await?
-            && ctx.workers.iter().any(|w| w.id.to_string() == sticky && diagnostic_claim_capable(w))
-        {
+        // Mirror `claim_task` exactly: another worker is refused when the
+        // sticky reservation predicate holds, with no additional gates.
+        // (Read-only: unlike the claim path, this never clears a stale
+        // reservation.)
+        if sticky_worker_reservation_active(db, sticky, project, task).await? {
             let name: Option<String> = sqlx::query_scalar("SELECT name FROM workers WHERE id=?")
                 .bind(sticky).fetch_optional(db).await.map_err(db_error)?;
             let detail = match name {
@@ -2016,11 +1974,12 @@ async fn queued_waiting_info(
         format!("eligible worker {} has a free slot; waiting for claim poll", free[0].name))))
 }
 
-/// Primary waiting reason for a `review` task, derived from the same
-/// predicates as `claim_review`: active lease, candidate readiness, reviewer
-/// runtime-failure budget (`review_runtime_failures_exhausted`), reviewer
-/// affinity reservation, reviewer role/protocol/scope, Host backend
-/// availability, and reviewer slot capacity. Read-only.
+/// Primary waiting reason for a `review` task, mirroring the exact check
+/// order of `claim_review`: reviewer affinity reservation (same predicate,
+/// nil claimant), candidate readiness, active lease, reviewer
+/// runtime-failure budget (`review_runtime_failures_exhausted`), then the
+/// reviewer pool (role/protocol/scope, Host backend availability, slot
+/// capacity). Read-only.
 #[allow(clippy::too_many_arguments)]
 async fn review_waiting_info(
     db: &SqlitePool,
@@ -2029,39 +1988,11 @@ async fn review_waiting_info(
     project: &Project,
 ) -> Result<Option<WaitingInfo>, ApiError> {
     let review_failure_limit = ctx.review_failure_limit;
-    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
-        .bind(task.id.to_string()).fetch_one(db).await.map_err(db_error)?;
-    if active > 0 {
-        return Ok(Some(waiting("review_lease_active", "a reviewer lease is already active".into())));
-    }
-    let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? AND state='completed' ORDER BY attempt DESC LIMIT 1")
-        .bind(task.id.to_string()).fetch_optional(db).await.map_err(db_error)?;
-    let Some(execution_row) = execution_row else {
-        return Ok(Some(waiting("candidate_not_ready", "no completed implementation candidate to review".into())));
-    };
-    let execution = execution_from_row(&execution_row)?;
-    let has_candidate = execution.result.as_ref().is_some_and(|result|
-        result.review_ref.is_some() && result.commit_sha.is_some());
-    if !has_candidate {
-        return Ok(Some(waiting("candidate_not_ready", "latest implementation has no reviewable candidate".into())));
-    }
-    let failed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
-        .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_one(db).await.map_err(db_error)?;
-    let lost_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
-        .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_one(db).await.map_err(db_error)?;
-    if review_runtime_failures_exhausted(failed_count, lost_count, review_failure_limit) {
-        return Ok(Some(waiting("review_failure_limit", format!(
-            "reviewer runtime failed {} times ({failed_count} failed, {lost_count} lost); automatic reclaim stopped at limit {review_failure_limit}",
-            failed_count + lost_count))));
-    }
-    // Reviewer affinity reservation: the most recent reviewer keeps priority
-    // while live and within the session-affinity window. Reuse the claim
-    // predicate with a nil claimant so the reservation check cannot drift,
-    // and only report it when the preferred reviewer could actually claim
-    // (credential + Pi backend); otherwise the pool analysis below gives
-    // the actionable reason.
-    let reserved = review_reserved_for_live_preferred_reviewer(db, task, project, Uuid::nil()).await?
-        && preferred_reviewer_claim_capable(db, ctx, task).await?;
+    // Reservation first, exactly as `claim_review` refuses a non-preferred
+    // claimant before looking at the candidate, lease, or failure budget.
+    // No additional gates: a live preferred reviewer reserves the task even
+    // when full or backend-unready, and even at the failure limit.
+    let reserved = review_reserved_for_live_preferred_reviewer(db, task, project, Uuid::nil()).await?;
     if reserved {
         let preferred_id: Option<String> = sqlx::query_scalar(
             "SELECT reviewer_worker_id FROM reviews WHERE task_id=? ORDER BY created_at DESC LIMIT 1")
@@ -2076,6 +2007,31 @@ async fn review_waiting_info(
             None => "reserved for previous reviewer by recent review affinity".into(),
         };
         return Ok(Some(waiting("reviewer_reserved", detail)));
+    }
+    let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? AND state='completed' ORDER BY attempt DESC LIMIT 1")
+        .bind(task.id.to_string()).fetch_optional(db).await.map_err(db_error)?;
+    let Some(execution_row) = execution_row else {
+        return Ok(Some(waiting("candidate_not_ready", "no completed implementation candidate to review".into())));
+    };
+    let execution = execution_from_row(&execution_row)?;
+    let has_candidate = execution.result.as_ref().is_some_and(|result|
+        result.review_ref.is_some() && result.commit_sha.is_some());
+    if !has_candidate {
+        return Ok(Some(waiting("candidate_not_ready", "latest implementation has no reviewable candidate".into())));
+    }
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
+        .bind(task.id.to_string()).fetch_one(db).await.map_err(db_error)?;
+    if active > 0 {
+        return Ok(Some(waiting("review_lease_active", "a reviewer lease is already active".into())));
+    }
+    let failed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
+        .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_one(db).await.map_err(db_error)?;
+    let lost_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
+        .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_one(db).await.map_err(db_error)?;
+    if review_runtime_failures_exhausted(failed_count, lost_count, review_failure_limit) {
+        return Ok(Some(waiting("review_failure_limit", format!(
+            "reviewer runtime failed {} times ({failed_count} failed, {lost_count} lost); automatic reclaim stopped at limit {review_failure_limit}",
+            failed_count + lost_count))));
     }
     let workers = &ctx.workers;
     let live: Vec<&Worker> = workers.iter()
@@ -3348,6 +3304,18 @@ mod tests {
             .execute(db).await.unwrap();
     }
 
+    /// Credentialed worker with no Host provider/model selection and an
+    /// empty Pi catalog: live by the server predicates but never
+    /// backend-ready. Used to prove reservation reasons follow the exact
+    /// claim predicate rather than backend readiness.
+    async fn seed_worker_no_backend(db: &SqlitePool, id: &str, name: &str, role: &str, now: &str, cred: &str) {
+        let hash = hash_secret(cred);
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(id).bind(name).bind(role).bind("idle").bind("linux").bind("x86_64")
+            .bind(PROTOCOL_VERSION as i64).bind("test").bind(now).bind(now).bind(r#"["*"]"#).bind(hash)
+            .execute(db).await.unwrap();
+    }
+
     fn worker_headers(cred: &str) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-lazyteam-worker-credential", cred.parse().unwrap());
@@ -3503,12 +3471,19 @@ mod tests {
         let task_id = Uuid::new_v4();
         let worker_id = Uuid::new_v4().to_string();
         let reviewer_id = Uuid::new_v4();
+        // Prior runtime history belongs to a stale-heartbeat reviewer, so no
+        // live preferred reviewer reserves the task and the failure budget
+        // is the reason the claimant is refused.
+        let history_id = Uuid::new_v4().to_string();
         let cred = "reviewer-cred";
         sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
             .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
         seed_backend_ready_worker(&db, &worker_id, "impl", "worker", &now, None).await;
         seed_backend_ready_worker(&db, &reviewer_id.to_string(), "rev", "reviewer", &now, Some(cred)).await;
+        seed_backend_ready_worker(&db, &history_id, "old", "reviewer", &now, Some("old-cred")).await;
+        sqlx::query("UPDATE workers SET last_heartbeat_at=? WHERE id=?")
+            .bind("2000-01-01T00:00:00+00:00").bind(&history_id).execute(&db).await.unwrap();
         sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
             .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
@@ -3519,12 +3494,12 @@ mod tests {
             .execute(&db).await.unwrap();
         for i in 0..2 {
             sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
-                .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(reviewer_id.to_string())
+                .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(&history_id)
                 .bind("failed").bind(&now).bind(&now).bind(format!(r#"{{"error":"boom {i}"}}"#))
                 .execute(&db).await.unwrap();
         }
         sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
-            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(reviewer_id.to_string())
+            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(&history_id)
             .bind("lost").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
         let (reason, detail) = waiting_reason(&db, task_id).await;
@@ -3537,5 +3512,122 @@ mod tests {
         assert_eq!(item.waiting.as_ref().map(|w| w.reason.as_str()), Some("review_failure_limit"));
         let response = claim_review(Path(reviewer_id), State(state), worker_headers(cred)).await.unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn waiting_sticky_beats_backend_unavailable_for_preferred() {
+        // The sticky worker is live by the exact server reservation
+        // predicate but has no Host backend, so the pool alone would say
+        // `backend_unavailable`. `claim_task` still refuses other workers
+        // for the sticky reservation, and diagnostics must agree.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let sticky_id = Uuid::new_v4();
+        let claimant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_worker_no_backend(&db, &sticky_id.to_string(), "sticky", "worker", &now, "sticky-cred").await;
+        seed_backend_ready_worker(&db, &claimant_id.to_string(), "claimant", "worker", &now, Some("claim-cred")).await;
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,sticky_worker_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued")
+            .bind(sticky_id.to_string()).bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_task(Path(claimant_id), State(state), worker_headers("claim-cred")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, _) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "sticky_reserved");
+    }
+
+    #[tokio::test]
+    async fn waiting_reviewer_reservation_beats_full_slots() {
+        // The preferred reviewer is live by the exact reservation predicate
+        // but holds no free slot. `claim_review` refuses other reviewers
+        // for the reservation before capacity is ever considered.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4().to_string();
+        let preferred_id = Uuid::new_v4();
+        let claimant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id, "impl", "worker", &now, None).await;
+        seed_backend_ready_worker(&db, &preferred_id.to_string(), "preferred", "reviewer", &now, Some("pref-cred")).await;
+        seed_backend_ready_worker(&db, &claimant_id.to_string(), "claimant", "reviewer", &now, Some("claim-cred")).await;
+        sqlx::query("UPDATE workers SET running_slots=1,slots=1,state='busy' WHERE id=?")
+            .bind(preferred_id.to_string()).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(task_id.to_string()).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(preferred_id.to_string())
+            .bind("completed").bind(&now).bind(&now).bind(r#"{"verdict":"retry","reason":"fix it","validation":[]}"#)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_review(Path(claimant_id), State(state), worker_headers("claim-cred")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&db).await.unwrap();
+        assert_eq!(task_state, "review");
+        let (reason, _) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "reviewer_reserved");
+    }
+
+    #[tokio::test]
+    async fn waiting_reviewer_reservation_beats_failure_limit() {
+        // Failure budget is exhausted AND a preferred reviewer is live.
+        // `claim_review` checks the reservation first, so another reviewer
+        // is refused for affinity without tripping the failure-limit block;
+        // diagnostics must report the same primary reason.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4().to_string();
+        let preferred_id = Uuid::new_v4();
+        let claimant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id, "impl", "worker", &now, None).await;
+        seed_backend_ready_worker(&db, &preferred_id.to_string(), "preferred", "reviewer", &now, Some("pref-cred")).await;
+        seed_backend_ready_worker(&db, &claimant_id.to_string(), "claimant", "reviewer", &now, Some("claim-cred")).await;
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(task_id.to_string()).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
+            .execute(&db).await.unwrap();
+        for i in 0..2 {
+            sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(preferred_id.to_string())
+                .bind("failed").bind(&now).bind(&now).bind(format!(r#"{{"error":"boom {i}"}}"#))
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(preferred_id.to_string())
+            .bind("lost").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_review(Path(claimant_id), State(state), worker_headers("claim-cred")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&db).await.unwrap();
+        assert_eq!(task_state, "review");
+        let (reason, _) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "reviewer_reserved");
     }
 }
