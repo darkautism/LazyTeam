@@ -219,6 +219,93 @@ async fn prepare_task_repo_inner(
 
     let allowed_ref = format!("refs/heads/lazyteam/task-{}", task_id.simple());
     install_receive_hook(&task_repo, &allowed_ref).await.map_err(internal)?;
+    // Manual retry/re-publish of a failed or blocked task must start with the
+    // last implementation candidate available, otherwise a fresh workspace
+    // sees no tracked delta and fails the no-change guard. Seed best-effort.
+    seed_prior_candidate(state, task_id, &task_repo, &allowed_ref).await;
+    Ok(())
+}
+
+/// Best-effort retry continuity: copy the latest valid implementation
+/// candidate for this task into the fresh execution repository so the next
+/// worker attempt (including a fresh workspace on another worker) starts with
+/// the prior delta available to amend.
+///
+/// Scoped strictly to `completed` executions of the same task whose recorded
+/// review ref matches this task's allowed branch. Reviewer checkouts and
+/// other tasks/projects are never consulted. Any failure falls back to a
+/// fresh base and must not fail the claim.
+async fn seed_prior_candidate(state: &AppState, task_id: Uuid, task_repo: &Path, allowed_ref: &str) {
+    let rows = match sqlx::query("SELECT id,result FROM executions WHERE task_id=? AND state='completed' ORDER BY attempt DESC")
+        .bind(task_id.to_string())
+        .fetch_all(&state.db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%task_id, %error, "skip prior-candidate seeding: execution lookup failed");
+            return;
+        }
+    };
+    for row in rows {
+        let execution_id: String = match row.try_get("id") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let result: Option<String> = row.try_get("result").unwrap_or(None);
+        let Some(result) = result else { continue };
+        let candidate: Option<(String, PathBuf)> = serde_json::from_str::<lazyteam_core::ExecutionResult>(&result)
+            .ok()
+            .and_then(|result| match (result.commit_sha, result.review_ref) {
+                (Some(commit_sha), Some(review_ref)) => {
+                    let commit_sha = commit_sha.trim().to_string();
+                    if commit_sha.is_empty() || format!("refs/heads/{review_ref}") != allowed_ref {
+                        return None;
+                    }
+                    let prior_repo = match Uuid::parse_str(&execution_id) {
+                        Ok(id) => task_repo_path(state, id),
+                        Err(_) => return None,
+                    };
+                    if prior_repo == *task_repo {
+                        return None;
+                    }
+                    Some((commit_sha, prior_repo))
+                }
+                _ => None,
+            });
+        let Some((commit_sha, prior_repo)) = candidate else { continue };
+        if !prior_repo.exists() {
+            continue;
+        }
+        if seed_candidate_ref(&prior_repo, task_repo, allowed_ref, &commit_sha).await.is_ok() {
+            return;
+        }
+    }
+}
+
+async fn seed_candidate_ref(prior_repo: &Path, task_repo: &Path, allowed_ref: &str, commit_sha: &str) -> Result<(), ApiError> {
+    let actual = git_output(
+        &HostGitAuth::none(),
+        Command::new("git").arg("-C").arg(prior_repo).args(["rev-parse", "--verify", allowed_ref]),
+    )
+    .await?;
+    if actual.trim() != commit_sha {
+        return Err((StatusCode::CONFLICT, format!("prior candidate ref moved: expected {commit_sha}")));
+    }
+    let refspec = format!("{allowed_ref}:{allowed_ref}");
+    git_ok(
+        &HostGitAuth::none(),
+        Command::new("git").arg("-C").arg(task_repo).args(["fetch", "--no-tags", &prior_repo.to_string_lossy(), &refspec]),
+    )
+    .await?;
+    let seeded = git_output(
+        &HostGitAuth::none(),
+        Command::new("git").arg("-C").arg(task_repo).args(["rev-parse", "--verify", allowed_ref]),
+    )
+    .await?;
+    if seeded.trim() != commit_sha {
+        return Err((StatusCode::CONFLICT, "prior candidate seed verification failed".into()));
+    }
     Ok(())
 }
 
@@ -969,6 +1056,178 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retry continuity: a task with an earlier completed candidate whose
+    /// later attempt failed, manually republished via `retry_task`, must
+    /// seed the fresh execution repository with the prior candidate so the
+    /// next worker attempt starts with that delta available to amend.
+    /// A task with no prior candidate still starts fresh, and candidates
+    /// never leak across tasks.
+    #[tokio::test]
+    async fn manual_retry_seeds_prior_candidate_into_fresh_execution_repo() {
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let root = std::env::temp_dir().join(format!("lazyteam-retry-seed-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let no_auth = HostGitAuth::none();
+        let run = |repo: &Path, args: &[&str]| {
+            let repo = repo.to_path_buf();
+            let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+            async move {
+                git_ok(&HostGitAuth::none(), Command::new("git").arg("-C").arg(&repo).args(&args)).await
+            }
+        };
+
+        // Upstream with a single commit on `main`.
+        let upstream = root.join("upstream.git");
+        git_ok(&no_auth, Command::new("git").args(["init", "--bare"]).arg(&upstream)).await.unwrap();
+        let seed_work = root.join("seed-work");
+        git_ok(&no_auth, Command::new("git").args(["init"]).arg(&seed_work)).await.unwrap();
+        run(&seed_work, &["config", "user.name", "LazyTeam Test"]).await.unwrap();
+        run(&seed_work, &["config", "user.email", "test@lazyteam.local"]).await.unwrap();
+        tokio::fs::write(seed_work.join("base.txt"), "base\n").await.unwrap();
+        run(&seed_work, &["add", "base.txt"]).await.unwrap();
+        run(&seed_work, &["commit", "-m", "base"]).await.unwrap();
+        run(&seed_work, &["branch", "-M", "main"]).await.unwrap();
+        let upstream_url = upstream.to_string_lossy().to_string();
+        run(&seed_work, &["push", &upstream_url, "refs/heads/main:refs/heads/main"]).await.unwrap();
+        let base_sha = git_output(
+            &no_auth,
+            Command::new("git").arg("-C").arg(&upstream).args(["rev-parse", "refs/heads/main"]),
+        ).await.unwrap();
+
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let git_root = root.join("git");
+        let state = Arc::new(crate::AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: git_root.clone(),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+        });
+        let now = chrono::Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(project_id.to_string()).bind("seed-proj").bind("Seed").bind(&upstream_url).bind("main").bind(&now).bind(&now)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .bind(worker_id.to_string()).bind("worker").bind("worker").bind("idle").bind("linux").bind("x86_64")
+            .bind(crate::api::PROTOCOL_VERSION as i64).bind("test").bind(&now).bind(&now)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,review_feedback,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(project_id.to_string()).bind("seeded task").bind("").bind("").bind("failed")
+            .bind("").bind(&now).bind(&now)
+            .execute(&state.db).await.unwrap();
+        let project = Project {
+            id: project_id,
+            slug: "seed-proj".into(),
+            name: "Seed".into(),
+            repo_url: upstream_url.clone(),
+            default_branch: "main".into(),
+            contributor: Default::default(),
+            required_worker_tags: Default::default(),
+            default_task_tags: Default::default(),
+            git_auth: Default::default(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let branch = format!("lazyteam/task-{}", task_id.simple());
+        let allowed_ref = format!("refs/heads/{branch}");
+
+        // Attempt 1: completed with a real candidate pushed to its task repo.
+        let exec1 = Uuid::new_v4();
+        prepare_task_repo(&state, &project, task_id, exec1, &GitCredential::Host).await.unwrap();
+        let old_repo = git_root.join("tasks").join(format!("{exec1}.git"));
+        let candidate_work = root.join("candidate-work");
+        git_ok(
+            &no_auth,
+            Command::new("git").args(["clone", &old_repo.to_string_lossy(), &candidate_work.to_string_lossy()]),
+        ).await.unwrap();
+        run(&candidate_work, &["config", "user.name", "LazyTeam Test"]).await.unwrap();
+        run(&candidate_work, &["config", "user.email", "test@lazyteam.local"]).await.unwrap();
+        run(&candidate_work, &["checkout", "-b", &branch]).await.unwrap();
+        tokio::fs::write(candidate_work.join("fix.txt"), "prior candidate\n").await.unwrap();
+        run(&candidate_work, &["add", "fix.txt"]).await.unwrap();
+        run(&candidate_work, &["commit", "-m", "lazyteam: seeded task"]).await.unwrap();
+        run(&candidate_work, &["push", "origin", &format!("HEAD:{allowed_ref}")]).await.unwrap();
+        let candidate_sha = git_output(
+            &no_auth,
+            Command::new("git").arg("-C").arg(&candidate_work).args(["rev-parse", "HEAD"]),
+        ).await.unwrap();
+        let result = lazyteam_core::ExecutionResult {
+            status: "completed".into(),
+            summary: "prior candidate".into(),
+            commit_sha: Some(candidate_sha.trim().to_string()),
+            base_sha: Some(base_sha.trim().to_string()),
+            patch: None,
+            patch_truncated: false,
+            workspace_clean: Some(true),
+            review_ref: Some(branch.clone()),
+            changed_files: vec!["fix.txt".into()],
+            validation: vec![],
+            warnings: vec![],
+            artifacts: vec![],
+        };
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(exec1.to_string()).bind(task_id.to_string()).bind(worker_id.to_string()).bind(1_i64)
+            .bind("completed").bind(&now).bind(&now).bind(serde_json::to_string(&result).unwrap())
+            .execute(&state.db).await.unwrap();
+        // Attempt 2: later failure with no candidate; task is failed.
+        let exec2 = Uuid::new_v4();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(exec2.to_string()).bind(task_id.to_string()).bind(worker_id.to_string()).bind(2_i64)
+            .bind("failed").bind(&now).bind(&now)
+            .execute(&state.db).await.unwrap();
+
+        // Manual re-publish asks to amend the prior candidate.
+        let transition = crate::review::retry_task(&state, task_id, Some("manual retry: amend prior candidate")).await.unwrap();
+        assert_eq!(transition.state, "queued");
+
+        // The next attempt's fresh execution repository must carry the
+        // prior candidate delta.
+        let exec3 = Uuid::new_v4();
+        prepare_task_repo(&state, &project, task_id, exec3, &GitCredential::Host).await.unwrap();
+        let new_repo = git_root.join("tasks").join(format!("{exec3}.git"));
+        let seeded = git_output(
+            &no_auth,
+            Command::new("git").arg("-C").arg(&new_repo).args(["rev-parse", "--verify", &allowed_ref]),
+        ).await.unwrap();
+        assert_eq!(seeded.trim(), candidate_sha.trim());
+        let content = git_output(
+            &no_auth,
+            Command::new("git").arg("-C").arg(&new_repo).args(["show", &format!("{}:fix.txt", candidate_sha.trim())]),
+        ).await.unwrap();
+        assert_eq!(content.trim(), "prior candidate");
+        // The default branch still tracks current upstream main.
+        let new_base = git_output(
+            &no_auth,
+            Command::new("git").arg("-C").arg(&new_repo).args(["rev-parse", "--verify", "refs/heads/main"]),
+        ).await.unwrap();
+        assert_eq!(new_base.trim(), base_sha.trim());
+
+        // No cross-task leak and no phantom candidate for a fresh task.
+        let other_task = Uuid::new_v4();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,review_feedback,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(other_task.to_string()).bind(project_id.to_string()).bind("fresh task").bind("").bind("").bind("queued")
+            .bind("").bind(&now).bind(&now)
+            .execute(&state.db).await.unwrap();
+        let other_exec = Uuid::new_v4();
+        prepare_task_repo(&state, &project, other_task, other_exec, &GitCredential::Host).await.unwrap();
+        let other_repo = git_root.join("tasks").join(format!("{other_exec}.git"));
+        let other_ref = format!("refs/heads/lazyteam/task-{}", other_task.simple());
+        let missing = git_run(
+            &HostGitAuth::none(),
+            Command::new("git").arg("-C").arg(&other_repo).args(["rev-parse", "--verify", &other_ref]),
+        ).await.unwrap();
+        assert!(!missing.status.success(), "fresh task must not inherit another task's candidate");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
 
     #[tokio::test]
     async fn dry_run_write_probe_does_not_mutate_upstream_ref() {

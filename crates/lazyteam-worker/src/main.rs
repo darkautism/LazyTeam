@@ -1241,6 +1241,7 @@ fn task_branch(assignment: &Assignment) -> String {
 
 async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<String> {
     let branch = task_branch(assignment);
+    let branch_ref = format!("refs/heads/{branch}");
     if path.exists() {
         let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]).await?;
         if inside != "true" { bail!("existing task workspace is not a git repository"); }
@@ -1250,23 +1251,14 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
         command_ok_with_auth(path, "git", &["fetch", "origin", &default_ref], git_auth).await?;
         let base = git_output(path, &["rev-parse", "FETCH_HEAD"]).await?;
         command_ok(path, "git", &["update-ref", &default_ref, &base]).await?;
-        command_ok(path, "git", &["checkout", &branch]).await?;
-        let already_based = trusted_git_command().args(["merge-base", "--is-ancestor", &base, "HEAD"]).current_dir(path).status().await?;
-        if !already_based.success() {
-            let merge = trusted_git_command()
-                .args(["-c", &format!("user.name={}", assignment.project.contributor.name)])
-                .args(["-c", &format!("user.email={}", assignment.project.contributor.email)])
-                .args(["merge", "--no-edit", &base])
-                .current_dir(path)
-                .output().await?;
-            if !merge.status.success() {
-                let conflicts = git_output(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
-                if conflicts.trim().is_empty() {
-                    bail!("merge current base into task branch failed: {}", String::from_utf8_lossy(&merge.stderr));
-                }
-                warn!(%conflicts, "task retry opened with merge conflicts for the agent to resolve");
-            }
-        }
+        // A fresh execution broker repository carries the latest prior
+        // candidate for this task when one exists. Fetch it best-effort so a
+        // reused workspace that lost the local branch (or never saw the
+        // candidate) still starts with the prior delta available.
+        fetch_seeded_candidate(path, &branch_ref, git_auth).await;
+        checkout_task_branch(path, &branch).await?;
+        merge_ref_into_head(path, assignment, SEEDED_CANDIDATE_REF).await?;
+        merge_ref_into_head(path, assignment, &base).await?;
         return Ok(base);
     }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
@@ -1278,8 +1270,89 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
     ).await?;
     let base = git_output(path, &["rev-parse", "HEAD"]).await?;
     install_workspace_excludes(path).await?;
-    command_ok(path, "git", &["checkout", "-b", &branch]).await?;
+    // A manually retried task seeds its prior candidate into the fresh
+    // execution repository. Check it out when present so the next attempt
+    // starts with the candidate delta available; a genuinely fresh task has
+    // no such ref and still starts from the current base.
+    fetch_seeded_candidate(path, &branch_ref, git_auth).await;
+    if seeded_candidate_present(path).await {
+        command_ok(path, "git", &["checkout", "-b", &branch, SEEDED_CANDIDATE_REF]).await?;
+        merge_ref_into_head(path, assignment, &base).await?;
+    } else {
+        command_ok(path, "git", &["checkout", "-b", &branch]).await?;
+    }
     Ok(base)
+}
+
+/// Stable local ref holding a prior candidate fetched from the current
+/// execution broker repository. Only ever sourced from `origin` (this
+/// execution's task repository, which the server seeds solely from completed
+/// executions of the same task); reviewer checkouts are never fetched here.
+const SEEDED_CANDIDATE_REF: &str = "refs/lazyteam/seeded-candidate";
+
+/// Best-effort fetch of the task branch seeded by the server into the fresh
+/// execution repository. Missing ref (genuinely fresh task) is normal and
+/// left for the caller to detect via [`seeded_candidate_present`].
+async fn fetch_seeded_candidate(path: &Path, branch_ref: &str, git_auth: &GitAuthContext) {
+    let _ = trusted_git_command()
+        .args(["update-ref", "-d", SEEDED_CANDIDATE_REF])
+        .current_dir(path)
+        .output()
+        .await;
+    let mut command = trusted_git_command();
+    command.args(["fetch", "origin", &format!("{branch_ref}:{SEEDED_CANDIDATE_REF}")]).current_dir(path);
+    git_auth.apply(&mut command);
+    let _ = command.output().await;
+}
+
+async fn seeded_candidate_present(path: &Path) -> bool {
+    trusted_git_command()
+        .args(["rev-parse", "--verify", SEEDED_CANDIDATE_REF])
+        .current_dir(path)
+        .output()
+        .await
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Check out the task branch, falling back to the seeded prior candidate (or
+/// a fresh branch from the current HEAD) when the local branch is missing.
+async fn checkout_task_branch(path: &Path, branch: &str) -> anyhow::Result<()> {
+    if trusted_git_command().args(["checkout", branch]).current_dir(path).status().await?.success() {
+        return Ok(());
+    }
+    if seeded_candidate_present(path).await {
+        command_ok(path, "git", &["checkout", "-b", branch, SEEDED_CANDIDATE_REF]).await
+    } else {
+        command_ok(path, "git", &["checkout", "-b", branch]).await
+    }
+}
+
+/// Merge `revision` (a base SHA or the seeded candidate ref) into the task
+/// branch using the existing task-branch rules: fast-forward/no-op when
+/// already contained, real merge otherwise, and merge conflicts left in the
+/// worktree for the agent to resolve instead of silently dropping changes.
+async fn merge_ref_into_head(path: &Path, assignment: &Assignment, revision: &str) -> anyhow::Result<()> {
+    if revision == SEEDED_CANDIDATE_REF && !seeded_candidate_present(path).await {
+        return Ok(());
+    }
+    let already_based = trusted_git_command().args(["merge-base", "--is-ancestor", revision, "HEAD"]).current_dir(path).status().await?;
+    if !already_based.success() {
+        let merge = trusted_git_command()
+            .args(["-c", &format!("user.name={}", assignment.project.contributor.name)])
+            .args(["-c", &format!("user.email={}", assignment.project.contributor.email)])
+            .args(["merge", "--no-edit", revision])
+            .current_dir(path)
+            .output().await?;
+        if !merge.status.success() {
+            let conflicts = git_output(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+            if conflicts.trim().is_empty() {
+                bail!("merge {} into task branch failed: {}", revision, String::from_utf8_lossy(&merge.stderr));
+            }
+            warn!(%conflicts, "task retry opened with merge conflicts for the agent to resolve");
+        }
+    }
+    Ok(())
 }
 
 async fn install_workspace_excludes(path: &Path) -> anyhow::Result<()> {
@@ -1727,6 +1800,156 @@ mod tests {
         auto_commit(&root, &assignment).await.unwrap();
         let author = git_output(&root, &["log", "-1", "--format=%an <%ae>"]).await.unwrap();
         assert_eq!(author, "Project Contributor <project@example.test>");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    fn workspace_test_assignment(repo_url: &str, task_id: Uuid, project_id: Uuid, attempt: u32) -> Assignment {
+        serde_json::from_value(json!({
+            "project": {
+                "id": project_id,
+                "slug": "test-project",
+                "name": "Test Project",
+                "repo_url": repo_url,
+                "default_branch": "main",
+                "contributor": {"name": "Project Contributor", "email": "project@example.test"},
+                "required_worker_tags": {},
+                "default_task_tags": {},
+                "git_auth": {"mode": "host", "credential_configured": false},
+                "enabled": true,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            },
+            "task": {
+                "id": task_id,
+                "project_id": project_id,
+                "title": "Amend prior candidate",
+                "description": "",
+                "expected_outcome": "",
+                "acceptance_criteria": [],
+                "required_tags": {},
+                "preferred_tags": {},
+                "dependencies": [],
+                "review_feedback": "manual retry: amend prior candidate",
+                "priority": 0,
+                "state": "running",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            },
+            "execution": {
+                "id": Uuid::new_v4(),
+                "task_id": task_id,
+                "worker_id": Uuid::new_v4(),
+                "attempt": attempt,
+                "state": "assigned",
+                "lease_until": "2026-01-01T00:02:00Z",
+                "started_at": null,
+                "finished_at": null,
+                "result": null
+            },
+            "lease_capability": "test-lease-capability"
+        })).unwrap()
+    }
+
+    async fn git_commit_file(workdir: &Path, name: &str, content: &str, message: &str) {
+        tokio::fs::write(workdir.join(name), content).await.unwrap();
+        command_ok(workdir, "git", &["add", name]).await.unwrap();
+        command_ok(workdir, "git", &["commit", "-m", message]).await.unwrap();
+    }
+
+    async fn init_broker_with_base(root: &Path) -> (PathBuf, PathBuf, String) {
+        let broker = root.join("broker.git");
+        command_ok(root, "git", &["init", "--bare", broker.to_str().unwrap()]).await.unwrap();
+        let work = root.join("seed");
+        command_ok(root, "git", &["clone", broker.to_str().unwrap(), work.to_str().unwrap()]).await.unwrap();
+        command_ok(&work, "git", &["config", "user.name", "LazyTeam Test"]).await.unwrap();
+        command_ok(&work, "git", &["config", "user.email", "lazyteam-test@local"]).await.unwrap();
+        git_commit_file(&work, "base.txt", "base\n", "base").await;
+        command_ok(&work, "git", &["branch", "-M", "main"]).await.unwrap();
+        command_ok(&work, "git", &["push", "origin", "refs/heads/main:refs/heads/main"]).await.unwrap();
+        let base = git_output(&work, &["rev-parse", "HEAD"]).await.unwrap();
+        (broker, work, base)
+    }
+
+    /// Manual retry into a fresh workspace must start with the seeded prior
+    /// candidate checked out, merged with the current base when main
+    /// advanced. Pre-fix this started from a bare base with no candidate
+    /// delta, so an agent that (correctly) made no new change hit
+    /// `agent completed without producing any tracked change`.
+    #[tokio::test]
+    async fn prepare_workspace_restores_seeded_candidate_and_merges_advanced_base() {
+        let root = std::env::temp_dir().join(format!("lazyteam-ws-seed-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let (broker, work, _) = init_broker_with_base(&root).await;
+        let task_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let branch = format!("lazyteam/task-{}", task_id.simple());
+        // Server-seeded prior candidate on the execution broker repository.
+        command_ok(&work, "git", &["checkout", "-b", &branch]).await.unwrap();
+        git_commit_file(&work, "fix.txt", "prior candidate\n", "lazyteam: amend prior candidate").await;
+        command_ok(&work, "git", &["push", "origin", &format!("HEAD:refs/heads/{branch}")]).await.unwrap();
+        // Main advances after the candidate was produced.
+        command_ok(&work, "git", &["checkout", "main"]).await.unwrap();
+        git_commit_file(&work, "base2.txt", "advanced\n", "upstream advance").await;
+        command_ok(&work, "git", &["push", "origin", "refs/heads/main:refs/heads/main"]).await.unwrap();
+        let new_base = git_output(&work, &["rev-parse", "refs/heads/main"]).await.unwrap();
+
+        let workspace = root.join("workspace");
+        let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 3);
+        let auth = GitAuthContext::broker("worker-secret", "lease-secret");
+        let base = prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        assert_eq!(base, new_base);
+        assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
+        assert_eq!(tokio::fs::read_to_string(workspace.join("base2.txt")).await.unwrap(), "advanced\n");
+        assert_eq!(git_output(&workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap(), branch);
+        assert!(trusted_git_command().args(["merge-base", "--is-ancestor", &base, "HEAD"]).current_dir(&workspace).status().await.unwrap().success());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A reused workspace whose local branch lost the candidate (stale local
+    /// state on another worker) must still pick up the seeded prior
+    /// candidate from the fresh execution repository.
+    #[tokio::test]
+    async fn prepare_workspace_reused_stale_workspace_picks_up_seeded_candidate() {
+        let root = std::env::temp_dir().join(format!("lazyteam-ws-stale-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let (broker, work, _) = init_broker_with_base(&root).await;
+        let task_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let branch = format!("lazyteam/task-{}", task_id.simple());
+        // Stale local workspace: task branch exists but has no candidate.
+        let workspace = root.join("workspace");
+        command_ok(root.as_path(), "git", &["clone", "--branch", "main", "--single-branch", broker.to_str().unwrap(), workspace.to_str().unwrap()]).await.unwrap();
+        command_ok(&workspace, "git", &["checkout", "-b", &branch]).await.unwrap();
+        // Server-seeded prior candidate appears on the fresh broker repo.
+        command_ok(&work, "git", &["checkout", "-b", &branch]).await.unwrap();
+        git_commit_file(&work, "fix.txt", "prior candidate\n", "lazyteam: amend prior candidate").await;
+        command_ok(&work, "git", &["push", "origin", &format!("HEAD:refs/heads/{branch}")]).await.unwrap();
+
+        let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 3);
+        let auth = GitAuthContext::broker("worker-secret", "lease-secret");
+        prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A genuinely fresh task (no seeded candidate) still starts from the
+    /// current base with HEAD == base, so the existing no-tracked-change
+    /// guard keeps applying when the agent produces nothing.
+    #[tokio::test]
+    async fn prepare_workspace_fresh_task_starts_from_base_without_candidate() {
+        let root = std::env::temp_dir().join(format!("lazyteam-ws-fresh-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let (broker, _, base) = init_broker_with_base(&root).await;
+        let task_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let workspace = root.join("workspace");
+        let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 1);
+        let auth = GitAuthContext::broker("worker-secret", "lease-secret");
+        let returned_base = prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        assert_eq!(returned_base, base);
+        let head = git_output(&workspace, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, base, "fresh task must start with no tracked delta so the no-change guard still applies");
+        assert!(!seeded_candidate_present(&workspace).await);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
