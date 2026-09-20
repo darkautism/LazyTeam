@@ -176,17 +176,23 @@ pub(crate) async fn retry_task(state: &AppState, id: Uuid, reason: Option<&str>)
     if review_retry && reason.is_none() {
         return Err((StatusCode::BAD_REQUEST, "review retry requires a reason for the next worker attempt".into()));
     }
-    // Keep the latest implementation owner for every retry state. The scheduler
-    // may release that ownership later if the worker is gone or the affinity TTL
-    // expires, but a manual retry should not discard a reusable backend session.
+    // A manual publish/re-publish/retry always starts a fresh review cycle:
+    // bump the durable tasks.review_cycle epoch so the per-cycle retry
+    // counter resets to zero while lifetime history stays intact. Automatic
+    // reviewer retry redispatch (finish_review) never touches this column and
+    // remains in the same cycle. Historical review rows keep their original
+    // review_cycle values and are never deleted to fake a reset. The latest
+    // implementation owner is kept for every retry state (the scheduler may
+    // release that ownership later); a manual retry never discards a reusable
+    // backend session.
     let sticky_worker_id: Option<String> = sqlx::query_scalar("SELECT worker_id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
         .bind(id.to_string()).fetch_optional(&state.db).await.map_err(internal)?;
     let changed = if let Some(reason) = reason {
-        sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
+        sqlx::query("UPDATE tasks SET state='queued',review_cycle=review_cycle+1,review_feedback=?,sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
             .bind(reason).bind(sticky_worker_id).bind(Utc::now().to_rfc3339()).bind(id.to_string()).bind(&current)
             .execute(&state.db).await.map_err(internal)?.rows_affected()
     } else {
-        sqlx::query("UPDATE tasks SET state='queued',sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
+        sqlx::query("UPDATE tasks SET state='queued',review_cycle=review_cycle+1,sticky_worker_id=COALESCE(?,sticky_worker_id),updated_at=? WHERE id=? AND state=?")
             .bind(sticky_worker_id).bind(Utc::now().to_rfc3339()).bind(id.to_string()).bind(&current)
             .execute(&state.db).await.map_err(internal)?.rows_affected()
     };

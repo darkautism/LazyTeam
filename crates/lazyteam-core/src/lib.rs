@@ -270,6 +270,11 @@ pub struct Task {
     pub review_feedback: String,
     pub priority: i32,
     pub state: TaskState,
+    /// Durable review-cycle/epoch counter. Bumped only by a manual
+    /// re-publish/retry (including merge-gate rejection); automatic
+    /// reviewer retry redispatch stays in the same cycle.
+    #[serde(default)]
+    pub review_cycle: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -486,6 +491,7 @@ mod tests {
             review_feedback: String::new(),
             priority: 0,
             state: TaskState::Queued,
+            review_cycle: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -549,6 +555,7 @@ mod tests {
             review_feedback: String::new(),
             priority: 0,
             state: TaskState::Queued,
+            review_cycle: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
