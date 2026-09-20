@@ -28,6 +28,7 @@ pub(crate) const PROTOCOL_VERSION: u32 = 6;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
 const DEFAULT_SESSION_AFFINITY_SECONDS: i64 = 15 * 60;
 const REVIEW_FAILURE_LIMIT: i64 = 3;
+const REVIEW_RETRY_LIMIT: i64 = 3;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 
 pub(crate) type ApiError = (StatusCode, String);
@@ -1245,8 +1246,20 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
             ReviewVerdictKind::Retry => {
                 let implementation_worker_id: String = sqlx::query_scalar("SELECT worker_id FROM executions WHERE id=?")
                     .bind(&execution_id).fetch_one(&mut *tx).await.map_err(db_error)?;
-                sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
-                    .bind(reason).bind(implementation_worker_id).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+                let reviewer_retries: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM reviews WHERE task_id=? AND state='completed' AND (verdict LIKE '%\"verdict\":\"retry\"%' OR verdict LIKE '%\"verdict\": \"retry\"%')"
+                )
+                    .bind(&task_id).fetch_one(&mut *tx).await.map_err(db_error)?;
+                if review_retries_exhausted(reviewer_retries) {
+                    let feedback = format!(
+                        "Reviewer requested implementation changes {reviewer_retries} times; automatic redispatch stopped at loop limit {REVIEW_RETRY_LIMIT}. Last feedback: {reason}"
+                    );
+                    sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
+                        .bind(feedback).bind(implementation_worker_id).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+                } else {
+                    sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
+                        .bind(reason).bind(implementation_worker_id).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+                }
             }
         }
     }
@@ -1759,6 +1772,10 @@ fn review_failures_exhausted(failed_reviews: i64) -> bool {
     failed_reviews >= REVIEW_FAILURE_LIMIT
 }
 
+fn review_retries_exhausted(reviewer_retries: i64) -> bool {
+    reviewer_retries >= REVIEW_RETRY_LIMIT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1769,6 +1786,13 @@ mod tests {
         assert!(!review_failures_exhausted(REVIEW_FAILURE_LIMIT - 1));
         assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT));
         assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT + 1));
+    }
+
+    #[test]
+    fn reviewer_quality_retries_are_bounded() {
+        assert!(!review_retries_exhausted(REVIEW_RETRY_LIMIT - 1));
+        assert!(review_retries_exhausted(REVIEW_RETRY_LIMIT));
+        assert!(review_retries_exhausted(REVIEW_RETRY_LIMIT + 1));
     }
 
     #[test]
