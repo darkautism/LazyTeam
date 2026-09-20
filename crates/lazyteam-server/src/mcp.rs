@@ -79,6 +79,56 @@ pub struct TaskRetryParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewReadParams {
+    pub task_id: String,
+    pub path: String,
+    #[serde(default = "default_review_revision")]
+    pub revision: String,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_review_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewSearchParams {
+    pub task_id: String,
+    pub query: String,
+    #[serde(default = "default_review_revision")]
+    pub revision: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_review_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewDiffParams {
+    pub task_id: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_review_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewDecideParams {
+    pub task_id: String,
+    pub candidate_sha: String,
+    pub verdict: String,
+    pub reason: String,
+    #[serde(default)]
+    pub validation: Vec<String>,
+}
+
+fn default_review_revision() -> String { "candidate".into() }
+fn default_review_limit() -> usize { 200 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WorkerIdParams {
     pub worker_id: String,
 }
@@ -220,6 +270,70 @@ impl LazyTeamMcp {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         json_result(&evidence)
+    }
+
+    #[tool(
+        name = "reviews_read",
+        title = "Read pinned review file",
+        description = "Read a UTF-8 text file from the complete pinned candidate or base repository snapshot for a task. Paths are repository-relative; arbitrary repositories, branches, SHAs, .git internals, and writes are not allowed. Results are line-paged.",
+        annotations(title = "Read pinned review file", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn reviews_read(&self, Parameters(input): Parameters<ReviewReadParams>) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        let page = crate::git_broker::review_read(&self.state, &evidence, &input.revision, &input.path, input.offset, input.limit)
+            .await.map_err(api_to_mcp)?;
+        json_result(&page)
+    }
+
+    #[tool(
+        name = "reviews_search",
+        title = "Search pinned review repository",
+        description = "Literal-search the complete pinned candidate or base repository snapshot for a task, optionally restricted to repository-relative paths. No shell, arbitrary revision, or external repository access. Results are line-paged.",
+        annotations(title = "Search pinned review repository", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn reviews_search(&self, Parameters(input): Parameters<ReviewSearchParams>) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        let page = crate::git_broker::review_search(&self.state, &evidence, &input.revision, &input.query, &input.paths, input.offset, input.limit)
+            .await.map_err(api_to_mcp)?;
+        json_result(&page)
+    }
+
+    #[tool(
+        name = "reviews_diff",
+        title = "Diff pinned review candidate",
+        description = "Read the pinned base-to-candidate diff for a task, optionally restricted to one repository-relative path. Unlike reviews_get patch evidence this view is generated from the Host task repository and is line-paged rather than capped to the worker patch payload.",
+        annotations(title = "Diff pinned review candidate", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn reviews_diff(&self, Parameters(input): Parameters<ReviewDiffParams>) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        let page = crate::git_broker::review_diff(&self.state, &evidence, input.path.as_deref(), input.offset, input.limit)
+            .await.map_err(api_to_mcp)?;
+        json_result(&page)
+    }
+
+    #[tool(
+        name = "reviews_decide",
+        title = "Decide pinned review candidate",
+        description = "Record a main-agent approve or retry decision for the exact pinned candidate SHA while the task is in review and no reviewer-worker lease is active. Approve moves to merge_pending; retry returns the same task to implementation with the reason. This never merges or writes repository content.",
+        annotations(title = "Decide pinned review candidate", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn reviews_decide(&self, Parameters(input): Parameters<ReviewDecideParams>) -> Result<CallToolResult, McpError> {
+        let task_id = parse_task_id(&input.task_id)?;
+        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        crate::git_broker::verify_review_snapshot(&self.state, &evidence, &input.candidate_sha).await.map_err(api_to_mcp)?;
+        let transition = review::decide_task(&self.state, task_id, &input.candidate_sha, input.verdict.trim(), &input.reason)
+            .await.map_err(api_to_mcp)?;
+        json_result(&serde_json::json!({
+            "task_id": transition.task_id,
+            "state": transition.state,
+            "candidate_sha": input.candidate_sha,
+            "verdict": input.verdict,
+            "reason": input.reason,
+            "validation": input.validation,
+        }))
     }
 
     #[tool(
@@ -379,7 +493,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. Only a completed independent reviewer-worker approve verdict moves a review task to merge_pending. For a merge_pending task, inspect the candidate with reviews_get, then call tasks_merge when the candidate is acceptable: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. When the merge_pending candidate is stale or unsafe, do not merge; call tasks_retry with a concrete reason to send it back through implementation + independent review instead of attempting an unsafe merge or inventing another recovery path. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review and merge-gate (merge_pending) retries require a concise reason and stay pinned to the implementation worker workspace/session when applicable.".to_string(),
+                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. A completed reviewer-worker approve verdict or an exact-candidate main-agent reviews_decide approve may move a review task to merge_pending. Main-agent review can inspect the complete pinned repository with reviews_read, reviews_search, and reviews_diff without shell access. For a merge_pending task, inspect the candidate with reviews_get, then call tasks_merge when the candidate is acceptable: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. When the merge_pending candidate is stale or unsafe, do not merge; call tasks_retry with a concrete reason to send it back through implementation + independent review instead of attempting an unsafe merge or inventing another recovery path. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review and merge-gate (merge_pending) retries require a concise reason and stay pinned to the implementation worker workspace/session when applicable.".to_string(),
             )
     }
 }

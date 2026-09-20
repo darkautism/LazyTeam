@@ -9,6 +9,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use lazyteam_core::{GitCredential, Project};
+use serde::Serialize;
 use sqlx::Row;
 use tokio::{io::AsyncWriteExt, process::Command};
 use uuid::Uuid;
@@ -218,6 +219,178 @@ async fn prepare_task_repo_inner(
     let allowed_ref = format!("refs/heads/lazyteam/task-{}", task_id.simple());
     install_receive_hook(&task_repo, &allowed_ref).await.map_err(internal)?;
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReviewTextPage {
+    pub(crate) revision: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+    pub(crate) total_lines: usize,
+    pub(crate) content: String,
+    pub(crate) next_offset: Option<usize>,
+}
+
+const MAX_REVIEW_PAGE_LINES: usize = 400;
+
+fn review_page(text: &str, revision: Option<&str>, path: Option<&str>, offset: usize, limit: usize) -> ReviewTextPage {
+    let lines: Vec<&str> = text.lines().collect();
+    let total_lines = lines.len();
+    let limit = limit.clamp(1, MAX_REVIEW_PAGE_LINES);
+    let start = offset.min(total_lines);
+    let end = start.saturating_add(limit).min(total_lines);
+    ReviewTextPage {
+        revision: revision.map(str::to_string),
+        path: path.map(str::to_string),
+        offset: start,
+        limit,
+        total_lines,
+        content: lines[start..end].join("\n"),
+        next_offset: (end < total_lines).then_some(end),
+    }
+}
+
+fn validate_review_path(raw: &str) -> Result<String, ApiError> {
+    use std::path::Component;
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 4096 {
+        return Err((StatusCode::BAD_REQUEST, "review path must be a non-empty repository-relative path".into()));
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Err((StatusCode::BAD_REQUEST, "review path must be repository-relative".into()));
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                if part == ".git" {
+                    return Err((StatusCode::BAD_REQUEST, ".git internals are not readable through review tools".into()));
+                }
+                parts.push(part.to_string_lossy().into_owned());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err((StatusCode::BAD_REQUEST, "review path may not escape the repository".into()));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "review path must name a file or directory".into()));
+    }
+    Ok(parts.join("/"))
+}
+
+async fn verified_review_repo(
+    state: &AppState,
+    evidence: &api::ReviewEvidence,
+) -> Result<(PathBuf, String, String), ApiError> {
+    let candidate_sha = evidence.checkout.commit_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate commit".into()))?;
+    let base_sha = evidence.checkout.base_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no pinned base commit".into()))?;
+    let review_ref = evidence.checkout.review_ref.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate ref".into()))?;
+    let task_repo = task_repo_path(state, evidence.execution.id);
+    verify_reviewed_candidate(&task_repo, review_ref, candidate_sha, base_sha).await?;
+    Ok((task_repo, candidate_sha.to_string(), base_sha.to_string()))
+}
+
+fn review_revision<'a>(revision: &str, candidate_sha: &'a str, base_sha: &'a str) -> Result<&'a str, ApiError> {
+    match revision {
+        "candidate" => Ok(candidate_sha),
+        "base" => Ok(base_sha),
+        _ => Err((StatusCode::BAD_REQUEST, "revision must be candidate or base".into())),
+    }
+}
+
+pub(crate) async fn verify_review_snapshot(
+    state: &AppState,
+    evidence: &api::ReviewEvidence,
+    candidate_sha: &str,
+) -> Result<(), ApiError> {
+    let (_, pinned_candidate, _) = verified_review_repo(state, evidence).await?;
+    if candidate_sha.trim() != pinned_candidate {
+        return Err((StatusCode::CONFLICT, format!("candidate_sha does not match pinned review candidate {pinned_candidate}")));
+    }
+    Ok(())
+}
+
+pub(crate) async fn review_read(
+    state: &AppState,
+    evidence: &api::ReviewEvidence,
+    revision: &str,
+    path: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<ReviewTextPage, ApiError> {
+    let path = validate_review_path(path)?;
+    let (repo, candidate_sha, base_sha) = verified_review_repo(state, evidence).await?;
+    let sha = review_revision(revision, &candidate_sha, &base_sha)?;
+    let spec = format!("{sha}:{path}");
+    let output = git_run(
+        &HostGitAuth::none(),
+        Command::new("git").arg("-C").arg(&repo).args(["show", "--no-ext-diff", &spec]),
+    ).await?;
+    if !output.status.success() {
+        return Err((StatusCode::NOT_FOUND, format!("path {path} does not exist as a text file in {revision}")));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("path {path} is not UTF-8 text")))?;
+    Ok(review_page(&text, Some(revision), Some(&path), offset, limit))
+}
+
+pub(crate) async fn review_search(
+    state: &AppState,
+    evidence: &api::ReviewEvidence,
+    revision: &str,
+    query: &str,
+    paths: &[String],
+    offset: usize,
+    limit: usize,
+) -> Result<ReviewTextPage, ApiError> {
+    let query = query.trim();
+    if query.is_empty() || query.len() > 1024 {
+        return Err((StatusCode::BAD_REQUEST, "review search query must be 1..=1024 characters".into()));
+    }
+    let (repo, candidate_sha, base_sha) = verified_review_repo(state, evidence).await?;
+    let sha = review_revision(revision, &candidate_sha, &base_sha)?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&repo).args(["grep", "-n", "-I", "-F", "-e", query, sha, "--"]);
+    if paths.is_empty() {
+        command.arg(".");
+    } else {
+        for path in paths {
+            let path = validate_review_path(path)?;
+            command.arg(format!(":(literal){path}"));
+        }
+    }
+    let output = git_run(&HostGitAuth::none(), &mut command).await?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err((StatusCode::BAD_GATEWAY, format!("host Git search failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
+    }
+    let text = String::from_utf8(output.stdout).map_err(internal)?;
+    Ok(review_page(&text, Some(revision), None, offset, limit))
+}
+
+pub(crate) async fn review_diff(
+    state: &AppState,
+    evidence: &api::ReviewEvidence,
+    path: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<ReviewTextPage, ApiError> {
+    let (repo, candidate_sha, base_sha) = verified_review_repo(state, evidence).await?;
+    let clean_path = path.map(validate_review_path).transpose()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&repo).args(["diff", "--no-ext-diff", "--unified=3", &base_sha, &candidate_sha, "--"]);
+    if let Some(path) = clean_path.as_deref() {
+        command.arg(format!(":(literal){path}"));
+    }
+    let output = git_run(&HostGitAuth::none(), &mut command).await?;
+    if !output.status.success() {
+        return Err((StatusCode::BAD_GATEWAY, format!("host Git diff failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
+    }
+    let text = String::from_utf8(output.stdout).map_err(internal)?;
+    Ok(review_page(&text, None, clean_path.as_deref(), offset, limit))
 }
 
 pub(crate) async fn publish_reviewed_task(
