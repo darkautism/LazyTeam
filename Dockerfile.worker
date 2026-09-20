@@ -1,7 +1,7 @@
 FROM ubuntu:24.04 AS agent-base
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        bash ca-certificates coreutils curl diffutils file findutils gawk git grep gzip jq patch procps python3 ripgrep sed tar unzip \
+        bash build-essential ca-certificates coreutils curl diffutils file findutils gawk git grep gzip jq patch pkg-config procps python3 ripgrep sed tar unzip \
     && rm -rf /var/lib/apt/lists/* \
     && tar --numeric-owner --one-file-system \
         --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run --exclude=./tmp \
@@ -19,14 +19,12 @@ FROM node:22-bookworm-slim
 ARG PI_CODING_AGENT_VERSION=0.85.1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        bash ca-certificates coreutils curl findutils git gosu grep gzip openssh-client procps sed tar util-linux \
+        bash build-essential ca-certificates coreutils curl findutils git gosu grep gzip openssh-client pkg-config procps sed tar util-linux \
     && npm install --global "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 10001 lazyteam \
-    && useradd --system --uid 10001 --gid 10001 --home-dir /app/state/home --shell /usr/sbin/nologin lazyteam \
     && mkdir -p /app/state/home /app/workspaces \
-    && chown -R lazyteam:lazyteam /app
+    && chmod 0777 /app/state /app/state/home /app/workspaces
 COPY --from=builder /src/target/release/lazyteam-worker /usr/local/bin/lazyteam-worker
 COPY --from=agent-base /tmp/lazyteam-ubuntu-rootfs.tar.gz /opt/lazyteam/ubuntu-rootfs.tar.gz
 COPY --from=agent-base /tmp/lazyteam-ubuntu-rootfs.tar.gz.sha256 /opt/lazyteam/ubuntu-rootfs.tar.gz.sha256

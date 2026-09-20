@@ -6,6 +6,8 @@ services:
     environment:
       LAZYTEAM_WORKER_JOIN_CODE: "${LAZYTEAM_WORKER_JOIN_CODE:-}"
       LAZYTEAM_WORKER_NAME: "${LAZYTEAM_WORKER_NAME:-worker-01}"
+      LAZYTEAM_PUID: "${LAZYTEAM_PUID:-}"
+      LAZYTEAM_PGID: "${LAZYTEAM_PGID:-}"
       RUST_LOG: "${RUST_LOG:-lazyteam_worker=info}"
     command: ["lazyteam-worker", "--project", "*", "--slots", "${LAZYTEAM_WORKER_SLOTS:-1}"]
     volumes:

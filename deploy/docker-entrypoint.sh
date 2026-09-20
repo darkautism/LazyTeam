@@ -44,13 +44,13 @@ if [ "$current_uid" -ne 0 ]; then
   test -w "$DATA_DIR" && test -w "$WORKSPACE_DIR" ||
     die "platform-selected identity $current_uid:$current_gid cannot write /app mounts"
 
-  probe="$DATA_DIR/.lazyteam-write-test.$"
+  probe="$DATA_DIR/.lazyteam-write-test.$$"
   : > "$probe" || die "platform-selected identity $current_uid:$current_gid cannot write $DATA_DIR"
   rm -f "$probe"
 
   export HOME="$HOME_DIR"
   umask 027
-  echo "lazyteam-entrypoint: platform already selected non-root $current_uid:$current_gid"
+  echo "lazyteam-entrypoint: platform selected numeric runtime $current_uid:$current_gid; nested privileged sandbox features will be probed and optional"
   exec "$@"
 fi
 

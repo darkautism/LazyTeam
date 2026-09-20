@@ -11,6 +11,7 @@ use tokio::process::Command;
 
 const EXEC_ARG: &str = "__lazyteam-sandbox-exec";
 const CONTAINER_EXEC_ARG: &str = "__lazyteam-container-exec";
+const SIGNAL_PROBE_ARG: &str = "__lazyteam-sandbox-signal-probe";
 const SPEC_ENV: &str = "LAZYTEAM_SANDBOX_SPEC";
 const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".pytest_cache", ".venv"];
 /// Image-native paths that may be visible to agents when present in the frozen
@@ -29,6 +30,30 @@ fn container_managed_rust_paths(container_rootfs: Option<&Path>) -> Option<(Path
     let cargo_image = rootfs.join(cargo_bin.strip_prefix("/").ok()?).join("cargo");
     (rustup_image.is_dir() && cargo_image.is_file()).then_some((rustup_home, cargo_bin))
 }
+
+fn host_visible_managed_rust_paths(rootfs: Option<&Path>) -> Option<(PathBuf, PathBuf)> {
+    let rootfs = rootfs?;
+    let rustup_home = rootfs.join(CONTAINER_RUSTUP_HOME.trim_start_matches('/'));
+    let cargo_bin = rootfs.join(CONTAINER_CARGO_BIN.trim_start_matches('/'));
+    (rustup_home.is_dir() && cargo_bin.join("cargo").is_file()).then_some((rustup_home, cargo_bin))
+}
+
+#[cfg(target_os = "linux")]
+fn nested_mount_namespace_available() -> bool {
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    std::process::Command::new("/usr/bin/unshare")
+        .args(["--mount", "--", "/bin/true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nested_mount_namespace_available() -> bool { false }
 
 fn managed_rust_version(line: &str) -> Option<(u64, u64, u64)> {
     let version = line.split_whitespace().nth(1)?;
@@ -89,12 +114,20 @@ pub struct AgentSandbox {
 impl AgentSandbox {
     pub async fn prepare(state_dir: &Path, pi_bin: &str, container_rootfs: Option<&Path>) -> anyhow::Result<Self> {
         let state_dir = canonical_dir(state_dir).context("canonicalize worker state directory")?;
-        let container_rootfs = container_rootfs.map(canonical_dir).transpose().context("canonicalize agent rootfs")?;
+        let requested_container_rootfs = container_rootfs.map(canonical_dir).transpose().context("canonicalize agent rootfs")?;
+        let container_rootfs = if requested_container_rootfs.is_some() && nested_mount_namespace_available() {
+            requested_container_rootfs.clone()
+        } else {
+            if requested_container_rootfs.is_some() {
+                tracing::warn!(
+                    uid = unsafe { libc::geteuid() },
+                    "nested mount namespace unavailable; using outer-container Landlock/seccomp sandbox"
+                );
+            }
+            None
+        };
         let trusted_container_daemon = container_rootfs.is_some()
             && std::env::var_os("LAZYTEAM_TRUSTED_CONTAINER_DAEMON").is_some_and(|value| value == "1");
-        if trusted_container_daemon && unsafe { libc::geteuid() } != 0 {
-            bail!("trusted container daemon mode requires container uid 0");
-        }
         let pi_config_dir = state_dir.join("pi-agent");
         let home_dir = state_dir.join("agent-home");
         let cargo_home = state_dir.join("agent-cache").join("cargo");
@@ -142,16 +175,24 @@ impl AgentSandbox {
         }
 
         // Container-native image content participates in the exact same
-        // filesystem policy as every other read-only path. enter_agent_container
-        // freezes the image and does not bind these paths from the host; after
-        // chroot, both Landlock and the namespace fallback consume read_only.
+        // filesystem policy as every other read-only path when the nested rootfs
+        // can be entered. NAS/container runtimes that deny CLONE_NEWNS instead
+        // use the outer container plus the same Landlock/seccomp policy.
         add_container_native_read_only(&mut read_only, container_rootfs.as_deref());
 
-        // The managed Rust proxies live inside the frozen image. Put them on
-        // PATH, but keep CARGO_HOME task-writable and point only RUSTUP_HOME at
-        // the read-only image toolchain.
+        // Managed Rust remains usable in both layouts. In nested-rootfs mode the
+        // agent sees /opt/lazyteam directly; in outer-container fallback mode use
+        // the host-visible path inside the extracted rootfs and allow it read-only.
         let container_rust = container_managed_rust_paths(container_rootfs.as_deref());
-        if let Some((_, cargo_bin)) = container_rust.as_ref() {
+        let fallback_rust = container_rootfs.is_none()
+            .then(|| host_visible_managed_rust_paths(requested_container_rootfs.as_deref()))
+            .flatten();
+        if let Some((rustup_home, cargo_bin)) = fallback_rust.as_ref() {
+            read_only.insert(rustup_home.clone());
+            read_only.insert(cargo_bin.clone());
+        }
+        let managed_rust = container_rust.as_ref().or(fallback_rust.as_ref());
+        if let Some((_, cargo_bin)) = managed_rust {
             let mut paths = vec![cargo_bin.clone()];
             paths.extend(std::env::split_paths(&path));
             path = std::env::join_paths(paths).context("compose agent PATH with managed Rust")?;
@@ -186,6 +227,8 @@ impl AgentSandbox {
         }
 
         let rustup_home = if let Some((rustup_home, _)) = container_rust {
+            Some(rustup_home)
+        } else if let Some((rustup_home, _)) = fallback_rust {
             Some(rustup_home)
         } else if container_rootfs.is_none() {
             std::env::var_os("RUSTUP_HOME")
@@ -233,7 +276,11 @@ impl AgentSandbox {
     }
 
     pub fn diagnostic_summary(&self) -> &'static str {
-        "ready: filesystem isolation (Landlock or rootless user/mount namespace) + seccomp denylist"
+        if self.container_rootfs.is_some() {
+            "ready: nested Ubuntu rootfs + filesystem isolation + seccomp denylist"
+        } else {
+            "ready: outer-container Landlock/rootless isolation + seccomp denylist"
+        }
     }
 
     pub async fn store_pi_api_key(&self, provider: &str, api_key: &str) -> anyhow::Result<()> {
@@ -361,12 +408,17 @@ impl AgentSandbox {
             );
         }
 
-        let mut command = self.command("/bin/sh", &self.probe_dir, None)?;
-        command.arg("-c").arg("if kill -0 \"$PPID\" 2>/dev/null; then exit 91; else exit 0; fi");
+        let current_exe = std::env::current_exe().context("resolve worker for sandbox signal probe")?;
+        let current_exe = current_exe.to_str().context("worker executable path is not UTF-8")?;
+        let mut command = self.command(current_exe, &self.probe_dir, None)?;
+        command.arg(SIGNAL_PROBE_ARG);
         command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let output = command.output().await.context("probe sandbox process isolation")?;
         if !output.status.success() {
-            bail!("agent sandbox can signal its parent daemon; refusing to start");
+            bail!(
+                "agent sandbox parent-signal syscall was not denied by seccomp: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(())
     }
@@ -418,7 +470,28 @@ pub fn maybe_handle_entrypoint() -> Option<anyhow::Result<()>> {
     if mode == OsStr::new(CONTAINER_EXEC_ARG) {
         return Some(sandbox_exec(args.collect(), true));
     }
+    if mode == OsStr::new(SIGNAL_PROBE_ARG) {
+        return Some(sandbox_signal_probe());
+    }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_signal_probe() -> anyhow::Result<()> {
+    let parent = unsafe { libc::getppid() };
+    if unsafe { libc::kill(parent, 0) } == 0 {
+        bail!("kill(2) unexpectedly reached parent pid {parent}");
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EPERM) {
+        bail!("kill(2) parent probe returned {error}, expected EPERM from seccomp");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_signal_probe() -> anyhow::Result<()> {
+    bail!("sandbox signal probe requires Linux")
 }
 
 fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Result<()> {
@@ -1268,6 +1341,10 @@ mod tests {
         let (rustup_home, cargo_bin) = container_managed_rust_paths(Some(&root)).unwrap();
         assert_eq!(rustup_home, PathBuf::from("/opt/lazyteam/rustup"));
         assert_eq!(cargo_bin, PathBuf::from("/opt/lazyteam/cargo/bin"));
+
+        let (host_rustup, host_cargo_bin) = host_visible_managed_rust_paths(Some(&root)).unwrap();
+        assert_eq!(host_rustup, root.join("opt/lazyteam/rustup"));
+        assert_eq!(host_cargo_bin, root.join("opt/lazyteam/cargo/bin"));
         assert_eq!(managed_rust_version("rustc 1.85.0 (hash 2025-01-01)"), Some((1, 85, 0)));
         assert_eq!(managed_rust_version("cargo 1.90.1 (hash 2025-01-01)"), Some((1, 90, 1)));
 

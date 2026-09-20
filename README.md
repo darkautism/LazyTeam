@@ -70,7 +70,7 @@ export LAZYTEAM_WORKER_SLOTS=1
 docker compose -f docker-compose.worker.yml up -d
 ```
 
-The supplied worker Compose file always refreshes the published `latest` image before recreating the worker, so a restart cannot silently reuse an older local image. The join code is a short-lived (10-minute) invite — after the worker joins once, it remembers its own credential and you can throw the code away.
+The supplied worker Compose file always refreshes the published `latest` image before recreating the worker, so a restart cannot silently reuse an older local image. Worker containers accept arbitrary numeric runtime identities: platforms may force a user such as TrueNAS `568`, ordinary Linux `1001`, or `0` (root), and root-started containers may explicitly set `LAZYTEAM_PUID`/`LAZYTEAM_PGID`. The image does not require UID 10001. NAS runtimes that deny nested mount namespaces automatically use the outer container with the same fail-closed Landlock/seccomp policy instead of refusing to start. The join code is a short-lived (10-minute) invite — after the worker joins once, it remembers its own credential and you can throw the code away.
 
 **Native worker (from source):**
 

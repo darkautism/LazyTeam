@@ -156,7 +156,7 @@ if [[ -z "$preseed_archive" ]]; then
 fi
 for capability in "${capabilities[@]}"; do
   case "$capability" in
-    rust) packages+=(build-essential pkg-config curl ca-certificates) ;;
+    rust) [[ -n "$preseed_archive" ]] || packages+=(build-essential pkg-config curl ca-certificates) ;;
     python) packages+=(python3 python3-pip python3-venv) ;;
     node) packages+=(nodejs npm) ;;
     go) packages+=(golang-go) ;;
@@ -212,40 +212,17 @@ if (( ${#packages[@]} > 0 )); then
 fi
 
 if [[ -n "${requested[rust]:-}" ]]; then
-  export LAZYTEAM_BUILD_ROOTFS="$rootfs_stage"
-  export LAZYTEAM_BUILD_RUST_KEY="$rust_key"
-  cat > "$rootfs_stage/tmp/lazyteam-rust-install.sh" <<EOF
-set -euo pipefail
-export RUSTUP_HOME=/opt/lazyteam/rustup
-export CARGO_HOME=/opt/lazyteam/cargo
-export PATH=/opt/lazyteam/cargo/bin:\$PATH
-mkdir -p "\$RUSTUP_HOME" "\$CARGO_HOME"
-curl --retry 3 --retry-delay 2 --retry-all-errors --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$rust_key" --no-modify-path
-rm -f /tmp/rustup-init.sh /tmp/lazyteam-rust-install.sh
-rustc --version
-cargo --version
-EOF
-  chmod 0755 "$rootfs_stage/tmp/lazyteam-rust-install.sh"
-  unshare "${namespace_args[@]}" /bin/bash -c '
-    set -euo pipefail
-    rootfs="$LAZYTEAM_BUILD_ROOTFS"
-    mount --make-rprivate /
-    mount --bind "$rootfs" "$rootfs"
-    mount -t proc proc "$rootfs/proc"
-    for device in null zero full random urandom; do
-      mount --bind "/dev/$device" "$rootfs/dev/$device"
-    done
-    chroot "$rootfs" /bin/bash /tmp/lazyteam-rust-install.sh
-  '
+  rustup_home="$rootfs_stage/opt/lazyteam/rustup"
+  cargo_home="$rootfs_stage/opt/lazyteam/cargo"
+  cargo_bin="$cargo_home/bin"
+  mkdir -p "$rustup_home" "$cargo_home"
 
-  rustc_line="$(unshare "${namespace_args[@]}" /bin/bash -c '
-    set -euo pipefail
-    rootfs="$LAZYTEAM_BUILD_ROOTFS"
-    mount --make-rprivate /
-    mount --bind "$rootfs" "$rootfs"
-    chroot "$rootfs" /usr/bin/env RUSTUP_HOME=/opt/lazyteam/rustup CARGO_HOME=/opt/lazyteam/cargo /opt/lazyteam/cargo/bin/rustc --version
-  ')"
+  rustup_init="$staging/rustup-init.sh"
+  curl --retry 3 --retry-delay 2 --retry-all-errors --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"
+  RUSTUP_HOME="$rustup_home" CARGO_HOME="$cargo_home"     sh "$rustup_init" -y --profile minimal --default-toolchain "$rust_key" --no-modify-path
+  rm -f "$rustup_init"
+
+  rustc_line="$(RUSTUP_HOME="$rustup_home" CARGO_HOME="$cargo_home" "$cargo_bin/rustc" --version)"
   installed_rust="$(rust_version_number "$rustc_line")"
   rust_version_at_least "$installed_rust" "1.85" || {
     echo "installed managed Rust $installed_rust is below 1.85" >&2
@@ -256,28 +233,14 @@ EOF
     exit 1
   }
 
-  cat > "$rootfs_stage/tmp/lazyteam-edition2024-check.sh" <<'EOF'
-set -euo pipefail
-export RUSTUP_HOME=/opt/lazyteam/rustup
-export CARGO_HOME=/opt/lazyteam/cargo
-export PATH=/opt/lazyteam/cargo/bin:$PATH
-check=/tmp/lazyteam-edition2024-check
-rm -rf "$check"
-mkdir -p "$check/src"
-printf '[package]\nname = "lazyteam-edition2024-check"\nversion = "0.1.0"\nedition = "2024"\n' > "$check/Cargo.toml"
-printf 'fn main() {}\n' > "$check/src/main.rs"
-cargo metadata --no-deps --format-version 1 --manifest-path "$check/Cargo.toml" >/dev/null
-rm -rf "$check" /tmp/lazyteam-edition2024-check.sh
-EOF
-  chmod 0755 "$rootfs_stage/tmp/lazyteam-edition2024-check.sh"
-  unshare "${namespace_args[@]}" /bin/bash -c '
-    set -euo pipefail
-    rootfs="$LAZYTEAM_BUILD_ROOTFS"
-    mount --make-rprivate /
-    mount --bind "$rootfs" "$rootfs"
-    mount -t proc proc "$rootfs/proc"
-    chroot "$rootfs" /bin/bash /tmp/lazyteam-edition2024-check.sh
-  '
+  check="$staging/edition2024-check"
+  target="$staging/edition2024-target"
+  rm -rf "$check" "$target"
+  mkdir -p "$check/src"
+  printf '[package]\nname = "lazyteam-edition2024-check"\nversion = "0.1.0"\nedition = "2024"\n' > "$check/Cargo.toml"
+  printf 'fn main() {}\n' > "$check/src/main.rs"
+  RUSTUP_HOME="$rustup_home" CARGO_HOME="$cargo_home" CARGO_TARGET_DIR="$target"     "$cargo_bin/cargo" metadata --no-deps --format-version 1 --manifest-path "$check/Cargo.toml" >/dev/null
+  rm -rf "$check" "$target"
 fi
 
 printf '%s\n' "${capabilities[@]}" > "$rootfs_stage/.lazyteam-capabilities"

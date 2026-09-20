@@ -217,7 +217,7 @@ There is intentionally no implicit `127.0.0.1:8787` fallback: a fresh worker mus
 
 ### Embedded agent sandbox
 
-On Linux, `lazyteam-worker` runs Pi inside an embedded sandbox implemented in the same Rust executable; Docker and a separate sandbox binary are not required. It prefers a fully enforced Landlock filesystem policy; kernels without Landlock use a rootless user+mount namespace with a tmpfs root and explicit bind-mount allowlist. Startup is **fail-closed**: if neither filesystem backend can be established or the seccomp filter cannot be installed, the worker refuses to run agents instead of falling back to an unsandboxed process. Check a machine without contacting the control plane with:
+On Linux, `lazyteam-worker` runs Pi inside an embedded sandbox implemented in the same Rust executable; Docker and a separate sandbox binary are not required. It prefers a fully enforced Landlock filesystem policy; kernels without Landlock use a rootless user+mount namespace with a tmpfs root and explicit bind-mount allowlist. When a NAS/container runtime (for example TrueNAS) denies a nested mount namespace, the worker does not require privileged mode: it uses the already-isolated outer worker container and applies the same Landlock + seccomp policy directly. This path works with platform-selected numeric users such as `568`, `1001`, or `0`. Startup remains **fail-closed**: if Landlock cannot be enforced and the namespace fallback is also unavailable, or the seccomp filter cannot be installed, the worker refuses to run agents instead of falling back to an unsandboxed process. Check a machine without contacting the control plane with:
 
 ```sh
 lazyteam-worker --sandbox-diagnose
@@ -227,7 +227,7 @@ The trusted worker daemon keeps the real Git checkout and `.git` metadata outsid
 
 The initial seccomp policy deliberately stays small to preserve normal Node/Pi/Cargo behavior while denying mount/namespace escape and process-inspection primitives such as `mount`, `pivot_root`, `chroot`, `setns`, `unshare`, `ptrace`, `bpf`, and `perf_event_open`. Network access remains available because Pi and package managers need outbound access.
 
-The managed `rust` capability is infrastructure-owned: the rootfs builder installs a concrete Rust toolchain with rustup under `/opt/lazyteam`, defaults to the current stable channel (or the explicit `LAZYTEAM_RUST_TOOLCHAIN` numeric override), and refuses versions below Rust 1.85. The concrete Rust version participates in the rootfs generation key, and the worker verifies `rustc` and `cargo` through the real sandbox before activating that generation. Agents do not install or upgrade Rust themselves.
+The managed `rust` capability is infrastructure-owned: the rootfs builder installs a concrete Rust toolchain with rustup under `/opt/lazyteam`, defaults to the current stable channel (or the explicit `LAZYTEAM_RUST_TOOLCHAIN` numeric override), and refuses versions below Rust 1.85. The published worker's preseed rootfs already contains the linker/build prerequisites, so Rust provisioning does not require nested `unshare`/`chroot`; this is required for TrueNAS-style restricted containers. The concrete Rust version participates in the rootfs generation key, and the worker verifies `rustc` and `cargo` through the real sandbox before activating that generation. Agents do not install or upgrade Rust themselves.
 
 ### Worker and agent configuration
 
