@@ -153,6 +153,12 @@ fn is_reviewer_retry_verdict(verdict_json: Option<&str>) -> bool {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct TaskStatus {
+    pub(crate) task: Task,
+    pub(crate) latest_execution: Option<Execution>,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct ReviewCheckout {
     pub(crate) repo_url: String,
     pub(crate) default_branch: String,
@@ -601,6 +607,17 @@ pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input):
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Task>> {
     let rows = sqlx::query("SELECT * FROM tasks WHERE state!='cancelled' ORDER BY priority DESC, created_at ASC").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(task_from_row).collect::<Result<Vec<_>,_>>().map(Json)
+}
+
+pub(crate) async fn task_status(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> ApiResult<TaskStatus> {
+    let task_row = sqlx::query("SELECT * FROM tasks WHERE id=? AND state!='cancelled'")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "task not found".into()))?;
+    let task = task_from_row(&task_row)?;
+    let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
+    let latest_execution = execution_row.as_ref().map(execution_from_row).transpose()?;
+    Ok(Json(TaskStatus { task, latest_execution }))
 }
 
 pub(crate) async fn delete_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
