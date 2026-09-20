@@ -208,6 +208,14 @@ mod tests {
         assert!(INDEX.contains("looping-pill"));
         assert!(INDEX.contains("review_rounds"));
         assert!(INDEX.contains("reviewer_retries"));
+        // Current-cycle vs lifetime retries are tracked separately: the
+        // per-cycle limit gates automatic redispatch while lifetime history
+        // stays observable. Badges distinguish the two when they differ.
+        assert!(INDEX.contains("current_cycle_reviewer_retries"));
+        assert!(INDEX.contains("lifetime_reviewer_retries"));
+        assert!(INDEX.contains("lifetimeReturned"));
+        assert!(INDEX.contains("Lifetime returned "));
+        assert!(INDEX.contains("current review cycle"));
         // Compact card layout and 3-line summary behavior are preserved.
         assert!(INDEX.contains("compactCard(t.title,cardSummary(x),"));
         // Looping derives from durable counts only, never review_feedback prose.
