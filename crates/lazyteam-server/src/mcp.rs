@@ -78,28 +78,61 @@ pub struct TaskRetryParams {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewRevision {
+    Candidate,
+    Base,
+}
+
+impl ReviewRevision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Base => "base",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewDecision {
+    Approve,
+    Retry,
+}
+
+impl ReviewDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Retry => "retry",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ReviewReadParams {
+pub struct ReviewShowParams {
     pub task_id: String,
+    #[serde(default = "default_review_path")]
     pub path: String,
     #[serde(default = "default_review_revision")]
-    pub revision: String,
-    #[serde(default)]
-    pub offset: usize,
+    pub revision: ReviewRevision,
+    #[serde(default = "default_start_line")]
+    pub start_line: usize,
     #[serde(default = "default_review_limit")]
     pub limit: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ReviewSearchParams {
+pub struct ReviewGrepParams {
     pub task_id: String,
-    pub query: String,
+    pub pattern: String,
     #[serde(default = "default_review_revision")]
-    pub revision: String,
+    pub revision: ReviewRevision,
     #[serde(default)]
     pub paths: Vec<String>,
-    #[serde(default)]
-    pub offset: usize,
+    #[serde(default = "default_start_line")]
+    pub start_line: usize,
     #[serde(default = "default_review_limit")]
     pub limit: usize,
 }
@@ -109,8 +142,8 @@ pub struct ReviewDiffParams {
     pub task_id: String,
     #[serde(default)]
     pub path: Option<String>,
-    #[serde(default)]
-    pub offset: usize,
+    #[serde(default = "default_start_line")]
+    pub start_line: usize,
     #[serde(default = "default_review_limit")]
     pub limit: usize,
 }
@@ -119,13 +152,13 @@ pub struct ReviewDiffParams {
 pub struct ReviewDecideParams {
     pub task_id: String,
     pub candidate_sha: String,
-    pub verdict: String,
+    pub verdict: ReviewDecision,
     pub reason: String,
-    #[serde(default)]
-    pub validation: Vec<String>,
 }
 
-fn default_review_revision() -> String { "candidate".into() }
+fn default_review_revision() -> ReviewRevision { ReviewRevision::Candidate }
+fn default_review_path() -> String { ".".into() }
+fn default_start_line() -> usize { 1 }
 fn default_review_limit() -> usize { 200 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -134,7 +167,7 @@ pub struct WorkerIdParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MergedTaskParams {
+pub struct ConfirmMergeParams {
     pub task_id: String,
     pub merge_commit_sha: String,
 }
@@ -254,7 +287,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "reviews_get",
         title = "Get review evidence",
-        description = "Get the latest pinned execution evidence for a task in review or merge_pending, including the implementation worker, candidate commit, base commit, review ref, patch/summary evidence, and Host repository metadata. Inspect this evidence before deciding to merge or reject a merge_pending candidate.",
+        description = "Get compact metadata for the latest pinned review candidate in review or merge_pending: task requirements, worker/execution summary, candidate/base SHA, review ref, changed files, validation, and warnings. The full patch is intentionally omitted; use reviews_diff for repository-backed diff content.",
         annotations(
             title = "Get review evidence",
             read_only_hint = true,
@@ -268,34 +301,37 @@ impl LazyTeamMcp {
         Parameters(input): Parameters<TaskIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
-        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        let Json(mut evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
+        if let Some(result) = evidence.execution.result.as_mut() {
+            result.patch = None;
+        }
         json_result(&evidence)
     }
 
     #[tool(
-        name = "reviews_read",
-        title = "Read pinned review file",
-        description = "Read a UTF-8 text file from the complete pinned candidate or base repository snapshot for a task. Paths are repository-relative; arbitrary repositories, branches, SHAs, .git internals, and writes are not allowed. Results are line-paged.",
-        annotations(title = "Read pinned review file", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+        name = "reviews_show",
+        title = "Show pinned review path",
+        description = "Git-show-like read of the complete pinned candidate or base snapshot. Read a UTF-8 file or list a directory; path defaults to '.' for the repository root. Pagination uses one-based output line numbers. Arbitrary repositories, branches, SHAs, .git internals, and writes are not allowed.",
+        annotations(title = "Show pinned review path", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn reviews_read(&self, Parameters(input): Parameters<ReviewReadParams>) -> Result<CallToolResult, McpError> {
+    async fn reviews_show(&self, Parameters(input): Parameters<ReviewShowParams>) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        let page = crate::git_broker::review_read(&self.state, &evidence, &input.revision, &input.path, input.offset, input.limit)
+        let page = crate::git_broker::review_show(&self.state, &evidence, input.revision.as_str(), &input.path, input.start_line, input.limit)
             .await.map_err(api_to_mcp)?;
         json_result(&page)
     }
 
     #[tool(
-        name = "reviews_search",
-        title = "Search pinned review repository",
-        description = "Literal-search the complete pinned candidate or base repository snapshot for a task, optionally restricted to repository-relative paths. No shell, arbitrary revision, or external repository access. Results are line-paged.",
-        annotations(title = "Search pinned review repository", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+        name = "reviews_grep",
+        title = "Grep pinned review repository",
+        description = "Git-grep-like fixed-string search of the complete pinned candidate or base snapshot, optionally restricted to repository-relative paths. Output is path:line:text without repeating the candidate SHA. No shell, arbitrary revision, or external repository access.",
+        annotations(title = "Grep pinned review repository", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn reviews_search(&self, Parameters(input): Parameters<ReviewSearchParams>) -> Result<CallToolResult, McpError> {
+    async fn reviews_grep(&self, Parameters(input): Parameters<ReviewGrepParams>) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        let page = crate::git_broker::review_search(&self.state, &evidence, &input.revision, &input.query, &input.paths, input.offset, input.limit)
+        let page = crate::git_broker::review_grep(&self.state, &evidence, input.revision.as_str(), &input.pattern, &input.paths, input.start_line, input.limit)
             .await.map_err(api_to_mcp)?;
         json_result(&page)
     }
@@ -303,13 +339,13 @@ impl LazyTeamMcp {
     #[tool(
         name = "reviews_diff",
         title = "Diff pinned review candidate",
-        description = "Read the pinned base-to-candidate diff for a task, optionally restricted to one repository-relative path. Unlike reviews_get patch evidence this view is generated from the Host task repository and is line-paged rather than capped to the worker patch payload.",
+        description = "Git-diff-like view of pinned base to candidate, optionally restricted to one repository-relative path. Generated from the Host task repository; pagination uses one-based output line numbers.",
         annotations(title = "Diff pinned review candidate", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn reviews_diff(&self, Parameters(input): Parameters<ReviewDiffParams>) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        let page = crate::git_broker::review_diff(&self.state, &evidence, input.path.as_deref(), input.offset, input.limit)
+        let page = crate::git_broker::review_diff(&self.state, &evidence, input.path.as_deref(), input.start_line, input.limit)
             .await.map_err(api_to_mcp)?;
         json_result(&page)
     }
@@ -317,22 +353,22 @@ impl LazyTeamMcp {
     #[tool(
         name = "reviews_decide",
         title = "Decide pinned review candidate",
-        description = "Record a main-agent approve or retry decision for the exact pinned candidate SHA while the task is in review and no reviewer-worker lease is active. Approve moves to merge_pending; retry returns the same task to implementation with the reason. This never merges or writes repository content.",
+        description = "Record approve or retry for the exact pinned candidate SHA while the task is in review and no reviewer-worker lease is active. Approve moves to merge_pending; retry returns the task to implementation. This never merges or writes repository content.",
         annotations(title = "Decide pinned review candidate", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn reviews_decide(&self, Parameters(input): Parameters<ReviewDecideParams>) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         crate::git_broker::verify_review_snapshot(&self.state, &evidence, &input.candidate_sha).await.map_err(api_to_mcp)?;
-        let transition = review::decide_task(&self.state, task_id, &input.candidate_sha, input.verdict.trim(), &input.reason)
+        let verdict = input.verdict.as_str();
+        let transition = review::decide_task(&self.state, task_id, &input.candidate_sha, verdict, &input.reason)
             .await.map_err(api_to_mcp)?;
         json_result(&serde_json::json!({
             "task_id": transition.task_id,
             "state": transition.state,
             "candidate_sha": input.candidate_sha,
-            "verdict": input.verdict,
+            "verdict": verdict,
             "reason": input.reason,
-            "validation": input.validation,
         }))
     }
 
@@ -379,7 +415,7 @@ impl LazyTeamMcp {
     }
 
     #[tool(
-        name = "tasks_merged",
+        name = "tasks_confirm_merge",
         title = "Confirm externally merged task",
         description = "Compatibility recovery for an approved task already merged outside tasks_merge. Verifies the upstream commit contains the exact reviewed file content before marking the task done and queuing cleanup.",
         annotations(
@@ -390,9 +426,9 @@ impl LazyTeamMcp {
             open_world_hint = true
         )
     )]
-    async fn tasks_merged(
+    async fn tasks_confirm_merge(
         &self,
-        Parameters(input): Parameters<MergedTaskParams>,
+        Parameters(input): Parameters<ConfirmMergeParams>,
     ) -> Result<CallToolResult, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
@@ -404,7 +440,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "tasks_retry",
         title = "Retry task",
-        description = "Re-dispatch a draft, review, merge_pending, failed, or blocked task back to implementation. A review or merge-gate (merge_pending) rejection requires a concise reason, which is delivered to the next worker attempt. Inspect a stale or unsafe merge_pending candidate first, then call tasks_retry with a concrete reason instead of attempting an unsafe merge.",
+        description = "Retry according to the task's current state (draft, review, merge_pending, failed, or blocked). Review or merge-gate rejection requires a concise reason for the next attempt; inspect the current task/review state before calling.",
         annotations(
             title = "Retry task",
             read_only_hint = false,
@@ -465,18 +501,18 @@ impl LazyTeamMcp {
     }
 
     #[tool(
-        name = "workers_delete",
-        title = "Delete inactive worker",
+        name = "workers_retire",
+        title = "Retire inactive worker",
         description = "Retire an inactive LazyTeam worker from the active pool while preserving execution/review audit history. Active workers must be stopped first.",
         annotations(
-            title = "Delete inactive worker",
+            title = "Retire inactive worker",
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = false
         )
     )]
-    async fn workers_delete(
+    async fn workers_retire(
         &self,
         Parameters(input): Parameters<WorkerIdParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -493,7 +529,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. A completed reviewer-worker approve verdict or an exact-candidate main-agent reviews_decide approve may move a review task to merge_pending. Main-agent review can inspect the complete pinned repository with reviews_read, reviews_search, and reviews_diff without shell access. For a merge_pending task, inspect the candidate with reviews_get, then call tasks_merge when the candidate is acceptable: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. When the merge_pending candidate is stale or unsafe, do not merge; call tasks_retry with a concrete reason to send it back through implementation + independent review instead of attempting an unsafe merge or inventing another recovery path. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review and merge-gate (merge_pending) retries require a concise reason and stay pinned to the implementation worker workspace/session when applicable.".to_string(),
+                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. A completed reviewer-worker approve verdict or an exact-candidate main-agent reviews_decide approve may move a review task to merge_pending. Main-agent review can inspect the complete pinned repository with reviews_show, reviews_grep, and reviews_diff without shell access. For a merge_pending task, inspect the candidate with reviews_get, then call tasks_merge when the candidate is acceptable: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. When the merge_pending candidate is stale or unsafe, do not merge; call tasks_retry with a concrete reason to send it back through implementation + independent review instead of attempting an unsafe merge or inventing another recovery path. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review and merge-gate (merge_pending) retries require a concise reason and stay pinned to the implementation worker workspace/session when applicable.".to_string(),
             )
     }
 }
@@ -599,5 +635,16 @@ mod tests {
             description.contains("merge_pending"),
             "reviews_get description must advertise merge_pending inspection: {description}"
         );
+    }
+
+    #[tokio::test]
+    async fn review_tool_surface_uses_git_like_names() {
+        let mcp = test_mcp();
+        for name in ["reviews_show", "reviews_grep", "reviews_diff", "reviews_decide", "tasks_confirm_merge", "workers_retire"] {
+            assert!(mcp.tool_router.get(name).is_some(), "{name} must be registered");
+        }
+        for old in ["reviews_read", "reviews_search", "tasks_merged", "workers_delete"] {
+            assert!(mcp.tool_router.get(old).is_none(), "obsolete MCP tool {old} must not remain registered");
+        }
     }
 }

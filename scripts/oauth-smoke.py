@@ -95,12 +95,16 @@ EXPECTED_TOOL_ANNOTATIONS = {
     "tasks_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
     "tasks_create": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "reviews_get": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "reviews_show": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "reviews_grep": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "reviews_diff": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "reviews_decide": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "tasks_merge": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
-    "tasks_merged": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+    "tasks_confirm_merge": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     "tasks_retry": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "tasks_delete": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     "workers_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
-    "workers_delete": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    "workers_retire": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
 }
 
 

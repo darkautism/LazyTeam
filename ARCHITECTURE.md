@@ -271,7 +271,7 @@ queued -> assigned -> running -> review -> merge_pending -> done
 
 - Completed worker executions enter `review` and publish a stable review ref.
 - Review retry requires feedback and is sticky to the same worker so workspace/session state is reused.
-- A reviewer-worker approve verdict is the only transition that moves `review -> merge_pending`; dependencies remain blocked.
+- A reviewer-worker approve verdict or an exact-candidate main-agent `reviews_decide` approve moves `review -> merge_pending`; dependencies remain blocked.
 - `tasks_merge` performs Host-side upstream publish of the exact reviewed candidate, moves `merge_pending -> done`, releases dependencies, and queues worker cleanup. It refuses the publish if upstream or the candidate moved after review.
 - Every execution still gets its own UUID/attempt record, but attempts share the task workspace/session until merge.
 
@@ -285,15 +285,19 @@ projects_create
 tasks_list
 tasks_create
 reviews_get
+reviews_show
+reviews_grep
+reviews_diff
+reviews_decide
 tasks_merge
-tasks_merged
+tasks_confirm_merge
 tasks_retry
 tasks_delete
 workers_list
-workers_delete
+workers_retire
 ```
 
-`tasks_merged` covers only the recovery case where an approved change was already merged outside `tasks_merge`; it verifies the upstream commit contains the exact reviewed content before marking the task done.
+`tasks_confirm_merge` covers only the recovery case where an approved change was already merged outside `tasks_merge`; it verifies the upstream commit contains the exact reviewed content before marking the task done.
 
 The intended flow is that a strong planner such as ChatGPT talks to the OAuth-protected MCP control plane, creates project-scoped work, and lets idle workers claim matching tasks automatically. The authorization page uses `LAZYTEAM_OAUTH_PASSWORD` for the human approval step. See [Security model](#security-model) for PKCE, DCR, CIMD, token, DNS, and rate-limit hardening.
 
