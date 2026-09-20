@@ -449,7 +449,7 @@ impl LazyTeamMcp {
             Ok(sha) => sha,
             Err((StatusCode::CONFLICT, message)) if message.starts_with("merge conflict with current ") => {
                 let reason = format!("Host merge could not be completed cleanly. {message}. Resolve the merge conflicts against the current default branch, preserve the reviewed task intent, validate the result, and resubmit for review.");
-                let transition = review::retry_task(&self.state, task_id, Some(&reason)).await.map_err(api_to_mcp)?;
+                let transition = review::retry_task_with_gate(&self.state, task_id, Some(&reason), Some("merge_conflict")).await.map_err(api_to_mcp)?;
                 return Ok(rmcp::Json(TaskMergeOutput {
                     task_id: transition.task_id,
                     state: transition.state,

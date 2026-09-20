@@ -20,6 +20,7 @@ mod api;
 mod cimd;
 mod git_broker;
 mod git_credentials;
+mod insights;
 mod mcp;
 mod oauth;
 mod review;
@@ -176,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .merge(web::router())
         .merge(api::router())
+        .merge(insights::router())
         .merge(git_broker::router())
         .merge(review::router())
         .merge(oauth::router())

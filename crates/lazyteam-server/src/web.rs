@@ -212,5 +212,25 @@ mod tests {
         assert!(INDEX.contains("compactCard(t.title,cardSummary(x),"));
         // Looping derives from durable counts only, never review_feedback prose.
         assert!(!INDEX.contains("review_feedback"));
+        // Host Insights: durable worker/reviewer/main-gate statistics.
+        assert!(INDEX.contains(r#"data-page="insights""#));
+        assert!(INDEX.contains("id=\"page-insights\""));
+        assert!(INDEX.contains("/api/insights"));
+        assert!(INDEX.contains("insights-window"));
+        assert!(INDEX.contains("refreshInsights"));
+        assert!(INDEX.contains("renderInsights"));
+        assert!(INDEX.contains("setInsightsWindow"));
+        assert!(INDEX.contains("Reviewer quality vs runtime"));
+        assert!(INDEX.contains("Main gate"));
+        assert!(INDEX.contains("Completion time"));
+        assert!(INDEX.contains("Implementation by worker"));
+        assert!(INDEX.contains("Reviewer by worker"));
+        assert!(INDEX.contains("Retry and send-back reasons"));
+        assert!(INDEX.contains("Lifetime retries"));
+        assert!(INDEX.contains("Current-cycle retries"));
+        assert!(INDEX.contains("merge-conflict redispatch"));
+        assert!(INDEX.contains("never model-quality failures"));
+        assert!(INDEX.contains("main_gate_merge_conflict"));
+        assert!(INDEX.contains("reviewer_retries_current_cycle"));
     }
 }
