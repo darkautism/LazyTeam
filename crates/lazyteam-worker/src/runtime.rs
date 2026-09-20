@@ -509,6 +509,44 @@ console.log(JSON.stringify(providers));"#
         }).await.context("Pi provider probe timed out")?
     }
 
+    pub async fn force_refresh_models(&self, provider: &str) -> anyhow::Result<()> {
+        let index = self.pi_module_index()?;
+        let import_url = serde_json::to_string(&format!("file://{}", index.display()))?;
+        let provider = serde_json::to_string(provider)?;
+        let script = format!(
+            r#"import {{ ModelRuntime }} from {import_url};
+const dir=process.env.PI_CODING_AGENT_DIR;
+const provider={provider};
+const controller=new AbortController();
+const timeout=setTimeout(()=>controller.abort(),15000);
+try {{
+  const rt=await ModelRuntime.create({{
+    authPath:dir+"/auth.json",
+    modelsPath:dir+"/models.json",
+    modelsStorePath:dir+"/models-store.json",
+    allowModelNetwork:false,
+    refreshOnCreate:false
+  }});
+  const result=await rt.refresh({{allowNetwork:true,force:true,providers:[provider],signal:controller.signal}});
+  if(result.aborted) throw new Error("model catalog refresh aborted");
+  const error=result.errors.get(provider);
+  if(error) throw error;
+}} finally {{ clearTimeout(timeout); }}
+console.log("ok");"#
+        );
+        let sandbox = self.sandbox.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+            let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
+            command.arg("--input-type=module").arg("--eval").arg(script);
+            command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = command.output().await.context("run Pi forced model catalog refresh")?;
+            if !output.status.success() {
+                bail!("Pi model catalog refresh failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+            }
+            Ok(())
+        }).await.context("Pi model catalog refresh timed out")?
+    }
+
     async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
         let binary = self.binary.clone();
         let sandbox = self.sandbox.clone();

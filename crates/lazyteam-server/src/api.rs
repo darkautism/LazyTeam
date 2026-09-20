@@ -42,6 +42,7 @@ pub(crate) struct AppState {
     pub(crate) git_credential_key: Option<[u8; 32]>,
     pub(crate) git_root: PathBuf,
     pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, PendingAgentAuth>>>,
+    pub(crate) model_refresh_requests: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
 pub(crate) struct PendingAgentAuth {
@@ -267,6 +268,22 @@ struct AgentAuthDelivery {
     api_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentModelRefreshInput {
+    provider: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentModelRefreshQueued {
+    provider: String,
+    queued: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentModelRefreshDelivery {
+    provider: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ManagedCapabilityOption {
     id: &'static str,
@@ -403,6 +420,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/config", get(worker_runtime_config))
         .route("/api/workers/{id}/provider-key", post(queue_worker_provider_key))
         .route("/api/workers/{id}/agent-auth", get(worker_agent_auth))
+        .route("/api/workers/{id}/models/refresh", get(worker_model_refresh).post(queue_worker_model_refresh))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
@@ -904,6 +922,41 @@ async fn worker_agent_auth(
             provider: update.provider,
             api_key: update.api_key,
         }).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+async fn queue_worker_model_refresh(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<AgentModelRefreshInput>,
+) -> ApiResult<AgentModelRefreshQueued> {
+    let provider = input.provider.trim();
+    if provider.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "provider is required".into()));
+    }
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
+    let worker = worker_from_row(&row)?;
+    let candidate = worker.agent_capabilities.providers.iter()
+        .find(|candidate| candidate.id == provider)
+        .ok_or((StatusCode::BAD_REQUEST, "provider is not reported by this worker's agent runtime".into()))?;
+    if !candidate.configured {
+        return Err((StatusCode::CONFLICT, "provider authentication must be configured before refreshing its model catalog".into()));
+    }
+    state.model_refresh_requests.lock().await.insert(id, provider.to_string());
+    Ok(Json(AgentModelRefreshQueued { provider: provider.to_string(), queued: true }))
+}
+
+async fn worker_model_refresh(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    match state.model_refresh_requests.lock().await.remove(&id) {
+        Some(provider) => Ok(Json(AgentModelRefreshDelivery { provider }).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
@@ -1920,6 +1973,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
         });
         let board = task_board(State(state)).await.unwrap().0;
         assert_eq!(board.len(), 1);
