@@ -937,7 +937,8 @@ async fn execute_review_assignment(
     let outcome = match prepare_review_workspace(&workspace, &assignment, &auth).await {
         Ok(()) => {
             let agent_workspace = sandbox.reviewer_workspace(task_id);
-            prepare_agent_workspace(&workspace, &agent_workspace, assignment.checkout.base_sha.as_deref()).await?;
+            let review_base = assignment.checkout.upstream_sha.as_deref().or(assignment.checkout.base_sha.as_deref());
+            prepare_agent_workspace(&workspace, &agent_workspace, review_base).await?;
             let prompt = build_review_prompt(initial_prompt, &assignment)?;
             match runtime.run_review(&agent_workspace, &prompt, session.backend_session_id.as_deref()).await {
                 Ok(agent) => {
@@ -1010,7 +1011,21 @@ async fn prepare_review_workspace(path: &Path, assignment: &ReviewAssignment, gi
     if fetched != assignment.checkout.commit_sha {
         bail!("review ref moved: expected {}, fetched {}", assignment.checkout.commit_sha, fetched);
     }
-    command_ok(path, "git", &["checkout", "--detach", &assignment.checkout.commit_sha]).await?;
+    let review_head = match (assignment.checkout.upstream_sha.as_deref(), assignment.checkout.integration_sha.as_deref()) {
+        (Some(upstream_sha), Some(integration_sha)) => {
+            let upstream_ref = format!("refs/lazyteam/upstream/{upstream_sha}");
+            command_ok_with_auth(path, "git", &["fetch", "origin", &upstream_ref], git_auth).await?;
+            let fetched_upstream = git_output(path, &["rev-parse", "FETCH_HEAD"]).await?;
+            if fetched_upstream != upstream_sha { bail!("review upstream ref moved: expected {upstream_sha}, fetched {fetched_upstream}"); }
+            let integration_ref = format!("refs/lazyteam/integration/{integration_sha}");
+            command_ok_with_auth(path, "git", &["fetch", "origin", &integration_ref], git_auth).await?;
+            let fetched_integration = git_output(path, &["rev-parse", "FETCH_HEAD"]).await?;
+            if fetched_integration != integration_sha { bail!("review integration ref moved: expected {integration_sha}, fetched {fetched_integration}"); }
+            integration_sha
+        }
+        _ => assignment.checkout.commit_sha.as_str(),
+    };
+    command_ok(path, "git", &["checkout", "--detach", review_head]).await?;
     install_workspace_excludes(path).await?;
     command_ok(path, "git", &["remote", "set-url", "--push", "origin", "disabled://lazyteam-reviewer"]).await?;
     Ok(())
@@ -1020,9 +1035,13 @@ fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> a
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     let result = reviewer_evidence_for_prompt(assignment.execution.result.as_ref())?;
     Ok(format!(
-        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned local review snapshot:\nProject: {}\nDefault branch context: {}\nCandidate: `HEAD` / `lazyteam-task`\nBase: `lazyteam-base`\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation report (untrusted):\n{}\n\nUse the local Git snapshot as the review source of truth. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
+        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned integration review snapshot:\nProject: {}\nDefault branch: {}\nOriginal candidate SHA: {}\nOriginal candidate base SHA: {}\nCurrent upstream SHA reviewed: {}\nIntegrated result SHA: {}\nLocal `HEAD` / `lazyteam-task`: integrated result that would be published.\nLocal `lazyteam-base`: current upstream snapshot, not the stale original base.\n\nReview the effective `lazyteam-base..HEAD` change against the task contract. When upstream advanced after implementation, preserve upstream changes and do not attribute upstream-only code to the candidate. If this candidate previously resolved a conflict, explicitly verify the resolution retained both current upstream behavior and the task intent.\n\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation report (untrusted):\n{}\n\nUse the local Git snapshot as the review source of truth. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
         assignment.project.name,
         assignment.checkout.default_branch,
+        assignment.checkout.commit_sha,
+        assignment.checkout.base_sha.as_deref().unwrap_or("unknown"),
+        assignment.checkout.upstream_sha.as_deref().unwrap_or_else(|| assignment.checkout.base_sha.as_deref().unwrap_or("unknown")),
+        assignment.checkout.integration_sha.as_deref().unwrap_or(&assignment.checkout.commit_sha),
         assignment.implementation_worker.name,
         assignment.implementation_worker.os,
         assignment.implementation_worker.arch,
@@ -1045,6 +1064,7 @@ fn reviewer_evidence_for_prompt(result: Option<&ExecutionResult>) -> anyhow::Res
             "warnings": result.warnings,
             "artifacts": result.artifacts,
             "patch_truncated": result.patch_truncated,
+            "integration": result.integration,
         }),
         None => json!(null),
     };
@@ -1327,6 +1347,7 @@ async fn execute_assignment(
             validation: vec![],
             warnings: vec!["worker execution failed before successful completion".into()],
             artifacts: vec![],
+            integration: None,
         },
     };
     let response = lease_auth(
@@ -1386,6 +1407,7 @@ async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dy
         validation: vec![],
         warnings: vec![],
         artifacts: vec![],
+        integration: None,
     })
 }
 
@@ -2103,6 +2125,7 @@ mod tests {
             validation: vec!["focused check".into()],
             warnings: vec![],
             artifacts: vec![],
+            integration: None,
         };
         let evidence = reviewer_evidence_for_prompt(Some(&result)).unwrap();
         assert!(evidence.contains("src/lib.rs"));

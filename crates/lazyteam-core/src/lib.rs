@@ -324,6 +324,60 @@ pub struct ExecutionResult {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub artifacts: Vec<String>,
+    /// Host-computed view of this candidate against the current upstream.
+    /// This lives on the existing execution result so retries/reviews share
+    /// one durable candidate envelope instead of inventing a conflict state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<IntegrationSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MergeConflictFile {
+    pub path: String,
+    pub status: String,
+    pub kind: String,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    #[serde(default)]
+    pub excerpt_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MergeConflictEvidence {
+    pub candidate_sha: String,
+    pub candidate_base_sha: String,
+    pub upstream_sha: String,
+    pub default_branch: String,
+    #[serde(default)]
+    pub files: Vec<MergeConflictFile>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct IntegrationSnapshot {
+    pub candidate_sha: String,
+    pub candidate_base_sha: String,
+    pub upstream_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_sha: Option<String>,
+    /// Stable hash of the effective `upstream -> integrated` diff. Final
+    /// publication uses it conservatively: equality means the already
+    /// reviewed effective change survived a later upstream move unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_diff_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<MergeConflictEvidence>,
+}
+
+impl IntegrationSnapshot {
+    pub fn is_clean(&self) -> bool {
+        self.integration_sha.is_some() && self.conflict.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,9 +406,16 @@ pub struct ReviewLease {
 pub struct ReviewCheckout {
     pub repo_url: String,
     pub default_branch: String,
+    /// Original implementation candidate ref/SHA.
     pub review_ref: String,
     pub commit_sha: String,
     pub base_sha: Option<String>,
+    /// Upstream and integrated result actually presented to this reviewer.
+    /// Older servers omit these and retain legacy candidate-vs-base review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

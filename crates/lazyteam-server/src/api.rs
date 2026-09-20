@@ -278,6 +278,10 @@ pub(crate) struct ReviewCheckout {
     pub(crate) review_ref: Option<String>,
     pub(crate) commit_sha: Option<String>,
     pub(crate) base_sha: Option<String>,
+    /// Host integration snapshot the reviewer actually sees.
+    pub(crate) upstream_sha: Option<String>,
+    pub(crate) integration_sha: Option<String>,
+    pub(crate) effective_diff_hash: Option<String>,
     pub(crate) pullable: bool,
 }
 
@@ -871,12 +875,16 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
     let worker_row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(execution.worker_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let worker = worker_from_row(&worker_row)?;
     let result = execution.result.as_ref();
+    let integration = result.and_then(|value| value.integration.as_ref());
     let checkout = ReviewCheckout {
         repo_url: crate::git_broker::task_repo_url(&state, execution.id)?,
         default_branch: project.default_branch.clone(),
         review_ref: result.and_then(|value| value.review_ref.clone()),
         commit_sha: result.and_then(|value| value.commit_sha.clone()),
         base_sha: result.and_then(|value| value.base_sha.clone()),
+        upstream_sha: integration.map(|value| value.upstream_sha.clone()),
+        integration_sha: integration.and_then(|value| value.integration_sha.clone()),
+        effective_diff_hash: integration.and_then(|value| value.effective_diff_hash.clone()),
         pullable: false,
     };
     Ok(Json(ReviewEvidence { project, task, execution, worker, checkout }))
@@ -1434,9 +1442,9 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? AND state='completed' ORDER BY attempt DESC LIMIT 1")
             .bind(task.id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
         let Some(execution_row) = execution_row else { continue };
-        let execution = execution_from_row(&execution_row)?;
+        let mut execution = execution_from_row(&execution_row)?;
         if execution.worker_id == worker.id { continue; }
-        let Some(result) = execution.result.as_ref() else { continue };
+        let Some(mut result) = execution.result.clone() else { continue };
         let (Some(review_ref), Some(commit_sha)) = (result.review_ref.clone(), result.commit_sha.clone()) else { continue };
 
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
@@ -1457,6 +1465,49 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
                 .bind(feedback).bind(ts(Utc::now())).bind(task.id.to_string()).execute(&state.db).await.map_err(db_error)?;
             continue;
         }
+
+        // Runtime-only reviewer reclaims must keep the exact clean snapshot
+        // from the failed/lost lease instead of silently changing the review
+        // target when upstream moves. A fresh candidate/quality retry has no
+        // such pinned failed/lost snapshot and is reconciled against current
+        // upstream below.
+        let prior_runtime_pins = sqlx::query("SELECT upstream_sha,integration_sha,effective_diff_hash FROM reviews WHERE task_id=? AND execution_id=? AND state IN ('failed','lost') AND upstream_sha IS NOT NULL AND integration_sha IS NOT NULL AND effective_diff_hash IS NOT NULL ORDER BY created_at DESC LIMIT 1")
+            .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
+        let reusable = prior_runtime_pins.and_then(|row| {
+            let upstream_sha: Option<String> = row.try_get("upstream_sha").ok()?;
+            let integration_sha: Option<String> = row.try_get("integration_sha").ok()?;
+            let effective_diff_hash: Option<String> = row.try_get("effective_diff_hash").ok()?;
+            let saved = result.integration.clone()?;
+            (saved.conflict.is_none()
+                && upstream_sha.as_deref() == Some(saved.upstream_sha.as_str())
+                && integration_sha.as_deref() == saved.integration_sha.as_deref()
+                && effective_diff_hash.as_deref() == saved.effective_diff_hash.as_deref()).then_some(saved)
+        });
+        // Reconcile every fresh review target against current upstream before
+        // a reviewer spends a turn. A Git conflict is implementation work,
+        // not a reviewer-quality retry, so no review row is created here.
+        let integration = match reusable {
+            Some(snapshot) => snapshot,
+            None => crate::git_broker::prepare_integration_snapshot(&state, &project, execution.id, &result).await?,
+        };
+        if let Some(conflict) = integration.conflict.as_ref() {
+            result.integration = Some(integration.clone());
+            execution.result = Some(result.clone());
+            sqlx::query("UPDATE executions SET result=? WHERE id=? AND state='completed'")
+                .bind(json(&result)?).bind(execution.id.to_string()).execute(&state.db).await.map_err(db_error)?;
+            let feedback = format!(
+                "{}
+
+This is an upstream integration retry, not a new implementation or reviewer rejection. Preserve current upstream changes, preserve the original task intent, resolve only the integration conflict, then validate the task again. Current upstream HEAD is {}.",
+                crate::git_broker::conflict_summary(conflict), conflict.upstream_sha
+            );
+            sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
+                .bind(feedback).bind(execution.worker_id.to_string()).bind(ts(Utc::now())).bind(task.id.to_string())
+                .execute(&state.db).await.map_err(db_error)?;
+            continue;
+        }
+        let integration_sha = integration.integration_sha.clone().ok_or((StatusCode::CONFLICT, "clean integration snapshot has no integrated commit".into()))?;
+        let effective_diff_hash = integration.effective_diff_hash.clone().ok_or((StatusCode::CONFLICT, "clean integration snapshot has no effective diff hash".into()))?;
 
         let implementation_row = sqlx::query("SELECT * FROM workers WHERE id=?")
             .bind(execution.worker_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
@@ -1491,10 +1542,18 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         // worker metadata.
         let review_cycle: i64 = sqlx::query_scalar("SELECT review_cycle FROM tasks WHERE id=?")
             .bind(task.id.to_string()).fetch_one(&mut *tx).await.map_err(db_error)?;
-        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+        // Only the claimant that won the active-review check may publish the
+        // clean snapshot into the execution envelope. Losing concurrent
+        // claimants cannot overwrite the review's pinned integration.
+        result.integration = Some(integration.clone());
+        execution.result = Some(result.clone());
+        sqlx::query("UPDATE executions SET result=? WHERE id=? AND state='completed'")
+            .bind(json(&result)?).bind(execution.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle,upstream_sha,integration_sha,effective_diff_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(review.id.to_string()).bind(task.id.to_string()).bind(execution.id.to_string()).bind(worker.id.to_string())
             .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash)
-            .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone()).bind(review_cycle).execute(&mut *tx).await.map_err(db_conflict)?;
+            .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone()).bind(review_cycle)
+            .bind(&integration.upstream_sha).bind(&integration_sha).bind(&effective_diff_hash).execute(&mut *tx).await.map_err(db_conflict)?;
         sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
             .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
@@ -1509,6 +1568,8 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
             review_ref,
             commit_sha,
             base_sha: result.base_sha.clone(),
+            upstream_sha: Some(integration.upstream_sha.clone()),
+            integration_sha: Some(integration_sha),
         };
         return Ok(Json(ReviewAssignment {
             review,
@@ -3130,13 +3191,14 @@ mod tests {
             .bind(&task_id).bind(&project_id).bind("claim loop").bind("").bind("").bind("review").bind("").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
         let execution_id = Uuid::new_v4().to_string();
-        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc123","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc123","base_sha":"base","review_ref":"refs/task/candidate","integration":{"candidate_sha":"abc123","candidate_base_sha":"base","upstream_sha":"upstream-pinned","integration_sha":"integration-pinned","effective_diff_hash":"diff-hash","conflict":null}}).to_string();
         sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
             .bind(&execution_id).bind(&task_id).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
             .execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict,upstream_sha,integration_sha,effective_diff_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(reviewer_id.to_string())
             .bind("failed").bind(&now).bind(&now).bind(r#"{"error":"runner crashed"}"#)
+            .bind("upstream-pinned").bind("integration-pinned").bind("diff-hash")
             .execute(&db).await.unwrap();
         let state = Arc::new(AppState { db, public_url: Some("https://example.com".into()), oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
         let headers = || {
