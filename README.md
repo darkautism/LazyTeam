@@ -70,7 +70,7 @@ export LAZYTEAM_WORKER_SLOTS=1
 docker compose -f docker-compose.worker.yml up -d
 ```
 
-The join code is a short-lived (10-minute) invite — after the worker joins once, it remembers its own credential and you can throw the code away.
+The supplied worker Compose file always refreshes the published `latest` image before recreating the worker, so a restart cannot silently reuse an older local image. The join code is a short-lived (10-minute) invite — after the worker joins once, it remembers its own credential and you can throw the code away.
 
 **Native worker (from source):**
 

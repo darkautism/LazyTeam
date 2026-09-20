@@ -187,7 +187,7 @@ export LAZYTEAM_WORKER_SLOTS=1
 docker compose -f docker-compose.worker.yml up -d
 ```
 
-The worker container is outbound-only and exposes no port. Its embedded agent sandbox needs Linux user/mount namespaces; the supplied Compose profile keeps the daemon non-root after volume initialization and relaxes the outer Docker seccomp/AppArmor filters so the worker can create its **inner** rootless namespace sandbox. LazyTeam still fails closed if that inner filesystem/seccomp sandbox cannot be established. Hosts that disable unprivileged user namespaces must enable them before using the worker container.
+The worker Compose profile uses `pull_policy: always`, so each recreate resolves the current published image instead of trusting a stale local `latest` tag. The worker container is outbound-only and exposes no port. Its embedded agent sandbox needs Linux user/mount namespaces; the supplied Compose profile keeps the daemon non-root after volume initialization and relaxes the outer Docker seccomp/AppArmor filters so the worker can create its **inner** rootless namespace sandbox. LazyTeam still fails closed if that inner filesystem/seccomp sandbox cannot be established. Hosts that disable unprivileged user namespaces must enable them before using the worker container.
 
 For a native worker, `git`, Pi, and the rootfs-builder host tools must be installed on the machine. The preferred bootstrap path does **not** require the remote machine to know `LAZYTEAM_PUBLIC_URL` or the shared enrollment secret in advance:
 

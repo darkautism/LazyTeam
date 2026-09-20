@@ -1,6 +1,7 @@
 services:
   lazyteam-worker:
     image: ghcr.io/darkautism/lazyteam-worker:latest
+    pull_policy: always
     restart: unless-stopped
     environment:
       LAZYTEAM_WORKER_JOIN_CODE: "${LAZYTEAM_WORKER_JOIN_CODE:-}"
