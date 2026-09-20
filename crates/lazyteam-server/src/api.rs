@@ -1852,10 +1852,6 @@ fn git_auth_mode_str(mode: &GitAuthMode) -> &'static str {
 fn git_auth_mode(value: &str) -> Result<GitAuthMode, ApiError> {
     match value {
         "host" => Ok(GitAuthMode::Host),
-        // Legacy default from migration 0007 for ambient Host Git access;
-        // migration 0016 renames stored rows to 'host' but the column
-        // default still yields 'worker' for direct test inserts.
-        "worker" => Ok(GitAuthMode::Host),
         "ssh_key" => Ok(GitAuthMode::SshKey),
         "https_basic" => Ok(GitAuthMode::HttpsBasic),
         _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid Git auth mode {value}"))),
@@ -2739,8 +2735,8 @@ mod tests {
         let reviewer_id = Uuid::new_v4();
         let reviewer_cred = "test-reviewer-cred";
         let reviewer_hash = hash_secret(reviewer_cred);
-        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
-            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,git_auth_mode,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind("host").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
         sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(worker_id.clone()).bind("worker").bind("worker").bind("idle").bind("linux").bind("x86_64")
