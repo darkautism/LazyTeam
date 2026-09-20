@@ -354,17 +354,14 @@ async fn insights(
     struct ExecRow {
         worker_id: String,
         state: String,
-        created: String,
-        started: Option<String>,
-        finished: Option<String>,
         agent_type: Option<String>,
         provider: Option<String>,
         model: Option<String>,
     }
     let exec_select = if execs_have_snap {
-        "SELECT worker_id,state,created_at,started_at,finished_at,worker_agent_type,worker_provider,worker_model FROM executions"
+        "SELECT worker_id,state,worker_agent_type,worker_provider,worker_model FROM executions"
     } else {
-        "SELECT worker_id,state,created_at,started_at,finished_at FROM executions"
+        "SELECT worker_id,state FROM executions"
     };
     // Counts cover executions started in window, where "started" is
     // `started_at` with fallback to the claim-time `created_at` for attempts
@@ -388,9 +385,6 @@ async fn insights(
             .map(|row| ExecRow {
                 worker_id: row.try_get("worker_id").unwrap_or_default(),
                 state: row.try_get("state").unwrap_or_default(),
-                created: row.try_get("created_at").unwrap_or_default(),
-                started: row.try_get("started_at").unwrap_or(None),
-                finished: row.try_get("finished_at").unwrap_or(None),
                 agent_type: row.try_get("worker_agent_type").unwrap_or(None),
                 provider: row.try_get("worker_provider").unwrap_or(None),
                 model: row.try_get("worker_model").unwrap_or(None),
@@ -407,26 +401,36 @@ async fn insights(
         .iter()
         .filter(|r| r.state == "assigned" || r.state == "running")
         .count() as i64;
-    let finished_rows: Vec<&ExecRow> = match &cutoff_str {
-        Some(cut) => started_rows
-            .iter()
-            .filter(|r| {
-                r.state == "completed"
-                    && r.finished.as_deref().and_then(parse_time).is_some_and(|t| t.to_rfc3339() >= *cut)
-            })
-            .collect(),
-        None => started_rows.iter().filter(|r| r.state == "completed").collect(),
-    };
+    // Completion timing covers every execution finished in window, including
+    // attempts that started before the window. It is selected independently
+    // of the started-in-window count above so late-finishing long attempts
+    // are never omitted from the finished-in-window metric.
+    let finished_select =
+        "SELECT created_at,started_at,finished_at FROM executions WHERE state='completed'";
     let mut exec_durations: Vec<f64> = Vec::new();
-    for row in &finished_rows {
-        let end = row.finished.as_deref().and_then(parse_time);
-        let start = row
-            .started
-            .as_deref()
-            .and_then(parse_time)
-            .or_else(|| parse_time(&row.created));
-        if let (Some(a), Some(b)) = (start, end) {
-            exec_durations.push((b - a).num_seconds().max(0) as f64);
+    if table_exists(db, "executions").await {
+        let sql = match &cutoff_str {
+            Some(_) => format!("{finished_select} AND finished_at>=?"),
+            None => finished_select.to_string(),
+        };
+        let mut query = sqlx::query(&sql);
+        if cutoff_str.is_some() {
+            query = query.bind(cutoff_str.clone().unwrap_or_default());
+        }
+        if let Ok(rows) = query.fetch_all(db).await {
+            for row in rows {
+                let created: String = row.try_get("created_at").unwrap_or_default();
+                let started: Option<String> = row.try_get("started_at").unwrap_or(None);
+                let finished: Option<String> = row.try_get("finished_at").unwrap_or(None);
+                let end = finished.as_deref().and_then(parse_time);
+                let start = started
+                    .as_deref()
+                    .and_then(parse_time)
+                    .or_else(|| parse_time(&created));
+                if let (Some(a), Some(b)) = (start, end) {
+                    exec_durations.push((b - a).num_seconds().max(0) as f64);
+                }
+            }
         }
     }
     let execution_duration = duration_summary(exec_durations);
@@ -1576,10 +1580,20 @@ mod tests {
         sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,started_at,created_at) VALUES(?,?,?,?,?,?,?,?)")
             .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&worker_id).bind(1_i64).bind("running").bind(&now_str).bind(&now_str).bind(&old)
             .execute(&db).await.unwrap();
+        // Started long before the window but finished inside it: excluded
+        // from started-in-window counts yet included in finished-in-window
+        // completion timing.
+        let finished_at = now.to_rfc3339();
+        let started_long_ago = old.clone();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,started_at,finished_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&worker_id).bind(2_i64).bind("completed").bind(&now_str).bind(&started_long_ago).bind(&finished_at).bind(&old)
+            .execute(&db).await.unwrap();
         let state = state_with(db);
         let Json(body) = insights(State(state), Query(InsightsQuery { window: "30d".into() }))
             .await
             .unwrap();
         assert_eq!(body.executions_total, 1);
+        assert_eq!(body.execution_duration.sample, 1);
+        assert!(body.execution_duration.median_secs.unwrap_or(0.0) >= 59.0 * 24.0 * 3600.0);
     }
 }
