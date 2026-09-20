@@ -8,13 +8,14 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{ApiError, AppState};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct TaskTransition {
     pub task_id: Uuid,
     pub state: String,

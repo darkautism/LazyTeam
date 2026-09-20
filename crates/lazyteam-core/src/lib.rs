@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::{BTreeMap, BTreeSet}, fmt};
 use uuid::Uuid;
@@ -18,7 +19,7 @@ pub const DEFAULT_WORKER_PROMPT: &str = "You are an autonomous LazyTeam coding w
 
 pub const DEFAULT_REVIEWER_PROMPT: &str = "You are an independent senior LazyTeam reviewer. Review the exact pinned candidate commit in the provided repository checkout, not the worker's claims. Read the task contract and acceptance criteria, inspect the implementation and surrounding code, and run focused validation when practical. Treat the implementation worker as untrusted evidence: verify changed behavior yourself. Do not modify source code, create commits, push branches, merge, or broaden scope. Approve only when the candidate is correct, complete, scoped, and supported by evidence. Otherwise request a retry with a concise, actionable reason. Your final response must be exactly one JSON object with this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[\"...\"]}.";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentLoginMode {
     Unsupported,
@@ -30,7 +31,7 @@ impl Default for AgentLoginMode {
     fn default() -> Self { Self::Unsupported }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 pub struct AgentModelCost {
     #[serde(default)]
     pub input: f64,
@@ -42,7 +43,7 @@ pub struct AgentModelCost {
     pub cache_write: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AgentProvider {
     pub id: String,
     pub name: String,
@@ -54,7 +55,7 @@ pub struct AgentProvider {
     pub oauth_label: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct AgentModel {
     pub provider: String,
     pub id: String,
@@ -68,7 +69,7 @@ pub struct AgentModel {
     pub cost: Option<AgentModelCost>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 pub struct AgentCapabilities {
     #[serde(default)]
     pub model_discovery: bool,
@@ -82,7 +83,7 @@ pub struct AgentCapabilities {
     pub probe_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     #[default]
@@ -90,7 +91,7 @@ pub enum AgentRole {
     Reviewer,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AgentConfig {
     pub agent_type: String,
     pub provider: Option<String>,
@@ -109,7 +110,7 @@ impl Default for AgentConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GitAuthMode {
     #[default]
@@ -118,7 +119,7 @@ pub enum GitAuthMode {
     HttpsBasic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct GitAuthConfig {
     #[serde(default)]
     pub mode: GitAuthMode,
@@ -153,7 +154,7 @@ impl fmt::Debug for GitCredential {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ContributorIdentity {
     pub name: String,
     pub email: String,
@@ -165,7 +166,7 @@ impl Default for ContributorIdentity {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Project {
     pub id: Uuid,
     pub slug: String,
@@ -185,7 +186,7 @@ pub struct Project {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerState {
     Idle,
@@ -196,7 +197,7 @@ pub enum WorkerState {
     Offline,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Worker {
     pub id: Uuid,
     pub name: String,
@@ -233,7 +234,7 @@ pub struct Worker {
     pub agent_capabilities: AgentCapabilities,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
     Draft,
@@ -248,7 +249,7 @@ pub enum TaskState {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Task {
     pub id: Uuid,
     pub project_id: Uuid,
@@ -271,7 +272,7 @@ pub struct Task {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionState {
     Assigned,
@@ -282,7 +283,7 @@ pub enum ExecutionState {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Execution {
     pub id: Uuid,
     pub task_id: Uuid,
@@ -295,7 +296,7 @@ pub struct Execution {
     pub result: Option<ExecutionResult>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecutionResult {
     pub status: String,
     pub summary: String,

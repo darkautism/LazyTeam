@@ -9,6 +9,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use lazyteam_core::{GitCredential, Project};
+use rmcp::schemars::JsonSchema;
 use serde::Serialize;
 use sqlx::Row;
 use tokio::{io::AsyncWriteExt, process::Command};
@@ -221,7 +222,7 @@ async fn prepare_task_repo_inner(
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct ReviewTextPage {
     pub(crate) revision: Option<String>,
     pub(crate) path: Option<String>,

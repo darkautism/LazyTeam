@@ -4,10 +4,10 @@ use axum::{extract::{Path, State}, http::StatusCode, Json};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -172,6 +172,36 @@ pub struct ConfirmMergeParams {
     pub merge_commit_sha: String,
 }
 
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct ReviewDecisionOutput {
+    task_id: Uuid,
+    state: String,
+    candidate_sha: String,
+    verdict: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct TaskMergeOutput {
+    task_id: Uuid,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_commit_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_conflict: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct TaskDeletedOutput {
+    task_id: Uuid,
+    deleted: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct WorkerRetiredOutput {
+    worker_id: Uuid,
+    retired: bool,
+}
 
 #[tool_router]
 impl LazyTeamMcp {
@@ -191,9 +221,9 @@ impl LazyTeamMcp {
             open_world_hint = false
         )
     )]
-    async fn projects_list(&self) -> Result<CallToolResult, McpError> {
+    async fn projects_list(&self) -> Result<rmcp::Json<Vec<lazyteam_core::Project>>, McpError> {
         let Json(items) = list_projects(State(self.state.clone())).await.map_err(api_to_mcp)?;
-        json_result(&items)
+        Ok(rmcp::Json(items))
     }
 
     #[tool(
@@ -211,7 +241,7 @@ impl LazyTeamMcp {
     async fn projects_create(
         &self,
         Parameters(input): Parameters<ProjectCreateParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<lazyteam_core::Project>, McpError> {
         let Json(project) = create_project(
             State(self.state.clone()),
             Json(CreateProject {
@@ -225,7 +255,7 @@ impl LazyTeamMcp {
                 git_auth: crate::api::ProjectGitAuthInput::default(),
             }),
         ).await.map_err(api_to_mcp)?;
-        json_result(&project)
+        Ok(rmcp::Json(project))
     }
 
     #[tool(
@@ -240,9 +270,9 @@ impl LazyTeamMcp {
             open_world_hint = false
         )
     )]
-    async fn tasks_list(&self) -> Result<CallToolResult, McpError> {
+    async fn tasks_list(&self) -> Result<rmcp::Json<Vec<lazyteam_core::Task>>, McpError> {
         let Json(items) = list_tasks(State(self.state.clone())).await.map_err(api_to_mcp)?;
-        json_result(&items)
+        Ok(rmcp::Json(items))
     }
 
     #[tool(
@@ -260,11 +290,11 @@ impl LazyTeamMcp {
     async fn tasks_get(
         &self,
         Parameters(input): Parameters<TaskIdParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<crate::api::TaskStatus>, McpError> {
         let task_id = Uuid::parse_str(&input.task_id)
             .map_err(|e| McpError::invalid_params("invalid task_id", Some(serde_json::json!({"error": e.to_string()}))))?;
         let Json(status) = task_status(State(self.state.clone()), Path(task_id)).await.map_err(api_to_mcp)?;
-        json_result(&status)
+        Ok(rmcp::Json(status))
     }
 
     #[tool(
@@ -282,7 +312,7 @@ impl LazyTeamMcp {
     async fn tasks_create(
         &self,
         Parameters(input): Parameters<TaskCreateParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<lazyteam_core::Task>, McpError> {
         let project_id = Uuid::parse_str(&input.project_id)
             .map_err(|e| McpError::invalid_params("invalid project_id", Some(serde_json::json!({"error": e.to_string()}))))?;
         let dependencies = input.dependencies.into_iter()
@@ -303,7 +333,7 @@ impl LazyTeamMcp {
                 priority: input.priority,
             }),
         ).await.map_err(api_to_mcp)?;
-        json_result(&task)
+        Ok(rmcp::Json(task))
     }
 
     #[tool(
@@ -321,13 +351,13 @@ impl LazyTeamMcp {
     async fn reviews_get(
         &self,
         Parameters(input): Parameters<TaskIdParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<crate::api::ReviewEvidence>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(mut evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         if let Some(result) = evidence.execution.result.as_mut() {
             result.patch = None;
         }
-        json_result(&evidence)
+        Ok(rmcp::Json(evidence))
     }
 
     #[tool(
@@ -336,12 +366,12 @@ impl LazyTeamMcp {
         description = "Git-show-like read of the complete pinned candidate or base snapshot. Read a UTF-8 file or list a directory; path defaults to '.' for the repository root. Pagination uses one-based output line numbers. Arbitrary repositories, branches, SHAs, .git internals, and writes are not allowed.",
         annotations(title = "Show pinned review path", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn reviews_show(&self, Parameters(input): Parameters<ReviewShowParams>) -> Result<CallToolResult, McpError> {
+    async fn reviews_show(&self, Parameters(input): Parameters<ReviewShowParams>) -> Result<rmcp::Json<crate::git_broker::ReviewTextPage>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         let page = crate::git_broker::review_show(&self.state, &evidence, input.revision.as_str(), &input.path, input.start_line, input.limit)
             .await.map_err(api_to_mcp)?;
-        json_result(&page)
+        Ok(rmcp::Json(page))
     }
 
     #[tool(
@@ -350,12 +380,12 @@ impl LazyTeamMcp {
         description = "Git-grep-like fixed-string search of the complete pinned candidate or base snapshot, optionally restricted to repository-relative paths. Output is path:line:text without repeating the candidate SHA. No shell, arbitrary revision, or external repository access.",
         annotations(title = "Grep pinned review repository", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn reviews_grep(&self, Parameters(input): Parameters<ReviewGrepParams>) -> Result<CallToolResult, McpError> {
+    async fn reviews_grep(&self, Parameters(input): Parameters<ReviewGrepParams>) -> Result<rmcp::Json<crate::git_broker::ReviewTextPage>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         let page = crate::git_broker::review_grep(&self.state, &evidence, input.revision.as_str(), &input.pattern, &input.paths, input.start_line, input.limit)
             .await.map_err(api_to_mcp)?;
-        json_result(&page)
+        Ok(rmcp::Json(page))
     }
 
     #[tool(
@@ -364,12 +394,12 @@ impl LazyTeamMcp {
         description = "Git-diff-like view of pinned base to candidate, optionally restricted to one repository-relative path. Generated from the Host task repository; pagination uses one-based output line numbers.",
         annotations(title = "Diff pinned review candidate", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn reviews_diff(&self, Parameters(input): Parameters<ReviewDiffParams>) -> Result<CallToolResult, McpError> {
+    async fn reviews_diff(&self, Parameters(input): Parameters<ReviewDiffParams>) -> Result<rmcp::Json<crate::git_broker::ReviewTextPage>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         let page = crate::git_broker::review_diff(&self.state, &evidence, input.path.as_deref(), input.start_line, input.limit)
             .await.map_err(api_to_mcp)?;
-        json_result(&page)
+        Ok(rmcp::Json(page))
     }
 
     #[tool(
@@ -378,19 +408,19 @@ impl LazyTeamMcp {
         description = "Record approve or retry for the exact pinned candidate SHA while the task is in review and no reviewer-worker lease is active. Approve moves to merge_pending; retry returns the task to implementation. This never merges or writes repository content.",
         annotations(title = "Decide pinned review candidate", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn reviews_decide(&self, Parameters(input): Parameters<ReviewDecideParams>) -> Result<CallToolResult, McpError> {
+    async fn reviews_decide(&self, Parameters(input): Parameters<ReviewDecideParams>) -> Result<rmcp::Json<ReviewDecisionOutput>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         crate::git_broker::verify_review_snapshot(&self.state, &evidence, &input.candidate_sha).await.map_err(api_to_mcp)?;
         let verdict = input.verdict.as_str();
         let transition = review::decide_task(&self.state, task_id, &input.candidate_sha, verdict, &input.reason)
             .await.map_err(api_to_mcp)?;
-        json_result(&serde_json::json!({
-            "task_id": transition.task_id,
-            "state": transition.state,
-            "candidate_sha": input.candidate_sha,
-            "verdict": verdict,
-            "reason": input.reason,
+        Ok(rmcp::Json(ReviewDecisionOutput {
+            task_id: transition.task_id,
+            state: transition.state,
+            candidate_sha: input.candidate_sha,
+            verdict: verdict.to_string(),
+            reason: input.reason,
         }))
     }
 
@@ -409,7 +439,7 @@ impl LazyTeamMcp {
     async fn tasks_merge(
         &self,
         Parameters(input): Parameters<TaskIdParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<TaskMergeOutput>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         if evidence.task.state != lazyteam_core::TaskState::MergePending {
@@ -420,19 +450,21 @@ impl LazyTeamMcp {
             Err((StatusCode::CONFLICT, message)) if message.starts_with("merge conflict with current ") => {
                 let reason = format!("Host merge could not be completed cleanly. {message}. Resolve the merge conflicts against the current default branch, preserve the reviewed task intent, validate the result, and resubmit for review.");
                 let transition = review::retry_task(&self.state, task_id, Some(&reason)).await.map_err(api_to_mcp)?;
-                return json_result(&serde_json::json!({
-                    "task_id": transition.task_id,
-                    "state": transition.state,
-                    "merge_conflict": message,
+                return Ok(rmcp::Json(TaskMergeOutput {
+                    task_id: transition.task_id,
+                    state: transition.state,
+                    merge_commit_sha: None,
+                    merge_conflict: Some(message),
                 }));
             }
             Err(error) => return Err(api_to_mcp(error)),
         };
         let transition = review::merged_task(&self.state, task_id, &merge_commit_sha).await.map_err(api_to_mcp)?;
-        json_result(&serde_json::json!({
-            "task_id": transition.task_id,
-            "state": transition.state,
-            "merge_commit_sha": merge_commit_sha,
+        Ok(rmcp::Json(TaskMergeOutput {
+            task_id: transition.task_id,
+            state: transition.state,
+            merge_commit_sha: Some(merge_commit_sha),
+            merge_conflict: None,
         }))
     }
 
@@ -451,12 +483,12 @@ impl LazyTeamMcp {
     async fn tasks_confirm_merge(
         &self,
         Parameters(input): Parameters<ConfirmMergeParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<crate::review::TaskTransition>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
         crate::git_broker::verify_external_merge(&self.state, &evidence, &input.merge_commit_sha).await.map_err(api_to_mcp)?;
         let transition = review::merged_task(&self.state, task_id, &input.merge_commit_sha).await.map_err(api_to_mcp)?;
-        json_result(&transition)
+        Ok(rmcp::Json(transition))
     }
 
     #[tool(
@@ -474,14 +506,14 @@ impl LazyTeamMcp {
     async fn tasks_retry(
         &self,
         Parameters(input): Parameters<TaskRetryParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<crate::review::TaskTransition>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         match review_evidence(Path(task_id), State(self.state.clone())).await {
             Ok(_) | Err((StatusCode::CONFLICT, _)) => {}
             Err(error) => return Err(api_to_mcp(error)),
         }
         let transition = review::retry_task(&self.state, task_id, input.reason.as_deref()).await.map_err(api_to_mcp)?;
-        json_result(&transition)
+        Ok(rmcp::Json(transition))
     }
 
     #[tool(
@@ -499,10 +531,10 @@ impl LazyTeamMcp {
     async fn tasks_delete(
         &self,
         Parameters(input): Parameters<TaskIdParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<TaskDeletedOutput>, McpError> {
         let task_id = parse_task_id(&input.task_id)?;
         delete_task(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        json_result(&serde_json::json!({"task_id": task_id, "deleted": true}))
+        Ok(rmcp::Json(TaskDeletedOutput { task_id, deleted: true }))
     }
 
     #[tool(
@@ -517,9 +549,9 @@ impl LazyTeamMcp {
             open_world_hint = false
         )
     )]
-    async fn workers_list(&self) -> Result<CallToolResult, McpError> {
+    async fn workers_list(&self) -> Result<rmcp::Json<Vec<lazyteam_core::Worker>>, McpError> {
         let Json(items) = list_workers(State(self.state.clone())).await.map_err(api_to_mcp)?;
-        json_result(&items)
+        Ok(rmcp::Json(items))
     }
 
     #[tool(
@@ -537,11 +569,11 @@ impl LazyTeamMcp {
     async fn workers_retire(
         &self,
         Parameters(input): Parameters<WorkerIdParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<rmcp::Json<WorkerRetiredOutput>, McpError> {
         let worker_id = Uuid::parse_str(&input.worker_id)
             .map_err(|e| McpError::invalid_params("invalid worker_id", Some(serde_json::json!({"error": e.to_string()}))))?;
         delete_worker(Path(worker_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        json_result(&serde_json::json!({"worker_id": worker_id, "retired": true}))
+        Ok(rmcp::Json(WorkerRetiredOutput { worker_id, retired: true }))
     }
 }
 
@@ -568,12 +600,6 @@ fn api_to_mcp((status, message): crate::ApiError) -> McpError {
     )
 }
 
-fn json_result(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +620,19 @@ mod tests {
             model_refresh_requests: Default::default(),
         });
         LazyTeamMcp::new(state)
+    }
+
+    #[tokio::test]
+    async fn every_mcp_tool_advertises_output_schema() {
+        let mcp = test_mcp();
+        let missing = mcp
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|tool| tool.output_schema.is_none())
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "MCP tools missing outputSchema: {missing:?}");
     }
 
     #[tokio::test]
