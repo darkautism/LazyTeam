@@ -73,6 +73,306 @@ fn tool_stalled(last_progress: Instant, now: Instant, window: Duration) -> bool 
     now.saturating_duration_since(last_progress) >= window
 }
 
+const MAX_TOOL_NAME_LEN: usize = 32;
+const MAX_TOOL_CALL_ID_LEN: usize = 64;
+const MAX_PROGRAM_LEN: usize = 32;
+const MAX_COMMAND_SUMMARY_LEN: usize = 80;
+const MAX_FINGERPRINT_BYTES: usize = 4096;
+
+/// Bounded safe diagnostics for the currently active Pi tool call.
+///
+/// Only fixed-vocabulary labels, sanitized identifiers, counts, durations,
+/// and a stable hash are retained. Raw tool arguments, command payload text,
+/// credentials, and transcripts are never stored here or in any durable
+/// watchdog message built from this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveToolState {
+    name: String,
+    call_id: Option<String>,
+    started_at: Instant,
+    last_progress_at: Instant,
+    update_count: u64,
+    args_available: bool,
+    command_class: String,
+    program: Option<String>,
+    command_summary: String,
+    fingerprint: String,
+}
+
+impl ActiveToolState {
+    fn name_label(&self) -> &str {
+        &self.name
+    }
+}
+
+fn sanitize_label(raw: &str, max_len: usize) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        .take(max_len)
+        .collect();
+    if filtered.is_empty() {
+        "unknown".to_string()
+    } else {
+        filtered
+    }
+}
+
+fn fnv1a64_hex_tool(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn extract_tool_name(event: &Value) -> String {
+    let raw = event
+        .get("toolName")
+        .or_else(|| event.get("tool_name"))
+        .or_else(|| event.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    sanitize_label(raw.trim(), MAX_TOOL_NAME_LEN)
+}
+
+fn extract_tool_call_id(event: &Value) -> Option<String> {
+    const KEYS: &[&str] = &["toolCallId", "tool_call_id", "callId", "call_id", "toolUseId", "tool_use_id"];
+    for key in KEYS {
+        if let Some(raw) = event.get(*key).and_then(Value::as_str) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(sanitize_label(trimmed, MAX_TOOL_CALL_ID_LEN));
+            }
+        }
+    }
+    for container in ["toolCall", "tool_call", "toolUse", "tool_use", "data"] {
+        if let Some(obj) = event.get(container).and_then(Value::as_object) {
+            for key in KEYS {
+                if let Some(raw) = obj.get(*key).and_then(Value::as_str) {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        return Some(sanitize_label(trimmed, MAX_TOOL_CALL_ID_LEN));
+                    }
+                }
+            }
+            if let Some(raw) = obj.get("id").and_then(Value::as_str) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() && container != "data" {
+                    return Some(sanitize_label(trimmed, MAX_TOOL_CALL_ID_LEN));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Locate the tool-argument payload without cloning raw content into durable
+/// state. Returns `None` when the Pi RPC event schema exposes no arguments.
+fn tool_args_value(event: &Value) -> Option<&Value> {
+    const KEYS: &[&str] = &["input", "args", "arguments", "params", "parameters", "toolInput", "tool_input"];
+    for key in KEYS {
+        if let Some(value) = event.get(*key) {
+            if !is_null_like(value) {
+                return Some(value);
+            }
+        }
+    }
+    for container in ["toolCall", "tool_call", "toolUse", "tool_use", "data"] {
+        if let Some(obj) = event.get(container).and_then(Value::as_object) {
+            for key in KEYS {
+                if let Some(value) = obj.get(*key) {
+                    if !is_null_like(value) {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+    }
+    // Some schemas inline the command beside the tool name on tool events.
+    // Only treated as args for tool execution events (never for get_state
+    // responses, which also use a `command` key for the RPC method name).
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("tool_execution_start") | Some("tool_execution_update")
+    ) {
+        if let Some(value) = event.get("command") {
+            if value.is_string() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn is_null_like(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+/// Extract a bounded raw command string for classification only. The returned
+/// string is used transiently to derive a redacted class/program/hash and is
+/// never persisted itself.
+fn raw_command_from_args(args: &Value, event: &Value) -> Option<String> {
+    if let Some(s) = args.as_str() {
+        return bounded_raw_command(s);
+    }
+    if let Some(obj) = args.as_object() {
+        for key in ["command", "cmd", "script", "code", "text", "input"] {
+            if let Some(s) = obj.get(key).and_then(Value::as_str) {
+                if let Some(cmd) = bounded_raw_command(s) {
+                    return Some(cmd);
+                }
+            }
+        }
+    }
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("tool_execution_start") | Some("tool_execution_update")
+    ) {
+        if let Some(s) = event.get("command").and_then(Value::as_str) {
+            return bounded_raw_command(s);
+        }
+    }
+    None
+}
+
+fn bounded_raw_command(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bounded: String = trimmed.chars().take(MAX_FINGERPRINT_BYTES).collect();
+    if bounded.is_empty() { None } else { Some(bounded) }
+}
+
+fn first_shell_token(raw: &str) -> Option<String> {
+    let mut tokens = raw
+        .split([ ' ', '\t', '\n', ';', '&', '|', '(', ')', '\\'])
+        .filter(|t| !t.trim().is_empty());
+    // Skip common shell wrappers so `sudo cargo test` still reports cargo.
+    for _ in 0..3 {
+        let Some(token) = tokens.next() else { return None };
+        let cleaned = token.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+        let lower = cleaned.to_ascii_lowercase();
+        if matches!(lower.as_str(), "sudo" | "env" | "time" | "nice" | "stdbuf" | "sh" | "bash") {
+            // `env FOO=bar cargo ...` carries assignments as extra wrappers.
+            continue;
+        }
+        if cleaned.contains('=') && !cleaned.contains('/') {
+            continue;
+        }
+        // Basename so `/usr/bin/cargo` still classifies as cargo.
+        let base = cleaned.rsplit('/').next().unwrap_or(cleaned);
+        if base.is_empty() {
+            continue;
+        }
+        return Some(base.to_string());
+    }
+    None
+}
+
+fn second_shell_token(raw: &str) -> Option<String> {
+    let mut parts = raw.split_whitespace();
+    let _ = parts.next()?;
+    for token in parts {
+        let cleaned = token.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+        if cleaned.is_empty() || cleaned.starts_with('-') || cleaned.contains('=') {
+            // Skip flags/env assignments to find the real subcommand.
+            if cleaned.starts_with('-') || cleaned.contains('=') {
+                continue;
+            }
+            continue;
+        }
+        return Some(cleaned.to_ascii_lowercase());
+    }
+    None
+}
+
+fn classify_bash_command(raw: &str) -> (String, Option<String>, String) {
+    let program_raw = first_shell_token(raw).unwrap_or_default();
+    let program = if program_raw.is_empty() {
+        None
+    } else {
+        Some(sanitize_label(&program_raw.to_ascii_lowercase(), MAX_PROGRAM_LEN))
+    };
+    let sub = second_shell_token(raw).unwrap_or_default();
+    let program_label = program.as_deref().unwrap_or("unknown");
+    let class: &'static str = match (program_label, sub.as_str()) {
+        ("cargo", "test") => "cargo-test",
+        ("cargo", "check") => "cargo-check",
+        ("cargo", "build") => "cargo-build",
+        ("cargo", "clippy") => "cargo-clippy",
+        ("cargo", "fmt") => "cargo-fmt",
+        ("cargo", _) => "cargo",
+        ("git", _) => "git",
+        ("curl" | "wget", _) => "network-fetch",
+        ("ssh" | "scp" | "rsync", _) => "network-ssh",
+        ("npm" | "pnpm" | "yarn", _) => "node-build",
+        ("docker" | "podman" | "nerdctl", _) => "container",
+        ("make" | "just" | "ninja" | "cmake", _) => "build",
+        ("cargo-test" | "pytest" | "pytest-3", _) => "python-test",
+        ("python" | "python3" | "pip" | "pip3" | "uv", s) if s.contains("test") => "python-test",
+        ("python" | "python3" | "pip" | "pip3" | "uv", _) => "python",
+        ("go", _) => "go",
+        ("rustc", _) => "rustc-build",
+        ("sleep", _) => "sleep-wait",
+        ("cargo-nextest" | "nextest", _) => "cargo-test",
+        ("ls" | "cat" | "echo" | "grep" | "rg" | "fd" | "find" | "head" | "tail" | "sed" | "awk" | "jq", _) => "shell-inspect",
+        ("unknown", _) => "generic-shell",
+        _ => "generic-shell",
+    };
+    // Redacted summary carries only the safe program (+ subcommand for
+    // well-known dispatchers). All flags, paths, URLs, and payloads stay out.
+    let summary = match program.as_deref() {
+        Some(p) if matches!(p, "cargo" | "git" | "npm" | "pnpm" | "yarn" | "make" | "just" | "go" | "docker" | "podman") => {
+            if sub.is_empty() || sub.starts_with('-') {
+                p.to_string()
+            } else {
+                let safe_sub = sanitize_label(&sub, MAX_PROGRAM_LEN);
+                format!("{p} {safe_sub}")
+            }
+        }
+        Some(p) => p.to_string(),
+        None => "generic-shell".to_string(),
+    };
+    let summary = summary.chars().take(MAX_COMMAND_SUMMARY_LEN).collect::<String>();
+    (class.to_string(), program, summary)
+}
+
+/// Derive the durable bash/non-bash diagnostic from one tool event. Only
+/// fixed-vocabulary class labels, sanitized program tokens, lengths, and the
+/// stable hash leave this function; raw arguments never do.
+fn derive_tool_command(tool_name: &str, event: &Value) -> (bool, String, Option<String>, String, String) {
+    let Some(args) = tool_args_value(event) else {
+        return (false, "args-unavailable".to_string(), None, "args-unavailable".to_string(), "none".to_string());
+    };
+    if tool_name == "bash" {
+        match raw_command_from_args(args, event) {
+            Some(raw) => {
+                let fingerprint = fnv1a64_hex_tool(raw.as_bytes());
+                let (class, program, summary) = classify_bash_command(&raw);
+                (true, class, program, summary, fingerprint)
+            }
+            None => {
+                // Args were exposed but carried no recognizable command string.
+                let serialized = serde_json::to_string(args).unwrap_or_default();
+                let bounded: String = serialized.chars().take(MAX_FINGERPRINT_BYTES).collect();
+                (true, "bash-no-command".to_string(), None, "bash-no-command".to_string(), fnv1a64_hex_tool(bounded.as_bytes()))
+            }
+        }
+    } else {
+        let serialized = serde_json::to_string(args).unwrap_or_default();
+        let bounded: String = serialized.chars().take(MAX_FINGERPRINT_BYTES).collect();
+        (true, "non-bash".to_string(), None, "non-bash".to_string(), fnv1a64_hex_tool(bounded.as_bytes()))
+    }
+}
+
 fn review_tool_budgets() -> (u64, u64) {
     let soft = std::env::var("LAZYTEAM_REVIEW_SOFT_TOOL_BUDGET")
         .ok()
@@ -122,7 +422,12 @@ impl RunPhase {
     }
 }
 
-fn observe_pi_activity(event: &Value, phase: &mut RunPhase, active_tool: &mut Option<String>) -> bool {
+fn observe_pi_activity(
+    event: &Value,
+    phase: &mut RunPhase,
+    active_tool: &mut Option<ActiveToolState>,
+    now: Instant,
+) -> bool {
     match event.get("type").and_then(Value::as_str) {
         Some("agent_start") | Some("turn_start") | Some("message_start") | Some("message_update") => {
             *phase = RunPhase::ModelStreaming;
@@ -133,11 +438,91 @@ fn observe_pi_activity(event: &Value, phase: &mut RunPhase, active_tool: &mut Op
             true
         }
         Some("tool_execution_start") => {
-            *active_tool = event.get("toolName").and_then(Value::as_str).map(str::to_string);
+            let name = extract_tool_name(event);
+            let call_id = extract_tool_call_id(event);
+            let (args_available, command_class, program, command_summary, fingerprint) =
+                derive_tool_command(&name, event);
+            *active_tool = Some(ActiveToolState {
+                name,
+                call_id,
+                started_at: now,
+                last_progress_at: now,
+                update_count: 0,
+                args_available,
+                command_class,
+                program,
+                command_summary,
+                fingerprint,
+            });
             *phase = RunPhase::ToolRunning;
             true
         }
         Some("tool_execution_update") => {
+            match active_tool {
+                Some(state) => {
+                    // A differently-named update resets the stall clock like a
+                    // fresh start; same-tool updates only refresh progress.
+                    let name = extract_tool_name(event);
+                    if name != "unknown" && name != state.name {
+                        let call_id = extract_tool_call_id(event).or_else(|| state.call_id.clone());
+                        let (args_available, command_class, program, command_summary, fingerprint) =
+                            derive_tool_command(&name, event);
+                        let args_available = if event.get("toolName").is_none() && tool_args_value(event).is_none() {
+                            state.args_available
+                        } else {
+                            args_available
+                        };
+                        *state = ActiveToolState {
+                            name,
+                            call_id,
+                            started_at: now,
+                            last_progress_at: now,
+                            update_count: 0,
+                            args_available,
+                            command_class: if args_available { command_class } else { state.command_class.clone() },
+                            program: if args_available { program } else { state.program.clone() },
+                            command_summary: if args_available { command_summary } else { state.command_summary.clone() },
+                            fingerprint: if args_available { fingerprint } else { state.fingerprint.clone() },
+                        };
+                    } else {
+                        state.last_progress_at = now;
+                        state.update_count += 1;
+                        // An update may be the first event to expose arguments.
+                        if !state.args_available {
+                            if tool_args_value(event).is_some() {
+                                let (args_available, command_class, program, command_summary, fingerprint) =
+                                    derive_tool_command(&state.name.clone(), event);
+                                state.args_available = args_available;
+                                state.command_class = command_class;
+                                state.program = program;
+                                state.command_summary = command_summary;
+                                state.fingerprint = fingerprint;
+                            }
+                        }
+                        if state.call_id.is_none() {
+                            state.call_id = extract_tool_call_id(event);
+                        }
+                    }
+                }
+                None => {
+                    let name = extract_tool_name(event);
+                    let call_id = extract_tool_call_id(event);
+                    let (args_available, command_class, program, command_summary, fingerprint) =
+                        derive_tool_command(&name, event);
+                    *active_tool = Some(ActiveToolState {
+                        name,
+                        call_id,
+                        started_at: now,
+                        last_progress_at: now,
+                        update_count: 1,
+                        args_available,
+                        command_class,
+                        program,
+                        command_summary,
+                        fingerprint,
+                    });
+                }
+            }
             *phase = RunPhase::ToolRunning;
             true
         }
@@ -190,6 +575,32 @@ fn pi_state_probe_active(event: &Value, phase: RunPhase, active_tool: Option<&st
             || active_tool.is_some()
             || matches!(phase, RunPhase::ToolRunning | RunPhase::Compacting | RunPhase::ProviderRetry),
     )
+}
+
+fn active_tool_name(state: &Option<ActiveToolState>) -> Option<&str> {
+    state.as_ref().map(|s| s.name.as_str())
+}
+
+/// Durable stall diagnostic. Emits only bounded sanitized identifiers,
+/// fixed-vocabulary class labels, counts, durations, and the stable hash —
+/// never raw arguments, command payloads, or transcripts.
+fn format_tool_diagnostic(state: &ActiveToolState, now: Instant) -> String {
+    let started_ago = now.saturating_duration_since(state.started_at).as_secs();
+    let idle_for = now.saturating_duration_since(state.last_progress_at).as_secs();
+    let call_id = state.call_id.as_deref().unwrap_or("none");
+    let program = state.program.as_deref().unwrap_or("none");
+    let args = if state.args_available { "available" } else { "unavailable" };
+    format!(
+        "tool={} call_id={} updates={} started_ago={}s idle={}s class={} program={} summary='{}' fingerprint={} args={}",
+        state.name, call_id, state.update_count, started_ago, idle_for, state.command_class, program, state.command_summary, state.fingerprint, args,
+    )
+}
+
+fn format_tool_brief(state: &Option<ActiveToolState>, now: Instant) -> String {
+    match state {
+        Some(s) => format_tool_diagnostic(s, now),
+        None => "tool=none".to_string(),
+    }
 }
 
 async fn abort_pi_run(
@@ -321,8 +732,7 @@ impl PiRuntime {
         let max_inactive_probes = watchdog_max_inactive_probes();
         let tool_stall_window = watchdog_tool_stall_window();
         let mut phase = RunPhase::Starting;
-        let mut active_tool: Option<String> = None;
-        let mut tool_progress_at: Option<Instant> = None;
+        let mut active_tool: Option<ActiveToolState> = None;
         let mut next_probe_at = Instant::now() + probe_interval;
         let mut probe_deadline: Option<Instant> = None;
         let mut missed_probes = 0u32;
@@ -344,19 +754,20 @@ impl PiRuntime {
                     let now = Instant::now();
                     if probe_deadline.take().is_some() {
                         missed_probes += 1;
+                        let tool_brief = format_tool_brief(&active_tool, Instant::now());
                         tracing::warn!(
                             session = session_name,
                             phase = phase.as_str(),
-                            active_tool = active_tool.as_deref().unwrap_or("none"),
+                            active_tool = active_tool.as_ref().map(|s| s.name_label()).unwrap_or("none"),
                             missed_probes,
                             max_missed_probes,
                             "Pi harness liveness probe timed out"
                         );
                         if missed_probes >= max_missed_probes {
                             let reason = format!(
-                                "Pi harness unresponsive after {missed_probes} liveness probes; phase={} active_tool={}",
+                                "Pi harness unresponsive after {missed_probes} liveness probes; phase={} {}",
                                 phase.as_str(),
-                                active_tool.as_deref().unwrap_or("none"),
+                                tool_brief,
                             );
                             abort_pi_run(&mut child, &mut stdin).await;
                             bail!(reason);
@@ -385,18 +796,13 @@ impl PiRuntime {
             };
 
             let event_type = event.get("type").and_then(Value::as_str);
-            if observe_pi_activity(&event, &mut phase, &mut active_tool) {
+            // Tool progress is tied strictly to tool execution events.
+            // Periodic `get_state` responses refresh liveness only and must
+            // never refresh the tool stall clock (see `pi_state_probe_active`).
+            if observe_pi_activity(&event, &mut phase, &mut active_tool, Instant::now()) {
                 inactive_probes = 0;
-                match event_type {
-                    Some("tool_execution_start") | Some("tool_execution_update") => {
-                        tool_progress_at = Some(Instant::now());
-                    }
-                    Some("tool_execution_end") => tool_progress_at = None,
-                    _ if phase != RunPhase::ToolRunning => tool_progress_at = None,
-                    _ => {}
-                }
             }
-            if let Some(active) = pi_state_probe_active(&event, phase, active_tool.as_deref()) {
+            if let Some(active) = pi_state_probe_active(&event, phase, active_tool_name(&active_tool)) {
                 if active {
                     inactive_probes = 0;
                 } else {
@@ -409,9 +815,11 @@ impl PiRuntime {
                         "Pi harness responded but reports no active model, tool, compaction, retry, or queued work"
                     );
                     if inactive_probes >= max_inactive_probes {
+                        let tool_brief = format_tool_brief(&active_tool, Instant::now());
                         let reason = format!(
-                            "Pi harness stayed inactive for {inactive_probes} consecutive state probes; phase={}",
+                            "Pi harness stayed inactive for {inactive_probes} consecutive state probes; phase={} {}",
                             phase.as_str(),
+                            tool_brief,
                         );
                         abort_pi_run(&mut child, &mut stdin).await;
                         bail!(reason);
@@ -420,22 +828,24 @@ impl PiRuntime {
             }
 
             if phase == RunPhase::ToolRunning {
-                if let Some(last_progress) = tool_progress_at {
+                if let Some(state) = active_tool.as_ref() {
                     let now = Instant::now();
-                    if tool_stalled(last_progress, now, tool_stall_window) {
-                        let stalled_for = now.saturating_duration_since(last_progress);
-                        let tool = active_tool.as_deref().unwrap_or("unknown");
+                    if tool_stalled(state.last_progress_at, now, tool_stall_window) {
+                        let stalled_for = now.saturating_duration_since(state.last_progress_at);
+                        let diagnostic = format_tool_diagnostic(state, now);
                         tracing::warn!(
                             session = session_name,
-                            active_tool = tool,
+                            active_tool = state.name_label(),
                             stalled_for_secs = stalled_for.as_secs(),
                             stall_limit_secs = tool_stall_window.as_secs(),
                             "Pi tool produced no observable progress; aborting stalled tool run"
                         );
                         let reason = format!(
-                            "Pi tool '{tool}' produced no observable progress for {}s (limit {}s)",
+                            "Pi tool '{}' produced no observable progress for {}s (limit {}s); {}",
+                            state.name,
                             stalled_for.as_secs(),
                             tool_stall_window.as_secs(),
+                            diagnostic,
                         );
                         abort_pi_run(&mut child, &mut stdin).await;
                         bail!(reason);
@@ -719,35 +1129,184 @@ mod tests {
     #[test]
     fn harness_activity_tracks_tool_compaction_and_retry_phases() {
         let mut phase = RunPhase::Starting;
-        let mut tool = None;
+        let mut tool: Option<ActiveToolState> = None;
+        let now = Instant::now();
 
-        assert!(observe_pi_activity(&json!({"type":"message_update"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"message_update"}), &mut phase, &mut tool, now));
         assert_eq!(phase, RunPhase::ModelStreaming);
 
         assert!(observe_pi_activity(
             &json!({"type":"tool_execution_start","toolName":"bash"}),
             &mut phase,
             &mut tool,
+            now,
         ));
         assert_eq!(phase, RunPhase::ToolRunning);
-        assert_eq!(tool.as_deref(), Some("bash"));
+        assert_eq!(tool.as_ref().map(|s| s.name.as_str()), Some("bash"));
 
-        assert!(observe_pi_activity(&json!({"type":"tool_execution_update"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"tool_execution_update"}), &mut phase, &mut tool, now));
         assert_eq!(phase, RunPhase::ToolRunning);
+        assert_eq!(tool.as_ref().map(|s| s.update_count), Some(1));
 
-        assert!(observe_pi_activity(&json!({"type":"tool_execution_end"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"tool_execution_end"}), &mut phase, &mut tool, now));
         assert_eq!(phase, RunPhase::ModelWaiting);
         assert!(tool.is_none());
 
-        assert!(observe_pi_activity(&json!({"type":"compaction_start"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"compaction_start"}), &mut phase, &mut tool, now));
         assert_eq!(phase, RunPhase::Compacting);
-        assert!(observe_pi_activity(&json!({"type":"compaction_end"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"compaction_end"}), &mut phase, &mut tool, now));
         assert_eq!(phase, RunPhase::ModelWaiting);
 
-        assert!(observe_pi_activity(&json!({"type":"auto_retry_start"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"auto_retry_start"}), &mut phase, &mut tool, now));
         assert_eq!(phase, RunPhase::ProviderRetry);
-        assert!(observe_pi_activity(&json!({"type":"auto_retry_end"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"auto_retry_end"}), &mut phase, &mut tool, now));
         assert_eq!(phase, RunPhase::ModelWaiting);
+    }
+
+    #[test]
+    fn silent_bash_tool_preserves_timing_and_call_identity() {
+        let mut phase = RunPhase::Starting;
+        let mut tool: Option<ActiveToolState> = None;
+        let start = Instant::now();
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"bash","toolCallId":"call-silent-1"}),
+            &mut phase,
+            &mut tool,
+            start,
+        ));
+        let state = tool.as_ref().expect("active bash tool");
+        assert_eq!(state.name, "bash");
+        assert_eq!(state.call_id.as_deref(), Some("call-silent-1"));
+        assert_eq!(state.update_count, 0);
+        assert_eq!(state.started_at, start);
+        assert_eq!(state.last_progress_at, start);
+        // No args exposed by this schema shape: record that explicitly while
+        // still preserving timing/update-count/call-id evidence.
+        assert!(!state.args_available);
+        assert_eq!(state.command_class, "args-unavailable");
+        let diagnostic = format_tool_diagnostic(state, start + Duration::from_secs(30 * 60));
+        assert!(diagnostic.contains("tool=bash"));
+        assert!(diagnostic.contains("call_id=call-silent-1"));
+        assert!(diagnostic.contains("updates=0"));
+        assert!(diagnostic.contains("args=unavailable"));
+        assert!(diagnostic.contains("args-unavailable"));
+    }
+
+    #[test]
+    fn updating_bash_tool_counts_progress_for_stall_clock() {
+        let mut phase = RunPhase::Starting;
+        let mut tool: Option<ActiveToolState> = None;
+        let start = Instant::now();
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"bash","toolCallId":"call-live-1","input":{"command":"cargo test --locked"}}),
+            &mut phase,
+            &mut tool,
+            start,
+        ));
+        assert_eq!(tool.as_ref().map(|s| s.command_class.as_str()), Some("cargo-test"));
+        assert_eq!(tool.as_ref().and_then(|s| s.program.as_deref()), Some("cargo"));
+        let later = start + Duration::from_secs(10 * 60);
+        assert!(observe_pi_activity(&json!({"type":"tool_execution_update","toolName":"bash"}), &mut phase, &mut tool, later));
+        let state = tool.as_ref().expect("active bash tool");
+        assert_eq!(state.update_count, 1);
+        assert_eq!(state.last_progress_at, later);
+        // Periodic progress keeps the stall clock fresh.
+        assert!(!tool_stalled(state.last_progress_at, start + Duration::from_secs(35 * 60), Duration::from_secs(30 * 60)));
+        // Silence past the window still stalls.
+        assert!(tool_stalled(state.last_progress_at, later + Duration::from_secs(31 * 60), Duration::from_secs(30 * 60)));
+    }
+
+    #[test]
+    fn non_bash_tool_uses_non_bash_class() {
+        let mut phase = RunPhase::Starting;
+        let mut tool: Option<ActiveToolState> = None;
+        let now = Instant::now();
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"read","toolCallId":"call-read-1","input":{"path":"src/main.rs"}}),
+            &mut phase,
+            &mut tool,
+            now,
+        ));
+        let state = tool.as_ref().expect("active tool");
+        assert_eq!(state.name, "read");
+        assert_eq!(state.command_class, "non-bash");
+        assert!(state.args_available);
+        let diagnostic = format_tool_diagnostic(state, now);
+        assert!(diagnostic.contains("class=non-bash"));
+        assert!(!diagnostic.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn secret_bearing_bash_args_never_appear_in_durable_diagnostic() {
+        let secret = "ghp_super_secret_token_abc123";
+        let password = "s3cr3t-p4ssw0rd-value";
+        let mut phase = RunPhase::Starting;
+        let mut tool: Option<ActiveToolState> = None;
+        let now = Instant::now();
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"bash","toolCallId":"call-secret-1","input":{"command": format!("cargo test --token {secret} --password {password}")}}),
+            &mut phase,
+            &mut tool,
+            now,
+        ));
+        let state = tool.as_ref().expect("active bash tool");
+        assert_eq!(state.command_class, "cargo-test");
+        assert_eq!(state.program.as_deref(), Some("cargo"));
+        let diagnostic = format_tool_diagnostic(state, now);
+        assert!(diagnostic.contains("cargo-test"));
+        assert!(!diagnostic.contains(secret));
+        assert!(!diagnostic.contains(password));
+        // Stable fingerprint lets operators correlate without raw content.
+        assert!(diagnostic.contains(&state.fingerprint));
+        assert_eq!(state.fingerprint.len(), 16);
+        // Same command always yields the same fingerprint.
+        let (_, _, _, _, again) = derive_tool_command("bash", &json!({"input": {"command": format!("cargo test --token {secret} --password {password}")}}));
+        assert_eq!(again, state.fingerprint);
+    }
+
+    #[test]
+    fn bash_command_classes_cover_expected_families() {
+        let (class, program, summary) = classify_bash_command("cargo check --locked");
+        assert_eq!(class, "cargo-check");
+        assert_eq!(program.as_deref(), Some("cargo"));
+        assert_eq!(summary, "cargo check");
+        let (class, _, _) = classify_bash_command("git fetch origin main");
+        assert_eq!(class, "git");
+        let (class, _, _) = classify_bash_command("curl https://example.com/pkg.tar.gz");
+        assert_eq!(class, "network-fetch");
+        let (class, _, _) = classify_bash_command("sleep 900");
+        assert_eq!(class, "sleep-wait");
+        // Redacted summaries never carry URLs, flags, or payloads.
+        let (_, _, summary) = classify_bash_command("curl https://example.com/secret?token=abc --retry 5");
+        assert_eq!(summary, "curl");
+        assert!(!summary.contains("example.com"));
+    }
+
+    #[test]
+    fn state_probe_responses_are_not_tool_progress() {
+        let mut phase = RunPhase::Starting;
+        let mut tool: Option<ActiveToolState> = None;
+        let start = Instant::now();
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"bash","toolCallId":"call-probe-1","input":{"command":"cargo test"}}),
+            &mut phase,
+            &mut tool,
+            start,
+        ));
+        let progress_before = tool.as_ref().expect("active tool").last_progress_at;
+        let updates_before = tool.as_ref().expect("active tool").update_count;
+        let probe = json!({
+            "type":"response",
+            "command":"get_state",
+            "success":true,
+            "data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0}
+        });
+        assert!(!observe_pi_activity(&probe, &mut phase, &mut tool, start + Duration::from_secs(60)));
+        let state = tool.as_ref().expect("active tool still tracked");
+        assert_eq!(state.last_progress_at, progress_before);
+        assert_eq!(state.update_count, updates_before);
+        // The probe still reports the tool as active for liveness purposes.
+        assert_eq!(pi_state_probe_active(&probe, phase, active_tool_name(&tool)), Some(true));
     }
 
     #[test]
