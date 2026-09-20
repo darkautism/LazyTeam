@@ -1,0 +1,3 @@
+# LazyTeam intentionally does not track the workspace root Cargo.lock.
+# Normal cargo check/test generates it; keep it from polluting task diffs.
+/Cargo.lock

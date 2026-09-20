@@ -278,6 +278,25 @@ async fn insights(
     let reviews_have_snap = column_exists(db, "reviews", "reviewer_agent_type").await
         && column_exists(db, "reviews", "reviewer_provider").await
         && column_exists(db, "reviews", "reviewer_model").await;
+    // The review-cycle epoch (migration 0018_review_cycles) pins each review
+    // row to its task's cycle at claim time. When present it is the durable
+    // source for current-cycle retries; otherwise Insights falls back to the
+    // latest-execution heuristic (or reports current-cycle as unavailable
+    // when execution_id is missing too).
+    let cycle_available = column_exists(db, "reviews", "review_cycle").await
+        && column_exists(db, "tasks", "review_cycle").await;
+    let mut task_cycles: HashMap<String, i64> = HashMap::new();
+    if cycle_available {
+        if let Ok(rows) = sqlx::query("SELECT id,review_cycle FROM tasks").fetch_all(db).await {
+            for row in rows {
+                let id: String = row.try_get("id").unwrap_or_default();
+                let cycle: i64 = row.try_get("review_cycle").unwrap_or(0);
+                if !id.is_empty() {
+                    task_cycles.insert(id, cycle);
+                }
+            }
+        }
+    }
     let execs_have_snap = column_exists(db, "executions", "worker_agent_type").await
         && column_exists(db, "executions", "worker_provider").await
         && column_exists(db, "executions", "worker_model").await;
@@ -470,13 +489,19 @@ async fn insights(
         agent_type: Option<String>,
         provider: Option<String>,
         model: Option<String>,
+        cycle: Option<i64>,
     }
-    let review_select = match (reviews_have_execution, reviews_have_snap) {
-        (true, true) => "SELECT id,task_id,execution_id,reviewer_worker_id,state,verdict,created_at,reviewer_agent_type,reviewer_provider,reviewer_model FROM reviews",
-        (true, false) => "SELECT id,task_id,execution_id,reviewer_worker_id,state,verdict,created_at FROM reviews",
-        (false, true) => "SELECT id,task_id,reviewer_worker_id,state,verdict,created_at,reviewer_agent_type,reviewer_provider,reviewer_model FROM reviews",
-        (false, false) => "SELECT id,task_id,reviewer_worker_id,state,verdict,created_at FROM reviews",
-    };
+    let mut review_cols = vec!["id", "task_id", "reviewer_worker_id", "state", "verdict", "created_at"];
+    if reviews_have_execution {
+        review_cols.push("execution_id");
+    }
+    if reviews_have_snap {
+        review_cols.extend(["reviewer_agent_type", "reviewer_provider", "reviewer_model"]);
+    }
+    if cycle_available {
+        review_cols.push("review_cycle");
+    }
+    let review_select = format!("SELECT {} FROM reviews", review_cols.join(","));
     let review_rows: Vec<ReviewRow> = if table_exists(db, "reviews").await {
         let sql = match &cutoff_str {
             Some(_) => format!("{review_select} WHERE created_at>=?"),
@@ -502,6 +527,7 @@ async fn insights(
                 agent_type: row.try_get("reviewer_agent_type").unwrap_or(None),
                 provider: row.try_get("reviewer_provider").unwrap_or(None),
                 model: row.try_get("reviewer_model").unwrap_or(None),
+                cycle: row.try_get("review_cycle").unwrap_or(None),
             })
             .collect()
     } else {
@@ -525,19 +551,44 @@ async fn insights(
         .iter()
         .filter(|r| r.state == "assigned" || r.state == "running")
         .count() as i64;
-    // Current-cycle: retry verdicts on the task's latest execution. Lifetime:
-    // retry verdicts on any execution. Unavailable when the deployment's
-    // reviews table has no execution_id column.
-    let current_cycle_available = reviews_have_execution;
+    // Current-cycle retries prefer the durable review-cycle epoch when the
+    // deployment has it (a retry counts when its pinned cycle equals the
+    // task's current cycle); otherwise they fall back to the latest-execution
+    // heuristic. Lifetime retries count every execution. Current-cycle is
+    // unavailable only when neither signal exists.
+    fn is_current_cycle(
+        task_id: &str,
+        cycle: Option<i64>,
+        execution_id: Option<&str>,
+        task_cycles: &HashMap<String, i64>,
+        cycle_available: bool,
+        latest_execution: &HashMap<String, String>,
+    ) -> bool {
+        if cycle_available {
+            if let (Some(row_cycle), Some(task_cycle)) = (cycle, task_cycles.get(task_id)) {
+                return row_cycle == *task_cycle;
+            }
+            return false;
+        }
+        execution_id.is_some_and(|exec| {
+            latest_execution.get(task_id).is_some_and(|latest| latest == exec)
+        })
+    }
+    let current_cycle_available = cycle_available || reviews_have_execution;
     let current_cycle_retries: i64 = if current_cycle_available {
         review_rows
             .iter()
             .filter(|r| {
                 r.state == "completed"
                     && parse_verdict_kind(r.verdict.as_deref()) == Some("retry")
-                    && r.execution_id.as_ref().is_some_and(|exec| {
-                        latest_execution.get(&r.task_id).is_some_and(|latest| latest == exec)
-                    })
+                    && is_current_cycle(
+                        &r.task_id,
+                        r.cycle,
+                        r.execution_id.as_deref(),
+                        &task_cycles,
+                        cycle_available,
+                        &latest_execution,
+                    )
             })
             .count() as i64
     } else {
@@ -826,12 +877,15 @@ async fn insights(
     let mut all_retries_cycle: HashMap<String, i64> = HashMap::new();
     let mut all_rounds: HashMap<String, i64> = HashMap::new();
     if table_exists(db, "reviews").await {
-        let exec_select = if reviews_have_execution {
-            "SELECT task_id,execution_id,state,verdict FROM reviews"
-        } else {
-            "SELECT task_id,state,verdict FROM reviews"
-        };
-        if let Ok(rows) = sqlx::query(exec_select).fetch_all(db).await {
+        let mut agg_cols = vec!["task_id", "state", "verdict"];
+        if reviews_have_execution {
+            agg_cols.push("execution_id");
+        }
+        if cycle_available {
+            agg_cols.push("review_cycle");
+        }
+        let agg_select = format!("SELECT {} FROM reviews", agg_cols.join(","));
+        if let Ok(rows) = sqlx::query(&agg_select).fetch_all(db).await {
             for row in rows {
                 let task_id: String = row.try_get("task_id").unwrap_or_default();
                 let state: String = row.try_get("state").unwrap_or_default();
@@ -845,10 +899,16 @@ async fn insights(
                 }
                 *all_retries_lifetime.entry(task_id.clone()).or_insert(0) += 1;
                 let exec: Option<String> = row.try_get("execution_id").unwrap_or(None);
+                let cycle: Option<i64> = row.try_get("review_cycle").unwrap_or(None);
                 if current_cycle_available
-                    && exec.as_ref().is_some_and(|e| {
-                        latest_execution.get(&task_id).is_some_and(|latest| latest == e)
-                    })
+                    && is_current_cycle(
+                        &task_id,
+                        cycle,
+                        exec.as_deref(),
+                        &task_cycles,
+                        cycle_available,
+                        &latest_execution,
+                    )
                 {
                     *all_retries_cycle.entry(task_id).or_insert(0) += 1;
                 }
@@ -941,6 +1001,8 @@ pub(crate) struct HistoryTask {
     pub(crate) project_id: String,
     pub(crate) title: String,
     pub(crate) created_at: String,
+    /// Current review-cycle epoch when the deployment records it.
+    pub(crate) review_cycle: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -976,6 +1038,8 @@ pub(crate) struct HistoryReview {
     pub(crate) agent_type: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
+    /// Cycle epoch pinned at claim time, when recorded.
+    pub(crate) review_cycle: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1018,7 +1082,12 @@ async fn task_history(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<TaskHistory>, ApiError> {
     let db = &state.db;
-    let task_row = sqlx::query("SELECT id,project_id,title,created_at FROM tasks WHERE id=?")
+    let task_select = if column_exists(db, "tasks", "review_cycle").await {
+        "SELECT id,project_id,title,created_at,review_cycle FROM tasks WHERE id=?"
+    } else {
+        "SELECT id,project_id,title,created_at FROM tasks WHERE id=?"
+    };
+    let task_row = sqlx::query(task_select)
         .bind(id.to_string())
         .fetch_optional(db)
         .await
@@ -1029,6 +1098,7 @@ async fn task_history(
         project_id: task_row.try_get("project_id").unwrap_or_default(),
         title: task_row.try_get("title").unwrap_or_default(),
         created_at: task_row.try_get("created_at").unwrap_or_default(),
+        review_cycle: task_row.try_get("review_cycle").unwrap_or(None),
     };
 
     let mut names: HashMap<String, String> = HashMap::new();
@@ -1085,15 +1155,24 @@ async fn task_history(
     let reviews_have_snap = column_exists(db, "reviews", "reviewer_agent_type").await
         && column_exists(db, "reviews", "reviewer_provider").await
         && column_exists(db, "reviews", "reviewer_model").await;
+    let history_cycle_available = column_exists(db, "reviews", "review_cycle").await;
     let mut reviews = Vec::new();
     if table_exists(db, "reviews").await {
-        let select = match (reviews_have_execution, reviews_have_snap) {
-            (true, true) => "SELECT id,execution_id,reviewer_worker_id,state,created_at,finished_at,verdict,reviewer_agent_type,reviewer_provider,reviewer_model FROM reviews WHERE task_id=? ORDER BY created_at ASC",
-            (true, false) => "SELECT id,execution_id,reviewer_worker_id,state,created_at,finished_at,verdict FROM reviews WHERE task_id=? ORDER BY created_at ASC",
-            (false, true) => "SELECT id,reviewer_worker_id,state,created_at,finished_at,verdict,reviewer_agent_type,reviewer_provider,reviewer_model FROM reviews WHERE task_id=? ORDER BY created_at ASC",
-            (false, false) => "SELECT id,reviewer_worker_id,state,created_at,finished_at,verdict FROM reviews WHERE task_id=? ORDER BY created_at ASC",
-        };
-        if let Ok(rows) = sqlx::query(select).bind(id.to_string()).fetch_all(db).await {
+        let mut hist_cols = vec!["id", "reviewer_worker_id", "state", "created_at", "finished_at", "verdict"];
+        if reviews_have_execution {
+            hist_cols.push("execution_id");
+        }
+        if reviews_have_snap {
+            hist_cols.extend(["reviewer_agent_type", "reviewer_provider", "reviewer_model"]);
+        }
+        if history_cycle_available {
+            hist_cols.push("review_cycle");
+        }
+        let select = format!(
+            "SELECT {} FROM reviews WHERE task_id=? ORDER BY created_at ASC",
+            hist_cols.join(",")
+        );
+        if let Ok(rows) = sqlx::query(&select).bind(id.to_string()).fetch_all(db).await {
             for row in rows {
                 let reviewer_id: String = row.try_get("reviewer_worker_id").unwrap_or_default();
                 reviews.push(HistoryReview {
@@ -1108,6 +1187,7 @@ async fn task_history(
                     agent_type: row.try_get("reviewer_agent_type").unwrap_or(None),
                     provider: row.try_get("reviewer_provider").unwrap_or(None),
                     model: row.try_get("reviewer_model").unwrap_or(None),
+                    review_cycle: row.try_get("review_cycle").unwrap_or(None),
                 });
             }
         }
@@ -1386,23 +1466,85 @@ mod tests {
                 .bind(exec).bind(&task_id).bind(&worker_id).bind(attempt).bind("completed").bind(&now).bind(&now)
                 .execute(&db).await.unwrap();
         }
-        // Two retries on the old cycle, none on the current cycle.
+        // Two retries pinned to cycle 0 while the task has moved to cycle 1:
+        // lifetime counts both, current-cycle counts neither. This exercises
+        // the durable review-cycle epoch (preferred over the execution
+        // heuristic whenever the deployment records it).
+        sqlx::query("UPDATE tasks SET review_cycle=1 WHERE id=?")
+            .bind(&task_id).execute(&db).await.unwrap();
+        for _ in 0..2 {
+            sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict,review_cycle) VALUES(?,?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&exec_old).bind(&reviewer_id)
+                .bind("completed").bind(&now).bind(&now)
+                .bind(r#"{"verdict":"retry","reason":"old cycle","validation":[]}"#)
+                .bind(0_i64)
+                .execute(&db).await.unwrap();
+        }
+        // One retry in the current cycle on the latest execution.
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict,review_cycle) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&exec_new).bind(&reviewer_id)
+            .bind("completed").bind(&now).bind(&now)
+            .bind(r#"{"verdict":"retry","reason":"current cycle","validation":[]}"#)
+            .bind(1_i64)
+            .execute(&db).await.unwrap();
+        let state = state_with(db);
+        let Json(body) = insights(State(state), Query(InsightsQuery { window: "all".into() }))
+            .await
+            .unwrap();
+        assert_eq!(body.reviewer_retries_lifetime, 3);
+        assert_eq!(body.reviewer_retries_current_cycle, 1);
+        assert_eq!(body.tasks[0].lifetime_retries, 3);
+        assert_eq!(body.tasks[0].current_cycle_retries, 1);
+        assert_eq!(body.tasks[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn insights_falls_back_to_execution_heuristic_without_cycle_columns() {
+        let db = memory_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for (id, role) in [(&worker_id, "worker"), (&reviewer_id, "reviewer")] {
+            sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(role).bind(role).bind("idle").bind("linux").bind("x86_64")
+                .bind(6_i64).bind("test").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        // Simulate a deployment from before the review-cycle epoch.
+        sqlx::query("DROP INDEX IF EXISTS idx_reviews_task_cycle").execute(&db).await.unwrap();
+        sqlx::query("ALTER TABLE reviews DROP COLUMN review_cycle").execute(&db).await.unwrap();
+        sqlx::query("ALTER TABLE tasks DROP COLUMN review_cycle").execute(&db).await.unwrap();
+        let exec_old = Uuid::new_v4().to_string();
+        let exec_new = Uuid::new_v4().to_string();
+        for (exec, attempt) in [(&exec_old, 1_i64), (&exec_new, 2_i64)] {
+            sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+                .bind(exec).bind(&task_id).bind(&worker_id).bind(attempt).bind("completed").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
         for _ in 0..2 {
             sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
                 .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&exec_old).bind(&reviewer_id)
                 .bind("completed").bind(&now).bind(&now)
-                .bind(r#"{"verdict":"retry","reason":"old cycle","validation":[]}"#)
+                .bind(r#"{"verdict":"retry","reason":"old attempt","validation":[]}"#)
                 .execute(&db).await.unwrap();
         }
         let state = state_with(db);
         let Json(body) = insights(State(state), Query(InsightsQuery { window: "all".into() }))
             .await
             .unwrap();
+        assert!(body.current_cycle_available);
         assert_eq!(body.reviewer_retries_lifetime, 2);
         assert_eq!(body.reviewer_retries_current_cycle, 0);
         assert_eq!(body.tasks[0].lifetime_retries, 2);
         assert_eq!(body.tasks[0].current_cycle_retries, 0);
-        assert_eq!(body.tasks[0].attempt, 2);
     }
 
     #[tokio::test]
