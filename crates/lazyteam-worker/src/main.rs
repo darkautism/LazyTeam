@@ -420,8 +420,12 @@ async fn async_main() -> anyhow::Result<()> {
             sleep(Duration::from_secs(5)).await;
             continue;
         }
-        if agent_capabilities.models.is_empty() {
-            tracing::debug!(active = active_jobs.len(), "worker has no usable Pi models yet; not claiming new work");
+        if !can_claim_work(&runtime_config.agent, &agent_capabilities) {
+            if agent_capabilities.models.is_empty() {
+                tracing::debug!(active = active_jobs.len(), "worker has no usable Pi models yet; not claiming new work");
+            } else {
+                tracing::debug!(active = active_jobs.len(), "worker has no Host provider/model selection yet; not claiming new work");
+            }
             sleep(Duration::from_secs(if active_jobs.is_empty() { 3 } else { 1 })).await;
             continue;
         }
@@ -784,6 +788,21 @@ async fn poll_agent_auth(client: &Client, server: &str, credential: &str, worker
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/agent-auth")), credential).send().await?;
     if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
     Ok(Some(ensure_success(response).await?.json().await?))
+}
+
+/// The Host-owned agent selection is claim-eligible only when both provider and
+/// model are configured. A nonempty Pi capability catalog alone must never make
+/// the worker eligible: without an explicit Host selection the worker stays idle
+/// so the server never assigns work that would launch Pi with backend defaults.
+fn host_agent_selection_ready(agent: &AgentConfig) -> bool {
+    agent.provider.as_ref().is_some_and(|provider| !provider.trim().is_empty())
+        && agent.model.as_ref().is_some_and(|model| !model.trim().is_empty())
+}
+
+/// Combined claim eligibility for implementation and review slots: a usable Pi
+/// model catalog plus a fully configured Host-owned agent selection.
+fn can_claim_work(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
+    !capabilities.models.is_empty() && host_agent_selection_ready(agent)
 }
 
 /// Build the slot runtime exclusively from the Host-owned agent selection.
@@ -1379,6 +1398,7 @@ async fn persist_worker_credential(dir: &Path, credential: &str) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lazyteam_core::AgentModel;
 
     #[test]
     fn runtime_config_defaults_legacy_server_to_one_slot() {
@@ -1424,6 +1444,75 @@ mod tests {
         assert_eq!(runtime.provider, None);
         assert_eq!(runtime.model, None);
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    fn nonempty_catalog() -> AgentCapabilities {
+        AgentCapabilities {
+            models: vec![AgentModel {
+                provider: "catalog-provider".into(),
+                id: "catalog-model".into(),
+                name: None,
+                context_window: None,
+                reasoning: false,
+                cost: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn worker_stays_idle_without_host_agent_selection() {
+        let catalog = nonempty_catalog();
+        let unselected = AgentConfig {
+            agent_type: "pi".into(),
+            provider: None,
+            model: None,
+            initial_prompt: "prompt".into(),
+        };
+        // Nonempty Pi catalog with null Host selection must not become eligible.
+        assert!(!can_claim_work(&unselected, &catalog));
+        assert!(!can_claim_work(&unselected, &AgentCapabilities::default()));
+        let half_selected = AgentConfig {
+            agent_type: "pi".into(),
+            provider: Some("host-provider".into()),
+            model: None,
+            initial_prompt: "prompt".into(),
+        };
+        assert!(!can_claim_work(&half_selected, &catalog));
+        let selected = AgentConfig {
+            agent_type: "pi".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        };
+        assert!(can_claim_work(&selected, &catalog));
+        assert!(!can_claim_work(&selected, &AgentCapabilities::default()));
+    }
+
+    #[test]
+    fn host_agent_selection_requires_nonblank_provider_and_model() {
+        let selected = AgentConfig {
+            agent_type: "pi".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        };
+        assert!(host_agent_selection_ready(&selected));
+        for (provider, model) in [
+            (None, None),
+            (Some("host-provider"), None),
+            (None, Some("host-model")),
+            (Some(""), Some("host-model")),
+            (Some("host-provider"), Some("   ")),
+        ] {
+            let agent = AgentConfig {
+                agent_type: "pi".into(),
+                provider: provider.map(str::to_string),
+                model: model.map(str::to_string),
+                initial_prompt: "prompt".into(),
+            };
+            assert!(!host_agent_selection_ready(&agent));
+        }
     }
 
     #[test]
