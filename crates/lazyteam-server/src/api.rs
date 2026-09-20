@@ -14,7 +14,7 @@ use lazyteam_core::{
     AgentRole, Assignment, ContributorIdentity, Execution, ExecutionResult, ExecutionState, GitAuthConfig,
     GitAuthMode, GitCredential, Project, ReviewAssignment, ReviewCheckout as WorkerReviewCheckout, ReviewLease,
     ReviewVerdict, ReviewVerdictKind, Tags, Task, TaskState, Worker,
-    WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT, LEASE_CAPABILITY_HEADER,
+    WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT, LEGACY_DEFAULT_REVIEWER_PROMPT, LEASE_CAPABILITY_HEADER,
     MANAGED_CAPABILITY_IDS,
 };
 use rmcp::schemars::JsonSchema;
@@ -28,8 +28,10 @@ use uuid::Uuid;
 pub(crate) const PROTOCOL_VERSION: u32 = 6;
 const DEFAULT_LEASE_SECONDS: i64 = 120;
 const DEFAULT_SESSION_AFFINITY_SECONDS: i64 = 15 * 60;
-const REVIEW_FAILURE_LIMIT: i64 = 3;
-const REVIEW_RETRY_LIMIT: i64 = 3;
+const DEFAULT_REVIEW_FAILURE_LIMIT: i64 = 3;
+const DEFAULT_REVIEW_RETRY_LIMIT: i64 = 3;
+const MIN_REVIEW_LIMIT: i64 = 1;
+const MAX_REVIEW_LIMIT: i64 = 50;
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
 
 pub(crate) type ApiError = (StatusCode, String);
@@ -50,6 +52,20 @@ pub(crate) struct PendingAgentAuth {
     id: Uuid,
     provider: String,
     api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub(crate) struct HostSettings {
+    pub(crate) review_retry_limit: i64,
+    pub(crate) review_failure_limit: i64,
+    pub(crate) task_lease_seconds: i64,
+    pub(crate) session_affinity_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateHostSettings {
+    review_retry_limit: Option<i64>,
+    review_failure_limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -408,6 +424,7 @@ struct GitProbeResult {
 pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
+        .route("/api/settings", get(get_host_settings).patch(update_host_settings))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/{id}", axum::routing::patch(update_project).delete(delete_project))
         .route("/api/projects/{id}/git-probe", post(probe_project_git))
@@ -439,6 +456,47 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
 }
 
 async fn health() -> &'static str { "ok" }
+
+async fn load_host_settings(db: &SqlitePool) -> Result<HostSettings, ApiError> {
+    let row = sqlx::query("SELECT review_retry_limit,review_failure_limit FROM host_settings WHERE id=1")
+        .fetch_optional(db).await.map_err(db_error)?;
+    let (review_retry_limit, review_failure_limit) = if let Some(row) = row {
+        (
+            row.try_get::<i64,_>("review_retry_limit").map_err(internal)?,
+            row.try_get::<i64,_>("review_failure_limit").map_err(internal)?,
+        )
+    } else {
+        (DEFAULT_REVIEW_RETRY_LIMIT, DEFAULT_REVIEW_FAILURE_LIMIT)
+    };
+    Ok(HostSettings {
+        review_retry_limit,
+        review_failure_limit,
+        task_lease_seconds: DEFAULT_LEASE_SECONDS,
+        session_affinity_seconds: session_affinity_seconds(),
+    })
+}
+
+async fn get_host_settings(State(state): State<Arc<AppState>>) -> ApiResult<HostSettings> {
+    load_host_settings(&state.db).await.map(Json)
+}
+
+async fn update_host_settings(State(state): State<Arc<AppState>>, Json(input): Json<UpdateHostSettings>) -> ApiResult<HostSettings> {
+    let current = load_host_settings(&state.db).await?;
+    let review_retry_limit = input.review_retry_limit.unwrap_or(current.review_retry_limit);
+    let review_failure_limit = input.review_failure_limit.unwrap_or(current.review_failure_limit);
+    for (name, value) in [
+        ("review_retry_limit", review_retry_limit),
+        ("review_failure_limit", review_failure_limit),
+    ] {
+        if !(MIN_REVIEW_LIMIT..=MAX_REVIEW_LIMIT).contains(&value) {
+            return Err((StatusCode::BAD_REQUEST, format!("{name} must be between {MIN_REVIEW_LIMIT} and {MAX_REVIEW_LIMIT}")));
+        }
+    }
+    sqlx::query("INSERT INTO host_settings(id,review_retry_limit,review_failure_limit,updated_at) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET review_retry_limit=excluded.review_retry_limit,review_failure_limit=excluded.review_failure_limit,updated_at=excluded.updated_at")
+        .bind(review_retry_limit).bind(review_failure_limit).bind(ts(Utc::now()))
+        .execute(&state.db).await.map_err(db_error)?;
+    load_host_settings(&state.db).await.map(Json)
+}
 
 async fn worker_capability_catalog() -> Json<Vec<ManagedCapabilityOption>> {
     Json(MANAGED_CAPABILITY_IDS.iter().filter_map(|id| {
@@ -1271,6 +1329,7 @@ async fn renew_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
 }
 
 async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(input): Json<FinishReview>) -> Result<StatusCode, ApiError> {
+    let settings = load_host_settings(&state.db).await?;
     let now = Utc::now();
     let mut tx = state.db.begin().await.map_err(db_error)?;
     let row = sqlx::query("SELECT task_id,execution_id,reviewer_worker_id,lease_capability_hash FROM reviews WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
@@ -1299,9 +1358,9 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
             .bind(ts(now)).bind(json(&serde_json::json!({"error": error}))?).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         let failed_reviews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
             .bind(&task_id).bind(&execution_id).fetch_one(&mut *tx).await.map_err(db_error)?;
-        if review_failures_exhausted(failed_reviews) {
+        if review_failures_exhausted(failed_reviews, settings.review_failure_limit) {
             let feedback = format!(
-                "Reviewer runtime failed {failed_reviews} times for this implementation; automatic review retries stopped. Last error: {error}"
+                "Reviewer runtime failed {failed_reviews} times for this implementation; automatic review retries stopped at limit {}. Last error: {error}", settings.review_failure_limit
             );
             sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
                 .bind(feedback).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
@@ -1329,9 +1388,9 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
                     "SELECT COUNT(*) FROM reviews WHERE task_id=? AND state='completed' AND (verdict LIKE '%\"verdict\":\"retry\"%' OR verdict LIKE '%\"verdict\": \"retry\"%')"
                 )
                     .bind(&task_id).fetch_one(&mut *tx).await.map_err(db_error)?;
-                if review_retries_exhausted(reviewer_retries) {
+                if review_retries_exhausted(reviewer_retries, settings.review_retry_limit) {
                     let feedback = format!(
-                        "Reviewer requested implementation changes {reviewer_retries} times; automatic redispatch stopped at loop limit {REVIEW_RETRY_LIMIT}. Last feedback: {reason}"
+                        "Reviewer requested implementation changes {reviewer_retries} times; automatic redispatch stopped at loop limit {}. Last feedback: {reason}", settings.review_retry_limit
                     );
                     sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
                         .bind(feedback).bind(implementation_worker_id).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
@@ -1774,6 +1833,8 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, ApiError> 
 fn worker_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Worker, ApiError> {
     let state: String = row.try_get("state").map_err(internal)?;
     let initial_prompt: String = row.try_get("initial_prompt").map_err(internal)?;
+    let role = agent_role(row.try_get("role").map_err(internal)?)?;
+    let initial_prompt = resolved_initial_prompt(&role, initial_prompt);
     let capabilities_raw: String = row.try_get("agent_capabilities").map_err(internal)?;
     let capabilities = serde_json::from_str::<AgentCapabilities>(&capabilities_raw).unwrap_or_default();
     let os: String = row.try_get("os").map_err(internal)?;
@@ -1784,7 +1845,7 @@ fn worker_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Worker, ApiError> {
     let system_tags = Tags::from([("os".into(), os.clone()), ("arch".into(), arch.clone())]);
     let tags = effective_worker_tags(&os, &arch, &user_tags, &managed_capabilities, &installed_capabilities);
     Ok(Worker { id: uuid(row.try_get("id").map_err(internal)?)?, name: row.try_get("name").map_err(internal)?,
-        role: agent_role(row.try_get("role").map_err(internal)?)?,
+        role,
         state: match state.as_str() { "busy" => WorkerState::Busy, "pending" => WorkerState::Pending, "draining" => WorkerState::Draining, "degraded" => WorkerState::Degraded, "offline" => WorkerState::Offline, _ => WorkerState::Idle },
         os, arch, system_tags, user_tags, managed_capabilities, installed_capabilities,
         capability_error: row.try_get("capability_error").map_err(internal)?,
@@ -1797,7 +1858,7 @@ fn worker_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Worker, ApiError> {
             agent_type: row.try_get("agent_type").map_err(internal)?,
             provider: row.try_get("agent_provider").map_err(internal)?,
             model: row.try_get("agent_model").map_err(internal)?,
-            initial_prompt: if initial_prompt.trim().is_empty() { DEFAULT_WORKER_PROMPT.into() } else { initial_prompt },
+            initial_prompt,
         },
         agent_capabilities: capabilities })
 }
@@ -1816,6 +1877,19 @@ fn execution_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Execution, ApiErr
         finished_at: row.try_get::<Option<String>,_>("finished_at").map_err(internal)?.map(datetime).transpose()?,
         result: result.map(dejson).transpose()?,
     })
+}
+
+fn resolved_initial_prompt(role: &AgentRole, initial_prompt: String) -> String {
+    if initial_prompt.trim().is_empty() {
+        return match role {
+            AgentRole::Worker => DEFAULT_WORKER_PROMPT.into(),
+            AgentRole::Reviewer => DEFAULT_REVIEWER_PROMPT.into(),
+        };
+    }
+    if matches!(role, AgentRole::Reviewer) && initial_prompt == LEGACY_DEFAULT_REVIEWER_PROMPT {
+        return DEFAULT_REVIEWER_PROMPT.into();
+    }
+    initial_prompt
 }
 
 fn agent_role_str(role: &AgentRole) -> &'static str {
@@ -1847,12 +1921,12 @@ fn db_conflict(error: sqlx::Error) -> ApiError {
     if matches!(error, sqlx::Error::Database(ref e) if e.is_unique_violation()) { (StatusCode::CONFLICT, error.to_string()) } else { db_error(error) }
 }
 
-fn review_failures_exhausted(failed_reviews: i64) -> bool {
-    failed_reviews >= REVIEW_FAILURE_LIMIT
+fn review_failures_exhausted(failed_reviews: i64, limit: i64) -> bool {
+    failed_reviews >= limit
 }
 
-fn review_retries_exhausted(reviewer_retries: i64) -> bool {
-    reviewer_retries >= REVIEW_RETRY_LIMIT
+fn review_retries_exhausted(reviewer_retries: i64, limit: i64) -> bool {
+    reviewer_retries >= limit
 }
 
 #[cfg(test)]
@@ -1862,16 +1936,58 @@ mod tests {
 
     #[test]
     fn reviewer_runtime_failures_are_bounded() {
-        assert!(!review_failures_exhausted(REVIEW_FAILURE_LIMIT - 1));
-        assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT));
-        assert!(review_failures_exhausted(REVIEW_FAILURE_LIMIT + 1));
+        assert!(!review_failures_exhausted(2, 3));
+        assert!(review_failures_exhausted(3, 3));
+        assert!(!review_failures_exhausted(3, 4));
     }
 
     #[test]
     fn reviewer_quality_retries_are_bounded() {
-        assert!(!review_retries_exhausted(REVIEW_RETRY_LIMIT - 1));
-        assert!(review_retries_exhausted(REVIEW_RETRY_LIMIT));
-        assert!(review_retries_exhausted(REVIEW_RETRY_LIMIT + 1));
+        assert!(!review_retries_exhausted(2, 3));
+        assert!(review_retries_exhausted(3, 3));
+        assert!(!review_retries_exhausted(3, 5));
+    }
+
+    #[test]
+    fn legacy_default_reviewer_prompt_upgrades_without_touching_custom_prompt() {
+        assert_eq!(resolved_initial_prompt(&AgentRole::Reviewer, LEGACY_DEFAULT_REVIEWER_PROMPT.into()), DEFAULT_REVIEWER_PROMPT);
+        assert_eq!(resolved_initial_prompt(&AgentRole::Reviewer, "custom".into()), "custom");
+        assert_eq!(resolved_initial_prompt(&AgentRole::Worker, String::new()), DEFAULT_WORKER_PROMPT);
+    }
+
+    #[tokio::test]
+    async fn host_review_settings_persist_and_reload() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let state = Arc::new(AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: std::env::temp_dir(),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+        });
+        let Json(saved) = update_host_settings(
+            State(state.clone()),
+            Json(UpdateHostSettings { review_retry_limit: Some(7), review_failure_limit: Some(4) }),
+        ).await.unwrap();
+        assert_eq!(saved.review_retry_limit, 7);
+        assert_eq!(saved.review_failure_limit, 4);
+        let Json(reloaded) = get_host_settings(State(state)).await.unwrap();
+        assert_eq!(reloaded.review_retry_limit, 7);
+        assert_eq!(reloaded.review_failure_limit, 4);
+    }
+
+    #[test]
+    fn reviewer_prompt_requires_complete_sweep_before_retry() {
+        assert!(DEFAULT_REVIEWER_PROMPT.contains("Do not stop after finding the first defect"));
+        assert!(DEFAULT_REVIEWER_PROMPT.contains("every acceptance criterion"));
+        assert!(DEFAULT_REVIEWER_PROMPT.contains("all discovered blockers"));
     }
 
     fn selected_agent() -> AgentConfig {
