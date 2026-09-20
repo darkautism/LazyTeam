@@ -1100,6 +1100,15 @@ fn parse_review_verdict(raw: &str) -> anyhow::Result<ReviewVerdict> {
 /// Bounded excerpt length for malformed verdict diagnostics: enough to
 /// identify a truncation or prose wrapper, never a full model output dump.
 const MALFORMED_VERDICT_EXCERPT_CHARS: usize = 500;
+/// Bounded length for a failed repair request's backend error text. Backend
+/// errors can embed raw event payloads, so they are sanitized and capped
+/// exactly like model output before they reach logs or durable evidence.
+const MALFORMED_REPAIR_ERROR_CHARS: usize = 300;
+/// Redaction runs on a window slightly larger than the excerpt cap so a
+/// secret value that starts inside the visible excerpt but runs past it is
+/// still recognised as a value (and fully redacted) rather than leaking a
+/// prefix into the truncated diagnostic.
+const SECRET_REDACT_SLACK_CHARS: usize = 512;
 
 /// Resolve the review verdict for the current lease. A successfully parsed
 /// first output completes immediately. A format-only failure gets exactly one
@@ -1129,8 +1138,9 @@ async fn resolve_review_verdict_in_lease(
         Ok(repaired) => repaired,
         Err(error) => {
             return Err(anyhow::anyhow!(
-                "{}; format repair request failed: {error:#}",
+                "{}; format repair request failed: {}",
                 malformed_verdict_diagnostic(&first.summary),
+                sanitize_for_diagnostic(&format!("{error:#}"), MALFORMED_REPAIR_ERROR_CHARS),
             ));
         }
     };
@@ -1160,17 +1170,277 @@ fn malformed_verdict_diagnostic(raw: &str) -> String {
 }
 
 fn sanitized_verdict_excerpt(raw: &str) -> String {
-    let mut excerpt: String = raw.chars().take(MALFORMED_VERDICT_EXCERPT_CHARS).collect();
-    // Never persist key blocks even in truncated form.
-    if excerpt.contains("BEGIN") && excerpt.contains("PRIVATE KEY") {
-        return "[redacted-key-material]".to_string();
-    }
-    excerpt = excerpt
+    sanitize_for_diagnostic(raw, MALFORMED_VERDICT_EXCERPT_CHARS)
+}
+
+/// Bound arbitrary untrusted text (model output or backend error text) for
+/// logs and durable `failed`-review evidence: redact common secret shapes
+/// first, then strip control characters and cap the length. Redaction runs
+/// before truncation so a secret is never persisted just because it appeared
+/// early in the output.
+fn sanitize_for_diagnostic(raw: &str, max_chars: usize) -> String {
+    let window: String = raw.chars().take(max_chars + SECRET_REDACT_SLACK_CHARS).collect();
+    let redacted = redact_secret_values(&window);
+    let cleaned: String = redacted
         .chars()
         .map(|c| if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c })
         .collect();
-    let trimmed = excerpt.trim();
-    if trimmed.is_empty() { "(empty)".to_string() } else { trimmed.to_string() }
+    let visible: String = cleaned.trim().chars().take(max_chars).collect();
+    let visible = visible.trim();
+    if visible.is_empty() { "(empty)".to_string() } else { visible.to_string() }
+}
+
+/// Redact common secret shapes without any regex dependency: PEM blocks,
+/// `name: value` / `name=value` pairs for sensitive field names (JSON or
+/// header style), `Bearer` tokens, and well-known token prefixes.
+fn redact_secret_values(text: &str) -> String {
+    let text = redact_pem_blocks(text);
+    // Bearer before fields: `Authorization: Bearer <token>` must redact the
+    // credential, not just the `Bearer` scheme word a field pass would see.
+    let text = redact_bearer_tokens(&text);
+    let text = redact_secret_fields(&text);
+    redact_prefixed_tokens(&text)
+}
+
+/// ASCII case-insensitive byte search. The returned index is always a char
+/// boundary when the needle starts with an ASCII byte, because ASCII bytes
+/// never occur inside multi-byte UTF-8 sequences.
+fn find_ascii_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || haystack.len() < needle.len() || from >= haystack.len() {
+        return None;
+    }
+    let mut i = from;
+    while i + needle.len() <= haystack.len() {
+        if haystack[i..i + needle.len()]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Replace every `-----BEGIN ... [-----END ...]` span with a placeholder. An
+/// unterminated block is redacted through the end of the window so a key
+/// whose END marker was truncated away still never leaks.
+fn redact_pem_blocks(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let Some(begin) = find_ascii_ci(rest, "-----BEGIN", 0) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..begin]);
+        let after_begin = &rest[begin..];
+        match find_ascii_ci(after_begin, "-----END", "-----BEGIN".len()) {
+            Some(end_rel) => {
+                let mut end = begin + end_rel + "-----END".len();
+                while end < rest.len() && rest.as_bytes()[end] == b'-' {
+                    end += 1;
+                }
+                out.push_str("[redacted-key-material]");
+                rest = &rest[end..];
+            }
+            None => {
+                out.push_str("[redacted-key-material]");
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Sensitive field names whose associated value must not reach diagnostics.
+/// Longest-first so `access_token` wins over `token` at the same position.
+const SECRET_FIELD_NAMES: &[&str] = &[
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "private_key",
+    "session_token",
+    "auth_token",
+    "id_token",
+    "api_key",
+    "authorization",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "api-key",
+];
+
+fn redact_secret_fields(text: &str) -> String {
+    let mut current = text.to_string();
+    for name in SECRET_FIELD_NAMES {
+        current = redact_secret_field(&current, name);
+    }
+    current
+}
+
+/// Redact the value of one `name: value` / `name=value` pair (quoted JSON
+/// strings or bare tokens). Occurrences without a `:`/`=` delimiter are
+/// ordinary prose and are left untouched.
+fn redact_secret_field(text: &str, name: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+    while let Some(rel) = find_ascii_ci(text, name, cursor) {
+        let bytes = text.as_bytes();
+        let mut j = rel + name.len();
+        while j < bytes.len()
+            && (bytes[j] == b'"' || bytes[j] == b'\'' || bytes[j] == b']' || bytes[j].is_ascii_whitespace())
+        {
+            j += 1;
+        }
+        if j < bytes.len() && (bytes[j] == b':' || bytes[j] == b'=') {
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                let quote = bytes[j];
+                j += 1;
+                let mut k = j;
+                while k < bytes.len() && bytes[k] != quote {
+                    k += 1;
+                    if k < bytes.len() && bytes[k - 1] == b'\\' {
+                        k += 1; // skip the escaped byte (e.g. \" in JSON)
+                    }
+                }
+                if k < bytes.len() {
+                    k += 1; // consume the closing quote
+                }
+                out.push_str(&text[cursor..rel]);
+                out.push_str(&text[rel..rel + name.len()]);
+                out.push_str("=[redacted]");
+                cursor = k;
+                continue;
+            }
+            let mut k = j;
+            while k < bytes.len()
+                && !matches!(bytes[k], b'"' | b'\'' | b',' | b'}' | b']' | b';' | b')')
+                && !bytes[k].is_ascii_whitespace()
+            {
+                k += 1;
+            }
+            if k > j {
+                out.push_str(&text[cursor..rel]);
+                out.push_str(&text[rel..rel + name.len()]);
+                out.push_str("=[redacted]");
+                cursor = k;
+                continue;
+            }
+        }
+        out.push_str(&text[cursor..rel + name.len()]);
+        cursor = rel + name.len();
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Redact `Bearer <token>` credential values, keeping only the scheme name.
+fn redact_bearer_tokens(text: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+    while let Some(rel) = find_ascii_ci(text, "bearer", cursor) {
+        let bytes = text.as_bytes();
+        let mut j = rel + "bearer".len();
+        if j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let mut k = j;
+            let mut quoted = None;
+            if k < bytes.len() && (bytes[k] == b'"' || bytes[k] == b'\'') {
+                quoted = Some(bytes[k]);
+                k += 1;
+            }
+            let start = k;
+            while k < bytes.len()
+                && !bytes[k].is_ascii_whitespace()
+                && !matches!(bytes[k], b'"' | b'\'' | b',' | b'}' | b';')
+            {
+                k += 1;
+            }
+            if let Some(quote) = quoted {
+                if k < bytes.len() && bytes[k] == quote {
+                    k += 1;
+                }
+            }
+            if k > start {
+                out.push_str(&text[cursor..rel]);
+                out.push_str("Bearer [redacted]");
+                cursor = k;
+                continue;
+            }
+        }
+        out.push_str(&text[cursor..rel + "bearer".len()]);
+        cursor = rel + "bearer".len();
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Well-known token prefixes. Matches are case-sensitive and must extend to
+/// a minimum total length so ordinary words containing e.g. `sk-` are left
+/// untouched.
+const TOKEN_PREFIXES: &[&str] = &[
+    "sk-ant-",
+    "github_pat_",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "xoxs-",
+    "AKIA",
+];
+const MIN_PREFIXED_TOKEN_LEN: usize = 12;
+
+fn is_token_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'+' | b'=' | b'~')
+}
+
+fn redact_prefixed_tokens(text: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+    loop {
+        let mut best: Option<(usize, usize)> = None;
+        for prefix in TOKEN_PREFIXES {
+            // Prefixes are ASCII, so `find` offsets are char boundaries.
+            if let Some(rel) = text[cursor..].find(prefix) {
+                let pos = cursor + rel;
+                if best.is_none_or(|(best_pos, _)| pos < best_pos) {
+                    best = Some((pos, prefix.len()));
+                }
+            }
+        }
+        let Some((pos, prefix_len)) = best else {
+            break;
+        };
+        let bytes = text.as_bytes();
+        let mut end = pos + prefix_len;
+        while end < bytes.len() && is_token_char(bytes[end]) {
+            end += 1;
+        }
+        if end - pos >= MIN_PREFIXED_TOKEN_LEN {
+            out.push_str(&text[cursor..pos]);
+            out.push_str("[redacted-token]");
+            cursor = end;
+        } else {
+            out.push_str(&text[cursor..pos + prefix_len]);
+            cursor = pos + prefix_len;
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out
 }
 
 fn fnv1a64_hex(bytes: &[u8]) -> String {
@@ -2042,6 +2312,7 @@ mod tests {
     /// outputs so each test performs at most one repair attempt.
     struct FakeReviewRuntime {
         repair_outputs: std::sync::Mutex<Vec<String>>,
+        repair_error: std::sync::Mutex<Option<String>>,
         repair_calls: std::sync::atomic::AtomicUsize,
         last_repair_session: std::sync::Mutex<Vec<Option<String>>>,
     }
@@ -2050,6 +2321,16 @@ mod tests {
         fn with_repairs(outputs: Vec<String>) -> Self {
             Self {
                 repair_outputs: std::sync::Mutex::new(outputs),
+                repair_error: std::sync::Mutex::new(None),
+                repair_calls: std::sync::atomic::AtomicUsize::new(0),
+                last_repair_session: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing_repair(message: String) -> Self {
+            Self {
+                repair_outputs: std::sync::Mutex::new(Vec::new()),
+                repair_error: std::sync::Mutex::new(Some(message)),
                 repair_calls: std::sync::atomic::AtomicUsize::new(0),
                 last_repair_session: std::sync::Mutex::new(Vec::new()),
             }
@@ -2070,6 +2351,9 @@ mod tests {
         async fn repair_review_verdict(&self, _workspace: &Path, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
             self.repair_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.last_repair_session.lock().unwrap().push(backend_session_id.map(str::to_string));
+            if let Some(message) = self.repair_error.lock().unwrap().take() {
+                return Err(anyhow::Error::msg(message));
+            }
             let mut outputs = self.repair_outputs.lock().unwrap();
             assert!(!outputs.is_empty(), "repair must be attempted at most once per lease");
             Ok(AgentRunResult { summary: outputs.remove(0), backend_session_id: None })
@@ -2136,6 +2420,60 @@ mod tests {
         assert!(!message.contains(&"x".repeat(1000)), "excerpt must be truncated");
         // Strict: prose is never regex-guessed into a verdict.
         assert!(parse_review_verdict(&malformed).is_err());
+    }
+
+    #[test]
+    fn malformed_excerpt_redacts_common_secret_shapes() {
+        let raw = "not json; Authorization: Bearer bearer-secret-value-12345 password=hunter2-secret \
+            {\"api_key\": \"api-key-secret-value\", \"token\":\"json-token-secret\"} \
+            key=sk-test-secret-key-abcdef1234567890";
+        let excerpt = sanitized_verdict_excerpt(raw);
+        for leaked in [
+            "bearer-secret-value-12345",
+            "hunter2-secret",
+            "api-key-secret-value",
+            "json-token-secret",
+            "sk-test-secret-key-abcdef1234567890",
+        ] {
+            assert!(!excerpt.contains(leaked), "secret leaked in excerpt: {excerpt}");
+        }
+        assert!(excerpt.contains("[redacted"), "expected redaction placeholders: {excerpt}");
+        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
+    }
+
+    #[test]
+    fn malformed_excerpt_redacts_key_block_even_when_end_is_truncated_away() {
+        let raw = format!("preamble not json -----BEGIN RSA PRIVATE KEY-----\n{}", "A".repeat(5000));
+        let excerpt = sanitized_verdict_excerpt(&raw);
+        assert!(!excerpt.contains("BEGIN"), "key block leaked: {excerpt}");
+        assert!(excerpt.contains("[redacted-key-material]"), "unexpected: {excerpt}");
+        // Ordinary words containing a token prefix but no real credential
+        // must survive redaction.
+        let innocent = sanitized_verdict_excerpt("the flask-based task token list is empty");
+        assert!(innocent.contains("flask-based"), "false positive redaction: {innocent}");
+    }
+
+    #[tokio::test]
+    async fn repair_request_failure_is_sanitized_and_bounded() {
+        // Backend repair errors can embed raw event payloads: the persisted
+        // failure must carry only a sanitized, capped fragment of them.
+        let repair_error = format!(
+            "Pi RPC blew up with Bearer repair-bearer-secret-999 {} event={{\"type\":\"message_update\"}}",
+            "y".repeat(4000),
+        );
+        let runtime = FakeReviewRuntime::failing_repair(repair_error);
+        let first = format!("first malformed output password=first-output-secret {}", "w".repeat(5000));
+        let error = lease_harness(&runtime, &first).await.unwrap_err();
+        assert_eq!(runtime.repair_call_count(), 1, "at most one repair per lease");
+        let message = error.to_string();
+        assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
+        assert!(message.contains("format repair request failed"), "unexpected: {message}");
+        for leaked in ["repair-bearer-secret-999", "first-output-secret"] {
+            assert!(!message.contains(leaked), "secret leaked in failure: {message}");
+        }
+        assert!(!message.contains(&"y".repeat(1000)), "backend filler must be capped");
+        assert!(!message.contains(&"w".repeat(1000)), "giant output must be capped");
+        assert!(message.len() < 2000, "failure diagnostic must stay bounded, got {} chars", message.len());
     }
 
     #[test]
