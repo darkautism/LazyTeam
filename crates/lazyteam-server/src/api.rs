@@ -246,6 +246,7 @@ struct WorkerRuntimeConfig {
     managed_capabilities: BTreeSet<String>,
     installed_capabilities: BTreeSet<String>,
     paused: bool,
+    model_refresh_provider: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -277,11 +278,6 @@ struct AgentModelRefreshInput {
 struct AgentModelRefreshQueued {
     provider: String,
     queued: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct AgentModelRefreshDelivery {
-    provider: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -420,7 +416,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/config", get(worker_runtime_config))
         .route("/api/workers/{id}/provider-key", post(queue_worker_provider_key))
         .route("/api/workers/{id}/agent-auth", get(worker_agent_auth))
-        .route("/api/workers/{id}/models/refresh", get(worker_model_refresh).post(queue_worker_model_refresh))
+        .route("/api/workers/{id}/models/refresh", post(queue_worker_model_refresh))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
@@ -870,6 +866,7 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
     require_worker(&state.db, id, &headers).await?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let worker = worker_from_row(&row)?;
+    let model_refresh_provider = state.model_refresh_requests.lock().await.remove(&id);
     Ok(Json(WorkerRuntimeConfig {
         role: worker.role,
         agent: worker.agent,
@@ -877,6 +874,7 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
         managed_capabilities: worker.managed_capabilities,
         installed_capabilities: worker.installed_capabilities,
         paused: matches!(worker.state, WorkerState::Draining),
+        model_refresh_provider,
     }))
 }
 
@@ -947,18 +945,6 @@ async fn queue_worker_model_refresh(
     }
     state.model_refresh_requests.lock().await.insert(id, provider.to_string());
     Ok(Json(AgentModelRefreshQueued { provider: provider.to_string(), queued: true }))
-}
-
-async fn worker_model_refresh(
-    Path(id): Path<Uuid>,
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    require_worker(&state.db, id, &headers).await?;
-    match state.model_refresh_requests.lock().await.remove(&id) {
-        Some(provider) => Ok(Json(AgentModelRefreshDelivery { provider }).into_response()),
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
-    }
 }
 
 async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(capabilities): Json<AgentCapabilities>) -> Result<StatusCode, ApiError> {
