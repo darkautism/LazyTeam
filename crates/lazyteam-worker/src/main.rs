@@ -1161,10 +1161,19 @@ async fn execute_assignment(
 
 async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dyn AgentRuntime>, initial_prompt: &str, session: &AgentSession, session_manager: &SessionManager, session_lock: &SessionLock, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<ExecutionResult> {
     let workspace = trusted_task_workspace(workspace_root, &assignment.project.slug, assignment.task.id);
-    let base_sha = prepare_workspace(&workspace, assignment, git_auth).await?;
+    let (base_sha, preserved) = prepare_workspace(&workspace, assignment, git_auth).await?;
     let agent_workspace = sandbox.agent_workspace(assignment.task.id);
     prepare_agent_workspace(&workspace, &agent_workspace, Some(&base_sha)).await?;
-    let prompt = build_prompt(initial_prompt, assignment);
+    // The sandbox is rebuilt from the trusted worktree with its Git metadata
+    // stripped, so a preserved backup ref alone would be invisible to the
+    // resumed agent. Carry the preservation record in the attempt prompt:
+    // the prompt travels with this execution (and its resumed session) on
+    // whichever worker claimed it, while the backup branch persists in the
+    // claiming worker's trusted workspace for session reuse.
+    let mut prompt = build_prompt(initial_prompt, assignment);
+    if let Some(preserved) = &preserved {
+        prompt = with_preserved_attempt_context(prompt, preserved);
+    }
     let agent = runtime.run(&agent_workspace, &prompt, session.backend_session_id.as_deref()).await?;
     persist_backend_session_binding(session_manager, session_lock, session, &agent).await?;
     sync_agent_workspace(&agent_workspace, &workspace).await?;
@@ -1253,7 +1262,27 @@ fn task_branch(assignment: &Assignment) -> String {
     format!("lazyteam/task-{}", assignment.task.id.simple())
 }
 
-async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitAuthContext) -> anyhow::Result<String> {
+/// Agent-visible record of failed-attempt state preserved while restoring
+/// the last valid candidate. The backup branch alone would be invisible: the
+/// sandbox is rebuilt from the trusted worktree with Git metadata stripped,
+/// so this record travels in the attempt prompt instead, which the resumed
+/// agent (and its session) always receives on the claiming worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreservedAttempt {
+    backup_branch: String,
+    files: Vec<String>,
+    stat: String,
+    diff: String,
+}
+
+/// Max bytes of the preserved unified diff carried in the attempt prompt.
+const PRESERVED_DIFF_MAX_BYTES: usize = 8 * 1024;
+
+async fn prepare_workspace(
+    path: &Path,
+    assignment: &Assignment,
+    git_auth: &GitAuthContext,
+) -> anyhow::Result<(String, Option<PreservedAttempt>)> {
     let branch = task_branch(assignment);
     let branch_ref = format!("refs/heads/{branch}");
     if path.exists() {
@@ -1271,11 +1300,13 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
         // candidate) still starts with the prior delta available.
         let seed = fetch_seeded_candidate(path, &branch_ref, git_auth).await?;
         checkout_task_branch(path, &branch).await?;
-        if seed == SeedFetch::Present {
-            restore_seeded_candidate_tree(path, assignment).await?;
-        }
+        let preserved = if seed == SeedFetch::Present {
+            restore_seeded_candidate_tree(path, assignment).await?
+        } else {
+            None
+        };
         merge_ref_into_head(path, assignment, &base).await?;
-        return Ok(base);
+        return Ok((base, preserved));
     }
     if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
     command_ok_with_auth(
@@ -1299,7 +1330,24 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
             command_ok(path, "git", &["checkout", "-b", &branch]).await?;
         }
     }
-    Ok(base)
+    Ok((base, None))
+}
+
+/// Append the preservation record to the attempt prompt so the resumed agent
+/// sees what a previous attempt changed relative to the restored candidate.
+/// The worktree the agent receives is the last valid candidate; the record
+/// below lets it salvage useful exploration without blindly reapplying
+/// whatever reverted or broke the previous attempt.
+fn with_preserved_attempt_context(prompt: String, preserved: &PreservedAttempt) -> String {
+    let files = if preserved.files.is_empty() {
+        "(no content differences)".to_string()
+    } else {
+        preserved.files.iter().map(|file| format!("- {file}")).collect::<Vec<_>>().join("\n")
+    };
+    format!(
+        "{prompt}\n\nPrior attempt context (preserved retry state):\nThe workspace diverged from the last valid implementation candidate (unpushed or uncommitted work from a failed attempt). That state was preserved on local branch `{}` and the worktree was restored to the last valid candidate, which is what you see now. Salvage anything useful, but do not blindly reapply it: it may contain the revert or breakage that failed.\n\nChanged files versus the restored candidate:\n{files}\n\nDiffstat versus the restored candidate:\n{}\n\nUnified diff versus the restored candidate (truncated):\n{}",
+        preserved.backup_branch, preserved.stat, preserved.diff,
+    )
 }
 
 /// Stable local ref holding a prior candidate fetched from the current
@@ -1370,7 +1418,15 @@ async fn origin_advertises_branch(path: &Path, branch_ref: &str, git_auth: &GitA
 /// pre-reset HEAD is kept on a verified backup branch. Backup creation is
 /// fail-closed, and no `clean` is used, so candidate-related changes cannot
 /// be silently lost.
-async fn restore_seeded_candidate_tree(path: &Path, assignment: &Assignment) -> anyhow::Result<()> {
+///
+/// Returns the agent-visible preservation record when a restore ran, so the
+/// resumed agent can see what the failed attempt changed relative to the
+/// restored candidate. Returns `None` when the workspace already matches
+/// the candidate and no restore was needed.
+async fn restore_seeded_candidate_tree(
+    path: &Path,
+    assignment: &Assignment,
+) -> anyhow::Result<Option<PreservedAttempt>> {
     let seeded = git_output(path, &["rev-parse", "--verify", SEEDED_CANDIDATE_REF]).await?;
     let mut head = git_output(path, &["rev-parse", "HEAD"]).await?;
     // A failed attempt can also leave an uncommitted revert/overwrite or an
@@ -1379,7 +1435,7 @@ async fn restore_seeded_candidate_tree(path: &Path, assignment: &Assignment) -> 
     let dirty = !git_output(path, &["status", "--porcelain"]).await?.trim().is_empty()
         || git_output(path, &["rev-parse", "--verify", "MERGE_HEAD"]).await.is_ok();
     if head == seeded && !dirty {
-        return Ok(());
+        return Ok(None);
     }
     if dirty {
         // Commit staged, uncommitted, and untracked (`-A`) worktree state
@@ -1434,7 +1490,54 @@ async fn restore_seeded_candidate_tree(path: &Path, assignment: &Assignment) -> 
         }
     }
     command_ok(path, "git", &["reset", "--hard", SEEDED_CANDIDATE_REF]).await?;
-    Ok(())
+    Ok(Some(summarize_preserved_attempt(path, &backup, &seeded).await?))
+}
+
+/// Build the agent-visible record of what the preserved pre-reset HEAD
+/// changed relative to the restored candidate: changed files, diffstat, and
+/// a bounded unified diff. All reads come from committed objects, so the
+/// record is exact.
+async fn summarize_preserved_attempt(path: &Path, backup: &str, seeded: &str) -> anyhow::Result<PreservedAttempt> {
+    let files = git_output(path, &["diff", "--no-ext-diff", "--name-only", seeded, backup, "--"])
+        .await
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let stat = git_output(path, &["diff", "--no-ext-diff", "--stat", seeded, backup, "--"])
+        .await
+        .unwrap_or_default();
+    let raw_diff = git_output(path, &["diff", "--no-ext-diff", "--unified=3", seeded, backup, "--"])
+        .await
+        .unwrap_or_default();
+    let (diff, truncated) = truncate_text(raw_diff, PRESERVED_DIFF_MAX_BYTES);
+    let diff = if truncated {
+        format!("{diff}\n\n[LazyTeam preserved-attempt diff truncated]")
+    } else if diff.is_empty() {
+        "(no content differences)".to_string()
+    } else {
+        diff
+    };
+    Ok(PreservedAttempt {
+        backup_branch: backup.to_string(),
+        files,
+        stat: if stat.trim().is_empty() { "(no content differences)".to_string() } else { stat },
+        diff,
+    })
+}
+
+/// Truncate text to at most `max_bytes` on a character boundary.
+fn truncate_text(mut text: String, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    (text, true)
 }
 
 async fn seeded_candidate_present(path: &Path) -> bool {
@@ -2028,7 +2131,7 @@ mod tests {
         let workspace = root.join("workspace");
         let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 3);
         let auth = GitAuthContext::broker("worker-secret", "lease-secret");
-        let base = prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        let (base, _) = prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
         assert_eq!(base, new_base);
         assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
         assert_eq!(tokio::fs::read_to_string(workspace.join("base2.txt")).await.unwrap(), "advanced\n");
@@ -2091,9 +2194,23 @@ mod tests {
 
         let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 3);
         let auth = GitAuthContext::broker("worker-secret", "lease-secret");
-        prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        let (base, preserved) = prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
         assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
         assert_eq!(git_output(&workspace, &["rev-parse", "HEAD"]).await.unwrap(), seeded);
+        // The preservation record is agent-visible: the reverted content is
+        // described relative to the restored candidate.
+        let preserved = preserved.expect("descendant restore must yield a preservation record");
+        assert!(preserved.files.iter().any(|file| file == "fix.txt"));
+        assert!(preserved.diff.contains("prior candidate"), "unexpected diff: {}", preserved.diff);
+        // The sandbox the agent actually receives carries the restored
+        // candidate tree.
+        let agent = root.join("agent");
+        prepare_agent_workspace(&workspace, &agent, Some(&base)).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(agent.join("fix.txt")).await.unwrap(), "prior candidate\n");
+        // The attempt prompt surfaces the record to the resumed agent.
+        let prompt = with_preserved_attempt_context("base prompt".to_string(), &preserved);
+        assert!(prompt.contains(&preserved.backup_branch));
+        assert!(prompt.contains("prior candidate"));
         // The pre-reset descendant is preserved for forensics, not dropped.
         assert!(!git_output(&workspace, &["for-each-ref", "refs/heads/lazyteam/retry-backup-*"]).await.unwrap().is_empty());
         let _ = tokio::fs::remove_dir_all(root).await;
@@ -2120,8 +2237,22 @@ mod tests {
 
         let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 3);
         let auth = GitAuthContext::broker("worker-secret", "lease-secret");
-        prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        let (base, preserved) = prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
         assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
+        // The preservation record is agent-visible: it describes the
+        // tampered content versus the restored candidate.
+        let preserved = preserved.expect("dirty restore must yield a preservation record");
+        assert!(preserved.files.iter().any(|file| file == "fix.txt"));
+        assert!(preserved.diff.contains("tampered"), "unexpected diff: {}", preserved.diff);
+        // The sandbox the agent actually receives carries the restored
+        // candidate tree.
+        let agent = root.join("agent");
+        prepare_agent_workspace(&workspace, &agent, Some(&base)).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(agent.join("fix.txt")).await.unwrap(), "prior candidate\n");
+        // The attempt prompt surfaces the record to the resumed agent.
+        let prompt = with_preserved_attempt_context("base prompt".to_string(), &preserved);
+        assert!(prompt.contains(&preserved.backup_branch));
+        assert!(prompt.contains("tampered"));
         // The tampered uncommitted work is preserved on the backup branch,
         // not discarded: nothing staged, uncommitted, or untracked is lost.
         let backup = git_output(&workspace, &["for-each-ref", "--format=%(refname:short)", "refs/heads/lazyteam/retry-backup-*"])
@@ -2145,7 +2276,6 @@ mod tests {
         let (broker, _, _) = init_broker_with_base(&root).await;
         let task_id = Uuid::new_v4();
         let project_id = Uuid::new_v4();
-        let branch = format!("lazyteam/task-{}", task_id.simple());
         // Advertise a task branch whose objects are missing: ls-remote sees
         // the ref, but fetching it fails. Written directly because
         // update-ref refuses a nonexistent object.
@@ -2215,7 +2345,8 @@ mod tests {
         let workspace = root.join("workspace");
         let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 1);
         let auth = GitAuthContext::broker("worker-secret", "lease-secret");
-        let returned_base = prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        let (returned_base, preserved) = prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        assert!(preserved.is_none(), "fresh task must not produce a preservation record");
         assert_eq!(returned_base, base);
         let head = git_output(&workspace, &["rev-parse", "HEAD"]).await.unwrap();
         assert_eq!(head, base, "fresh task must start with no tracked delta so the no-change guard still applies");
