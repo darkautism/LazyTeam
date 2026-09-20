@@ -16,6 +16,7 @@ lazyteam-core = { path = "../lazyteam-core" }
 rand.workspace = true
 reqwest.workspace = true
 rmcp = { version = "3.4", features = ["server", "transport-streamable-http-server"] }
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

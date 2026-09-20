@@ -17,6 +17,7 @@ use lazyteam_core::{
     WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT, LEASE_CAPABILITY_HEADER,
     MANAGED_CAPABILITY_IDS,
 };
+use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
@@ -152,13 +153,13 @@ fn is_reviewer_retry_verdict(verdict_json: Option<&str>) -> bool {
     raw.contains("\"verdict\":\"retry\"") || raw.contains("\"verdict\": \"retry\"")
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct TaskStatus {
     pub(crate) task: Task,
     pub(crate) latest_execution: Option<Execution>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct ReviewCheckout {
     pub(crate) repo_url: String,
     pub(crate) default_branch: String,
@@ -168,7 +169,7 @@ pub(crate) struct ReviewCheckout {
     pub(crate) pullable: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct ReviewEvidence {
     pub(crate) project: Project,
     pub(crate) task: Task,
