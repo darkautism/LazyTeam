@@ -753,6 +753,10 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
         return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into()));
     }
     let agent_capabilities = json(&input.agent_capabilities)?;
+    // Re-registration (same worker id) refreshes identity, heartbeat, and capability
+    // state only. Host-owned selections (role, agent provider/model, prompt, tags,
+    // projects, slots) are intentionally absent from the ON CONFLICT UPDATE clause
+    // below so re-enrollment never resets them.
     let role = agent_role_str(&input.role);
     let default_prompt = match input.role { AgentRole::Worker => DEFAULT_WORKER_PROMPT, AgentRole::Reviewer => DEFAULT_REVIEWER_PROMPT };
     sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at,credential_hash,agent_type,agent_provider,agent_model,initial_prompt,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,state=CASE WHEN workers.state IN ('pending','draining','degraded') THEN workers.state WHEN workers.running_slots>0 THEN 'busy' ELSE 'idle' END,os=excluded.os,arch=excluded.arch,protocol_version=excluded.protocol_version,worker_version=excluded.worker_version,last_heartbeat_at=excluded.last_heartbeat_at,credential_hash=excluded.credential_hash,agent_capabilities=excluded.agent_capabilities")
@@ -796,6 +800,31 @@ pub(crate) async fn delete_worker(Path(id): Path<Uuid>, State(state): State<Arc<
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Resolve the Host-owned agent selection for a worker update.
+///
+/// Omitted fields preserve the current Host-owned selection. Clearing is only
+/// possible through an explicit `clear_model: true`, which must not be combined
+/// with replacement values; a bare null/absent provider or model never clears.
+fn resolve_agent_selection(
+    current: &AgentConfig,
+    provider: Option<String>,
+    model: Option<String>,
+    clear_model: bool,
+) -> Result<(Option<String>, Option<String>), ApiError> {
+    if clear_model {
+        if provider.is_some() || model.is_some() {
+            return Err((StatusCode::BAD_REQUEST, "clear_model cannot be combined with provider/model".into()));
+        }
+        return Ok((None, None));
+    }
+    let provider = provider.or_else(|| current.provider.clone());
+    let model = model.or_else(|| current.model.clone());
+    if provider.is_some() != model.is_some() {
+        return Err((StatusCode::BAD_REQUEST, "provider and model must be set or cleared together".into()));
+    }
+    Ok((provider, model))
+}
+
 async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, Json(input): Json<UpdateWorker>) -> ApiResult<Worker> {
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
@@ -811,14 +840,7 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     }
     let agent_type = input.agent_type.unwrap_or_else(|| current.agent.agent_type.clone());
     if agent_type != "pi" { return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into())); }
-    let (provider, model) = if input.clear_model.unwrap_or(false) {
-        (None, None)
-    } else {
-        (input.provider.or_else(|| current.agent.provider.clone()), input.model.or_else(|| current.agent.model.clone()))
-    };
-    if provider.is_some() != model.is_some() {
-        return Err((StatusCode::BAD_REQUEST, "provider and model must be set or cleared together".into()));
-    }
+    let (provider, model) = resolve_agent_selection(&current.agent, input.provider, input.model, input.clear_model.unwrap_or(false))?;
     if let (Some(provider), Some(model)) = (&provider, &model) {
         if !current.agent_capabilities.models.is_empty()
             && !current.agent_capabilities.models.iter().any(|candidate| &candidate.provider == provider && &candidate.id == model)
@@ -1849,6 +1871,103 @@ mod tests {
         assert!(!review_retries_exhausted(REVIEW_RETRY_LIMIT - 1));
         assert!(review_retries_exhausted(REVIEW_RETRY_LIMIT));
         assert!(review_retries_exhausted(REVIEW_RETRY_LIMIT + 1));
+    }
+
+    fn selected_agent() -> AgentConfig {
+        AgentConfig {
+            agent_type: "pi".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        }
+    }
+
+    #[test]
+    fn agent_selection_update_preserves_omitted_host_values() {
+        let current = selected_agent();
+        assert_eq!(
+            resolve_agent_selection(&current, None, None, false).unwrap(),
+            (Some("host-provider".into()), Some("host-model".into()))
+        );
+        assert_eq!(
+            resolve_agent_selection(&current, Some("next-provider".into()), Some("next-model".into()), false).unwrap(),
+            (Some("next-provider".into()), Some("next-model".into()))
+        );
+        let unselected = AgentConfig {
+            agent_type: "pi".into(),
+            provider: None,
+            model: None,
+            initial_prompt: "prompt".into(),
+        };
+        assert_eq!(resolve_agent_selection(&unselected, None, None, false).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn agent_selection_clearing_requires_explicit_clear_model() {
+        let current = selected_agent();
+        assert_eq!(resolve_agent_selection(&current, None, None, true).unwrap(), (None, None));
+        assert!(resolve_agent_selection(&current, Some("next-provider".into()), Some("next-model".into()), true).is_err());
+        assert!(resolve_agent_selection(&current, Some("next-provider".into()), None, true).is_err());
+        let unselected = AgentConfig {
+            agent_type: "pi".into(),
+            provider: None,
+            model: None,
+            initial_prompt: "prompt".into(),
+        };
+        assert!(resolve_agent_selection(&unselected, Some("only-provider".into()), None, false).is_err());
+        assert!(resolve_agent_selection(&unselected, None, Some("only-model".into()), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_reregistration_preserves_host_owned_agent_selection() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let state = Arc::new(AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: std::env::temp_dir(),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+        });
+        let worker_id = Uuid::new_v4();
+        let input = || RegisterWorker {
+            id: Some(worker_id),
+            name: "worker-01".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            tags: Default::default(),
+            allowed_projects: BTreeSet::from(["*".to_string()]),
+            slots: 1,
+            worker_version: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            agent_type: "pi".into(),
+            role: AgentRole::Worker,
+            agent_capabilities: AgentCapabilities::default(),
+        };
+        register_worker(State(state.clone()), Json(input())).await.unwrap();
+        sqlx::query("UPDATE workers SET agent_provider=?,agent_model=? WHERE id=?")
+            .bind("host-provider")
+            .bind("host-model")
+            .bind(worker_id.to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        register_worker(State(state.clone()), Json(input())).await.unwrap();
+        let row = sqlx::query("SELECT agent_provider,agent_model FROM workers WHERE id=?")
+            .bind(worker_id.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let provider: Option<String> = row.try_get("agent_provider").unwrap();
+        let model: Option<String> = row.try_get("agent_model").unwrap();
+        assert_eq!(provider.as_deref(), Some("host-provider"));
+        assert_eq!(model.as_deref(), Some("host-model"));
     }
 
     #[test]

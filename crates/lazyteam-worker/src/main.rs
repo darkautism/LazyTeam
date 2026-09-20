@@ -51,10 +51,6 @@ struct Args {
     workspace_dir: PathBuf,
     #[arg(long, env = "LAZYTEAM_PI_BIN", default_value = "pi")]
     pi_bin: String,
-    #[arg(long, env = "LAZYTEAM_PI_PROVIDER")]
-    pi_provider: Option<String>,
-    #[arg(long, env = "LAZYTEAM_PI_MODEL")]
-    pi_model: Option<String>,
     /// Verify the embedded Linux agent sandbox and exit without contacting the server.
     #[arg(long)]
     sandbox_diagnose: bool,
@@ -248,8 +244,6 @@ async fn async_main() -> anyhow::Result<()> {
     let enrollment_credential = args.join_code.as_deref().or(args.worker_token.as_deref());
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let pi_bin = args.pi_bin.clone();
-    let legacy_provider = args.pi_provider.clone();
-    let legacy_model = args.pi_model.clone();
     let mut probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None, session_dir: None, sandbox: agent_sandbox.clone() };
     let mut agent_capabilities = probe_runtime.capabilities().await;
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
@@ -451,8 +445,6 @@ async fn async_main() -> anyhow::Result<()> {
                         let runtime = match runtime_for_config(
                             &runtime_config.agent,
                             &pi_bin,
-                            legacy_provider.as_deref(),
-                            legacy_model.as_deref(),
                             session.data_dir.clone(),
                             agent_sandbox.clone(),
                         ) {
@@ -509,8 +501,6 @@ async fn async_main() -> anyhow::Result<()> {
                         let runtime = match runtime_for_config(
                             &runtime_config.agent,
                             &pi_bin,
-                            legacy_provider.as_deref(),
-                            legacy_model.as_deref(),
                             session.data_dir.clone(),
                             agent_sandbox.clone(),
                         ) {
@@ -796,12 +786,15 @@ async fn poll_agent_auth(client: &Client, server: &str, credential: &str, worker
     Ok(Some(ensure_success(response).await?.json().await?))
 }
 
-fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, legacy_provider: Option<&str>, legacy_model: Option<&str>, session_dir: PathBuf, sandbox: AgentSandbox) -> anyhow::Result<Arc<dyn AgentRuntime>> {
+/// Build the slot runtime exclusively from the Host-owned agent selection.
+/// Worker-local overrides are intentionally unsupported: provider/model may only
+/// be set, preserved, or explicitly cleared through the Host worker registry.
+fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, session_dir: PathBuf, sandbox: AgentSandbox) -> anyhow::Result<Arc<PiRuntime>> {
     if agent.agent_type != "pi" { bail!("unsupported agent type {}", agent.agent_type); }
     Ok(Arc::new(PiRuntime {
         binary: pi_bin.to_string(),
-        provider: agent.provider.clone().or_else(|| legacy_provider.map(str::to_string)),
-        model: agent.model.clone().or_else(|| legacy_model.map(str::to_string)),
+        provider: agent.provider.clone(),
+        model: agent.model.clone(),
         session_dir: Some(session_dir),
         sandbox,
     }))
@@ -1396,6 +1389,41 @@ mod tests {
             "installed_capabilities": []
         })).unwrap();
         assert_eq!(config.slots, 1);
+    }
+
+    #[test]
+    fn legacy_pi_selection_flags_are_removed() {
+        use clap::Parser;
+        assert!(Args::try_parse_from(["lazyteam-worker", "--pi-provider", "legacy"]).is_err());
+        assert!(Args::try_parse_from(["lazyteam-worker", "--pi-model", "legacy"]).is_err());
+        let args = Args::try_parse_from(["lazyteam-worker"]).unwrap();
+        assert_eq!(args.pi_bin, "pi");
+    }
+
+    #[tokio::test]
+    async fn slot_runtime_uses_only_host_owned_agent_selection() {
+        let root = std::env::temp_dir().join(format!("lazyteam-runtime-selection-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let sandbox = AgentSandbox::prepare(&root, "pi", None).await.unwrap();
+        let hosted = AgentConfig {
+            agent_type: "pi".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        };
+        let runtime = runtime_for_config(&hosted, "pi", root.join("session-a"), sandbox.clone()).unwrap();
+        assert_eq!(runtime.provider.as_deref(), Some("host-provider"));
+        assert_eq!(runtime.model.as_deref(), Some("host-model"));
+        let unset = AgentConfig {
+            agent_type: "pi".into(),
+            provider: None,
+            model: None,
+            initial_prompt: "prompt".into(),
+        };
+        let runtime = runtime_for_config(&unset, "pi", root.join("session-b"), sandbox).unwrap();
+        assert_eq!(runtime.provider, None);
+        assert_eq!(runtime.model, None);
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]
