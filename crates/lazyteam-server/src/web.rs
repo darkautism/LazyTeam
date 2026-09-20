@@ -132,6 +132,7 @@ mod tests {
         assert!(INDEX.contains("renderProviderAuth"));
         assert!(INDEX.contains("worker-model-refresh"));
         assert!(INDEX.contains("refreshProviderModels"));
+        assert!(!INDEX.contains("clear_model:!(provider&&model)"));
         assert!(INDEX.contains("/models/refresh"));
         assert!(INDEX.contains("Configure provider authentication before refreshing models"));
         assert!(INDEX.contains("onWorkerRoleChange"));
