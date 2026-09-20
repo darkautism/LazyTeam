@@ -16,7 +16,7 @@ use lazyteam_core::{
     ExecutionState, GitAuthConfig, GitAuthMode, GitCredential, Project, ReviewAssignment,
     ReviewCheckout as WorkerReviewCheckout, ReviewLease, ReviewVerdict, ReviewVerdictKind, Tags, Task,
     TaskState, Worker, WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT,
-    LEGACY_DEFAULT_REVIEWER_PROMPT, LEASE_CAPABILITY_HEADER, MANAGED_CAPABILITY_IDS,
+    LEGACY_DEFAULT_REVIEWER_PROMPT, LEGACY_FULL_SWEEP_REVIEWER_PROMPT, LEASE_CAPABILITY_HEADER, MANAGED_CAPABILITY_IDS,
 };
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2535,7 +2535,10 @@ fn resolved_initial_prompt(role: &AgentRole, initial_prompt: String) -> String {
             AgentRole::Reviewer => DEFAULT_REVIEWER_PROMPT.into(),
         };
     }
-    if matches!(role, AgentRole::Reviewer) && initial_prompt == LEGACY_DEFAULT_REVIEWER_PROMPT {
+    if matches!(role, AgentRole::Reviewer)
+        && (initial_prompt == LEGACY_DEFAULT_REVIEWER_PROMPT
+            || initial_prompt == LEGACY_FULL_SWEEP_REVIEWER_PROMPT)
+    {
         return DEFAULT_REVIEWER_PROMPT.into();
     }
     initial_prompt
@@ -2620,6 +2623,7 @@ mod tests {
     #[test]
     fn legacy_default_reviewer_prompt_upgrades_without_touching_custom_prompt() {
         assert_eq!(resolved_initial_prompt(&AgentRole::Reviewer, LEGACY_DEFAULT_REVIEWER_PROMPT.into()), DEFAULT_REVIEWER_PROMPT);
+        assert_eq!(resolved_initial_prompt(&AgentRole::Reviewer, LEGACY_FULL_SWEEP_REVIEWER_PROMPT.into()), DEFAULT_REVIEWER_PROMPT);
         assert_eq!(resolved_initial_prompt(&AgentRole::Reviewer, "custom".into()), "custom");
         assert_eq!(resolved_initial_prompt(&AgentRole::Worker, String::new()), DEFAULT_WORKER_PROMPT);
     }
@@ -2657,6 +2661,8 @@ mod tests {
         assert!(DEFAULT_REVIEWER_PROMPT.contains("Do not stop after finding the first defect"));
         assert!(DEFAULT_REVIEWER_PROMPT.contains("every acceptance criterion"));
         assert!(DEFAULT_REVIEWER_PROMPT.contains("all discovered blockers"));
+        assert!(DEFAULT_REVIEWER_PROMPT.contains("submit_review"));
+        assert!(!DEFAULT_REVIEWER_PROMPT.contains("final response must be exactly one JSON"));
     }
 
     fn selected_agent() -> AgentConfig {

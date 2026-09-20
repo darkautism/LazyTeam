@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, t
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
-use lazyteam_core::{can_claim_work, host_agent_selection_ready, AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict, LEASE_CAPABILITY_HEADER};
+use lazyteam_core::{can_claim_work, host_agent_selection_ready, AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, LEASE_CAPABILITY_HEADER};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -11,9 +11,11 @@ use tokio::{process::Command, task::JoinSet, time::{sleep, Instant}};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod review_mcp;
 mod runtime;
 mod sandbox;
 mod session;
+use review_mcp::ReviewSlot;
 use runtime::{AgentRunResult, AgentRuntime, PiRuntime};
 use sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
 use session::{AgentSession, SessionLock, SessionManager, SessionRole};
@@ -902,6 +904,8 @@ async fn execute_review_assignment(
     assignment: ReviewAssignment,
 ) -> anyhow::Result<()> {
     let review_id = assignment.review.id;
+    let slot = ReviewSlot::start(review_id, assignment.execution.id).await?;
+    let renew_slot = slot.clone();
     let renew_client = client.clone();
     let renew_server = server.to_string();
     let renew_credential = worker_credential.to_string();
@@ -916,7 +920,12 @@ async fn execute_review_assignment(
                 &renew_capability,
             ).send().await {
                 Ok(response) if response.status().is_success() => {}
-                Ok(response) => warn!(status = %response.status(), %review_id, "review lease renew rejected"),
+                Ok(response) => {
+                    let status = response.status();
+                    warn!(%status, %review_id, "review lease renew rejected; cancelling reviewer slot");
+                    renew_slot.cancel(format!("review lease renew rejected with {status}"));
+                    break;
+                }
                 Err(error) => warn!(%error, %review_id, "review lease renew failed"),
             }
         }
@@ -934,41 +943,44 @@ async fn execute_review_assignment(
     // session that would orphan one of them.
     let session_lock = session_manager.lock_session(session.task_id, session.role).await;
     let session = session_manager.acquire_with(&session_lock, session.task_id, session.role, &session.backend).await?;
-    let outcome = match prepare_review_workspace(&workspace, &assignment, &auth).await {
-        Ok(()) => {
-            let agent_workspace = sandbox.reviewer_workspace(task_id);
-            let review_base = assignment.checkout.upstream_sha.as_deref().or(assignment.checkout.base_sha.as_deref());
-            prepare_agent_workspace(&workspace, &agent_workspace, review_base).await?;
-            let prompt = build_review_prompt(initial_prompt, &assignment)?;
-            match runtime.run_review(&agent_workspace, &prompt, session.backend_session_id.as_deref()).await {
-                Ok(agent) => {
-                    match persist_backend_session_binding(session_manager, &session_lock, &session, &agent).await {
-                        Ok(()) => {
-                            let dirty = git_status_external_worktree(&workspace, &agent_workspace)
-                                .await
-                                .unwrap_or_else(|error| format!("status-check-error: {error}"));
-                            if !dirty.is_empty() {
-                                Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
-                            } else {
-                                // Format-only failure gets at most one narrow same-session
-                                // repair within this lease; the substantive run stays fixed.
-                                resolve_review_verdict_in_lease(
-                                    runtime.as_ref(),
-                                    &agent_workspace,
-                                    session_manager,
-                                    &session_lock,
-                                    &session,
-                                    &agent,
-                                ).await
-                            }
+    let outcome = if !runtime.supports_reviewer_mcp() {
+        Err(anyhow::anyhow!("{} runtime cannot attach the required reviewer MCP terminal", runtime.kind()))
+    } else {
+        match prepare_review_workspace(&workspace, &assignment, &auth).await {
+            Ok(()) => {
+                let agent_workspace = sandbox.reviewer_workspace(task_id);
+                let review_base = assignment.checkout.upstream_sha.as_deref().or(assignment.checkout.base_sha.as_deref());
+                prepare_agent_workspace(&workspace, &agent_workspace, review_base).await?;
+                let prompt = build_review_prompt(initial_prompt, &assignment)?;
+                let review_run = runtime.run_review_with_mcp(
+                    &agent_workspace,
+                    &prompt,
+                    session.backend_session_id.as_deref(),
+                    slot.endpoint(),
+                );
+                tokio::pin!(review_run);
+                let verdict = tokio::select! {
+                    verdict = slot.wait() => verdict,
+                    run = &mut review_run => {
+                        let agent = run?;
+                        persist_backend_session_binding(session_manager, &session_lock, &session, &agent).await?;
+                        match tokio::time::timeout(Duration::from_secs(2), slot.wait()).await {
+                            Ok(verdict) => verdict,
+                            Err(_) => Err(anyhow::anyhow!("reviewer ended without calling submit_review MCP tool")),
                         }
-                        Err(error) => Err(error),
                     }
+                }?;
+                let dirty = git_status_external_worktree(&workspace, &agent_workspace)
+                    .await
+                    .unwrap_or_else(|error| format!("status-check-error: {error}"));
+                if !dirty.is_empty() {
+                    Err(anyhow::anyhow!("reviewer modified the pinned source checkout; review discarded: {dirty}"))
+                } else {
+                    Ok(verdict)
                 }
-                Err(error) => Err(error),
             }
+            Err(error) => Err(error),
         }
-        Err(error) => Err(error),
     };
     renew.abort();
 
@@ -1035,7 +1047,7 @@ fn build_review_prompt(initial_prompt: &str, assignment: &ReviewAssignment) -> a
     let criteria = assignment.task.acceptance_criteria.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n");
     let result = reviewer_evidence_for_prompt(assignment.execution.result.as_ref())?;
     Ok(format!(
-        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned integration review snapshot:\nProject: {}\nDefault branch: {}\nOriginal candidate SHA: {}\nOriginal candidate base SHA: {}\nCurrent upstream SHA reviewed: {}\nIntegrated result SHA: {}\nLocal `HEAD` / `lazyteam-task`: integrated result that would be published.\nLocal `lazyteam-base`: current upstream snapshot, not the stale original base.\n\nReview the effective `lazyteam-base..HEAD` change against the task contract. When upstream advanced after implementation, preserve upstream changes and do not attribute upstream-only code to the candidate. If this candidate previously resolved a conflict, explicitly verify the resolution retained both current upstream behavior and the task intent.\n\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation report (untrusted):\n{}\n\nUse the local Git snapshot as the review source of truth. You may inspect files and run validation, but do not edit files. Return only the required JSON verdict object.\n",
+        "{initial_prompt}\n\n{AGENT_GIT_BOUNDARY}\n\nPinned integration review snapshot:\nProject: {}\nDefault branch: {}\nOriginal candidate SHA: {}\nOriginal candidate base SHA: {}\nCurrent upstream SHA reviewed: {}\nIntegrated result SHA: {}\nLocal `HEAD` / `lazyteam-task`: integrated result that would be published.\nLocal `lazyteam-base`: current upstream snapshot, not the stale original base.\n\nReview the effective `lazyteam-base..HEAD` change against the task contract. When upstream advanced after implementation, preserve upstream changes and do not attribute upstream-only code to the candidate. If this candidate previously resolved a conflict, explicitly verify the resolution retained both current upstream behavior and the task intent.\n\nImplementation worker: {} ({}/{})\n\nTask contract:\nTitle: {}\n\nDescription:\n{}\n\nExpected outcome:\n{}\n\nAcceptance criteria:\n{}\n\nImplementation report (untrusted):\n{}\n\nUse the local Git snapshot as the review source of truth. You may inspect files and run validation, but do not edit files. Finish by calling the `submit_review` MCP tool; do not return a verdict as prose or JSON.\n",
         assignment.project.name,
         assignment.checkout.default_branch,
         assignment.checkout.commit_sha,
@@ -1069,224 +1081,6 @@ fn reviewer_evidence_for_prompt(result: Option<&ExecutionResult>) -> anyhow::Res
         None => json!(null),
     };
     serde_json::to_string_pretty(&value).context("serialize reviewer implementation report")
-}
-
-fn parse_review_verdict(raw: &str) -> anyhow::Result<ReviewVerdict> {
-    let trimmed = raw.trim();
-    if let Ok(verdict) = serde_json::from_str::<ReviewVerdict>(trimmed) {
-        if verdict.reason.trim().is_empty() { bail!("review verdict reason is empty"); }
-        return Ok(verdict);
-    }
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start <= end {
-            let candidate = &trimmed[start..=end];
-            if let Ok(verdict) = serde_json::from_str::<ReviewVerdict>(candidate) {
-                if verdict.reason.trim().is_empty() { bail!("review verdict reason is empty"); }
-                return Ok(verdict);
-            }
-        }
-    }
-    bail!("reviewer did not return the required JSON verdict")
-}
-
-
-
-/// Resolve the review verdict for the current lease. A successfully parsed
-/// first output completes immediately. A format-only failure gets exactly one
-/// narrow same-session repair request that must only re-emit the
-/// already-decided verdict in the required JSON shape — never another code
-/// review. The repaired verdict completes the existing review row; no new row
-/// is created and runtime-failure counters are untouched by this path.
-async fn resolve_review_verdict_in_lease(
-    runtime: &dyn AgentRuntime,
-    agent_workspace: &Path,
-    session_manager: &SessionManager,
-    session_lock: &SessionLock,
-    session: &AgentSession,
-    first: &AgentRunResult,
-) -> anyhow::Result<ReviewVerdict> {
-    if let Ok(verdict) = parse_review_verdict(&first.summary) {
-        return Ok(verdict);
-    }
-    // Same backend logical reviewer session when supported: prefer a rotated
-    // opaque ID from the substantive run, otherwise the bound logical ID.
-    let repair_session = first
-        .backend_session_id
-        .as_deref()
-        .or(session.backend_session_id.as_deref());
-    // Exactly one formatting repair per lease: no loop, no new review row.
-    let repaired = match runtime.repair_review_verdict(agent_workspace, repair_session).await {
-        Ok(repaired) => repaired,
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "{}; format repair request failed: {}",
-                malformed_verdict_diagnostic(&first.summary),
-                backend_error_fingerprint(&error),
-            ));
-        }
-    };
-    // Parsing determines the branch: a successfully repaired verdict must
-    // never be misreported as malformed, even if its session binding fails.
-    match parse_review_verdict(&repaired.summary) {
-        Ok(verdict) => {
-            if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
-                return Err(anyhow::anyhow!(
-                    "repaired reviewer verdict parsed but its session could not persist: {}",
-                    backend_error_fingerprint(&error),
-                ));
-            }
-            info!("reviewer verdict repaired in-lease; completing existing review row");
-            Ok(verdict)
-        }
-        Err(_) => {
-            // The repaired summary is the malformed final output even when
-            // its binding cannot be persisted: still report it with the
-            // bounded excerpt/hash/length diagnostic. The bind is
-            // best-effort here so a persistence failure cannot displace or
-            // duplicate the malformed-output failure.
-            if let Err(error) = persist_backend_session_binding(session_manager, session_lock, session, &repaired).await {
-                warn!(
-                    "repaired reviewer session binding failed alongside malformed verdict: {}",
-                    backend_error_fingerprint(&error),
-                );
-            }
-            Err(anyhow::anyhow!(malformed_verdict_diagnostic(&repaired.summary)))
-        }
-    }
-}
-
-/// Durable diagnostic for a malformed verdict: hash/length plus
-/// fixed-vocabulary structural facts about the malformed final output. No
-/// input bytes are ever copied into the diagnostic — every emitted token
-/// after the fixed prefix is a number or a constant authored below — so the
-/// diagnostic is non-secret by construction however the model formatted its
-/// output, while still distinguishing truncation, prose-wrapping, and
-/// wrong-shape failures for diagnosis.
-fn malformed_verdict_diagnostic(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let len = raw.len();
-    let hash = fnv1a64_hex(raw.as_bytes());
-    let lines = raw.lines().count();
-    let (object, cause) = classify_malformed_verdict(trimmed);
-    let keys = present_fixed_keys(trimmed);
-    let hint = verdict_hint(trimmed);
-    format!(
-        "reviewer did not return the required JSON verdict (len={len} hash={hash} lines={lines} object={object} keys={keys} hint={hint} cause={cause})"
-    )
-}
-
-/// Classify the outer JSON-object shape without echoing any input. The
-/// `{`/`}` offsets come from `str::find` on ASCII bytes, so the candidate
-/// slice cannot split a UTF-8 character.
-fn classify_malformed_verdict(trimmed: &str) -> (&'static str, &'static str) {
-    if trimmed.is_empty() {
-        return ("absent", "empty");
-    }
-    let (start, end) = match (trimmed.find('{'), trimmed.rfind('}')) {
-        (Some(start), Some(end)) if start <= end => (start, end),
-        (None, None) => return ("absent", "no-object"),
-        _ => return ("unbalanced", "unbalanced"),
-    };
-    let object = if start == 0 && end + 1 == trimmed.len() { "whole" } else { "wrapped" };
-    match serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
-        Err(_) => (object, "invalid-json"),
-        // Mirror `parse_review_verdict`'s strictness structurally: an empty
-        // reason or any other valid-JSON-but-not-a-verdict shape, without
-        // echoing the offending values.
-        Ok(value) => {
-            let reason_empty = value
-                .get("reason")
-                .and_then(|reason| reason.as_str())
-                .is_some_and(|reason| reason.trim().is_empty());
-            if reason_empty {
-                (object, "empty-reason")
-            } else {
-                (object, "shape-mismatch")
-            }
-        }
-    }
-}
-
-/// Fixed-vocabulary presence signals over literal JSON key names. Only the
-/// constant labels below are ever emitted.
-fn present_fixed_keys(trimmed: &str) -> &'static str {
-    match (
-        trimmed.contains("\"verdict\""),
-        trimmed.contains("\"reason\""),
-        trimmed.contains("\"validation\""),
-    ) {
-        (true, true, true) => "verdict,reason,validation",
-        (true, true, false) => "verdict,reason",
-        (true, false, true) => "verdict,validation",
-        (false, true, true) => "reason,validation",
-        (true, false, false) => "verdict",
-        (false, true, false) => "reason",
-        (false, false, true) => "validation",
-        (false, false, false) => "none",
-    }
-}
-
-/// Fixed-vocabulary presence signal over the two legal verdict literals.
-/// Emits only the constant labels below, never input text.
-fn verdict_hint(trimmed: &str) -> &'static str {
-    match (trimmed.contains("approve"), trimmed.contains("retry")) {
-        (true, true) => "both",
-        (true, false) => "approve",
-        (false, true) => "retry",
-        (false, false) => "none",
-    }
-}
-
-/// Fingerprint a backend/session error for durable evidence and logs
-/// without copying its text: backend errors can embed raw event payloads,
-/// so only a closed operational label plus length and hash are emitted.
-fn backend_error_fingerprint(error: &anyhow::Error) -> String {
-    let full = format!("{error:#}");
-    format!(
-        "error_kind={} error_len={} error_hash={}",
-        classify_backend_error(&full),
-        full.len(),
-        fnv1a64_hex(full.as_bytes()),
-    )
-}
-
-/// Closed operational vocabulary over our own static backend/session error
-/// constructors. This table classifies failures for operators; it makes no
-/// secrecy claims and needs none, because every emitted label is a constant
-/// and unrecognized errors still yield a fixed label, never input bytes.
-fn classify_backend_error(message: &str) -> &'static str {
-    const TABLE: &[(&str, &str)] = &[
-        ("timed out", "timeout"),
-        ("unresponsive after", "unresponsive"),
-        ("stayed inactive", "inactive"),
-        ("no observable progress", "tool-stall"),
-        ("interactive extension ui", "interactive-ui"),
-        ("final assistant text", "no-final-text"),
-        ("before agent_settled", "early-exit"),
-        ("stdin missing", "rpc-io"),
-        ("stdout missing", "rpc-io"),
-        ("stderr missing", "rpc-io"),
-        ("persist session", "session-persist"),
-        ("session lock", "session-bind"),
-        ("backend session", "session-bind"),
-        ("spawn", "spawn-failed"),
-    ];
-    let lowered = message.to_ascii_lowercase();
-    for (fragment, label) in TABLE {
-        if lowered.contains(fragment) {
-            return label;
-        }
-    }
-    "backend-error"
-}
-
-fn fnv1a64_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
 }
 
 async fn execute_assignment(
@@ -2134,317 +1928,6 @@ mod tests {
         assert!(!evidence.contains("base-secret-sha"));
         assert!(!evidence.contains("task-secret-ref"));
         assert!(!evidence.contains("diff containing implementation"));
-    }
-
-    #[test]
-    fn reviewer_verdict_parser_accepts_json_and_rejects_missing_reason() {
-        let verdict = parse_review_verdict(r#"{"verdict":"approve","reason":"verified","validation":["cargo test"]}"#).unwrap();
-        assert_eq!(verdict.verdict, lazyteam_core::ReviewVerdictKind::Approve);
-        assert_eq!(verdict.reason, "verified");
-        let wrapped = parse_review_verdict("Result:\n{\"verdict\":\"retry\",\"reason\":\"missing test\",\"validation\":[]}").unwrap();
-        assert_eq!(wrapped.verdict, lazyteam_core::ReviewVerdictKind::Retry);
-        assert!(parse_review_verdict(r#"{"verdict":"approve","reason":"","validation":[]}"#).is_err());
-    }
-
-    /// Fake reviewer backend for in-lease format-repair tests: records the
-    /// session ID each repair call receives so tests can assert the same
-    /// logical reviewer session is reused, and serves scripted repair
-    /// outputs so each test performs at most one repair attempt.
-    struct FakeReviewRuntime {
-        repair_outputs: std::sync::Mutex<Vec<String>>,
-        repair_error: std::sync::Mutex<Option<String>>,
-        repair_calls: std::sync::atomic::AtomicUsize,
-        last_repair_session: std::sync::Mutex<Vec<Option<String>>>,
-    }
-
-    impl FakeReviewRuntime {
-        fn with_repairs(outputs: Vec<String>) -> Self {
-            Self {
-                repair_outputs: std::sync::Mutex::new(outputs),
-                repair_error: std::sync::Mutex::new(None),
-                repair_calls: std::sync::atomic::AtomicUsize::new(0),
-                last_repair_session: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
-        fn failing_repair(message: String) -> Self {
-            Self {
-                repair_outputs: std::sync::Mutex::new(Vec::new()),
-                repair_error: std::sync::Mutex::new(Some(message)),
-                repair_calls: std::sync::atomic::AtomicUsize::new(0),
-                last_repair_session: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
-        fn repair_call_count(&self) -> usize {
-            self.repair_calls.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl AgentRuntime for FakeReviewRuntime {
-        fn kind(&self) -> &'static str { "fake-review" }
-        async fn capabilities(&self) -> AgentCapabilities { AgentCapabilities::default() }
-        async fn run(&self, _workspace: &Path, _prompt: &str, _backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
-            unreachable!("in-lease tests drive resolve_review_verdict_in_lease directly")
-        }
-        async fn repair_review_verdict(&self, _workspace: &Path, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
-            self.repair_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.last_repair_session.lock().unwrap().push(backend_session_id.map(str::to_string));
-            if let Some(message) = self.repair_error.lock().unwrap().take() {
-                return Err(anyhow::Error::msg(message));
-            }
-            let mut outputs = self.repair_outputs.lock().unwrap();
-            assert!(!outputs.is_empty(), "repair must be attempted at most once per lease");
-            // A rotated backend ID, so the in-lease bind path is exercised.
-            Ok(AgentRunResult { summary: outputs.remove(0), backend_session_id: Some("ses_repaired_opaque".into()) })
-        }
-    }
-
-    async fn lease_harness(runtime: &FakeReviewRuntime, first_summary: &str) -> anyhow::Result<ReviewVerdict> {
-        let root = std::env::temp_dir().join(format!("lazyteam-review-lease-{}", Uuid::new_v4()));
-        tokio::fs::create_dir_all(&root).await.unwrap();
-        let manager = SessionManager::new(root.join("state"));
-        let task_id = Uuid::new_v4();
-        let lock = manager.lock_session(task_id, SessionRole::Review).await;
-        let session = manager.acquire_with(&lock, task_id, SessionRole::Review, "pi").await.unwrap();
-        let first = AgentRunResult { summary: first_summary.to_string(), backend_session_id: None };
-        let outcome = resolve_review_verdict_in_lease(runtime, &root, &manager, &lock, &session, &first).await;
-        let _ = tokio::fs::remove_dir_all(&root).await;
-        outcome
-    }
-
-    #[tokio::test]
-    async fn in_lease_pure_valid_json_needs_no_repair() {
-        let runtime = FakeReviewRuntime::with_repairs(vec![]);
-        let verdict = lease_harness(&runtime, r#"{"verdict":"approve","reason":"verified","validation":[]}"#).await.unwrap();
-        assert_eq!(verdict.verdict, lazyteam_core::ReviewVerdictKind::Approve);
-        assert_eq!(runtime.repair_call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn in_lease_prose_wrapped_valid_json_needs_no_repair() {
-        let runtime = FakeReviewRuntime::with_repairs(vec![]);
-        let verdict = lease_harness(&runtime, "Result:\n{\"verdict\":\"retry\",\"reason\":\"missing test\",\"validation\":[]}\nThanks").await.unwrap();
-        assert_eq!(verdict.verdict, lazyteam_core::ReviewVerdictKind::Retry);
-        assert_eq!(runtime.repair_call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn in_lease_malformed_first_then_repaired_in_same_session() {
-        let runtime = FakeReviewRuntime::with_repairs(vec![
-            r#"{"verdict":"approve","reason":"reformatted after repair","validation":[]}"#.to_string(),
-        ]);
-        let verdict = lease_harness(&runtime, "I approve this change but forgot the JSON shape").await.unwrap();
-        assert_eq!(verdict.verdict, lazyteam_core::ReviewVerdictKind::Approve);
-        assert_eq!(verdict.reason, "reformatted after repair");
-        assert_eq!(runtime.repair_call_count(), 1);
-        // Same backend logical reviewer session is reused for the repair.
-        let sessions = runtime.last_repair_session.lock().unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert!(sessions[0].as_deref().is_some_and(|id| id.starts_with("review-")));
-    }
-
-    #[tokio::test]
-    async fn in_lease_malformed_twice_fails_once_with_bounded_diagnostics() {
-        let malformed = format!("still not json {}", "x".repeat(5000));
-        let runtime = FakeReviewRuntime::with_repairs(vec![malformed.clone()]);
-        let error = lease_harness(&runtime, "first malformed output with no JSON").await.unwrap_err();
-        assert_eq!(runtime.repair_call_count(), 1, "at most one repair per lease");
-        let message = error.to_string();
-        assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
-        assert!(message.contains("len="), "diagnostic must carry length: {message}");
-        assert!(message.contains("hash="), "diagnostic must carry hash: {message}");
-        assert!(message.contains("object=absent"), "prose must classify structurally: {message}");
-        assert!(message.contains("cause=no-object"), "prose must classify structurally: {message}");
-        // Bounded fixed-size diagnostic: the 5000-char filler must not appear.
-        assert!(message.len() < malformed.len(), "diagnostic must be bounded");
-        assert!(!message.contains(&"x".repeat(1000)), "no raw output may be embedded");
-        // Strict: prose is never regex-guessed into a verdict.
-        assert!(parse_review_verdict(&malformed).is_err());
-    }
-
-    #[test]
-    fn malformed_diagnostic_embeds_no_raw_values() {
-        // Regression: the diagnostic carries hash/length plus structural
-        // facts only, so even arbitrary previously-unknown secret strings
-        // with no recognized field, prefix, or context cannot appear in
-        // durable evidence or logs. Every secret below defeated at least
-        // one generation of the old shape allowlist.
-        let unknowns = [
-            "zz-top-secret-blob-9f8e7d6c5b4a",
-            "mystery=xyzzy-unknown-format-12345",
-            "Bearer bearer-secret-value-12345",
-            "password=hunter2-secret",
-            "-----BEGIN MYSTERY KEY-----\nquux-quuz-corge",
-            "ENCRYPTION_KEY=enc-key-secret-001",
-            "CREDENTIAL=cred-secret-004",
-            "SESSION_ID=sess-field-secret-005",
-            "Cookie: connect.sid=sess-id-secret-002; Path=/",
-            "Cookie: connect.sid=\"sess-quoted-secret-003\"; Path=/",
-            "postgres://deploy:db-password-secret-456@db.internal:5432/app",
-            "sk_live_abc123def456ghi789",
-            "AIzaSyD-secret-raw-006",
-        ];
-        for secret in unknowns {
-            let raw = format!("model rambled: {secret} {}", "w".repeat(3000));
-            let diagnostic = malformed_verdict_diagnostic(&raw);
-            // Neither the whole secret nor any of its distinctive tokens.
-            assert!(!diagnostic.contains(secret), "secret leaked: {diagnostic}");
-            for token in secret.split(|c: char| !c.is_alphanumeric()) {
-                if token.len() >= 6 {
-                    assert!(!diagnostic.contains(token), "secret token {token:?} leaked: {diagnostic}");
-                }
-            }
-            // Fixed-size vocabulary plus numbers only.
-            assert!(diagnostic.is_ascii(), "diagnostic must be fixed-vocabulary: {diagnostic}");
-            assert!(diagnostic.len() < 512, "diagnostic must stay bounded: {diagnostic}");
-            assert!(diagnostic.contains("len="), "diagnostic must carry length");
-            assert!(diagnostic.contains("hash="), "diagnostic must carry hash");
-        }
-    }
-
-    #[test]
-    fn malformed_diagnostic_classifies_malformed_shapes() {
-        // Structural facts replace the old raw excerpt: truncation,
-        // prose-wrapping, and wrong-shape failures stay distinguishable.
-        let truncated = malformed_verdict_diagnostic("{\"verdict\":\"retry\",\"reason\":\"abc");
-        assert!(truncated.contains("object=unbalanced"), "unexpected: {truncated}");
-        assert!(truncated.contains("cause=unbalanced"), "unexpected: {truncated}");
-        let wrapped = malformed_verdict_diagnostic(
-            "Result:\n{\"verdict\":\"retry\",\"reason\":\"\",\"validation\":[]}\nThanks",
-        );
-        assert!(wrapped.contains("object=wrapped"), "unexpected: {wrapped}");
-        assert!(wrapped.contains("cause=empty-reason"), "unexpected: {wrapped}");
-        assert!(wrapped.contains("hint=retry"), "unexpected: {wrapped}");
-        let shape = malformed_verdict_diagnostic(r#"{"verdict":"maybe","reason":"x"}"#);
-        assert!(shape.contains("object=whole"), "unexpected: {shape}");
-        assert!(shape.contains("cause=shape-mismatch"), "unexpected: {shape}");
-        // The offending variant value is never echoed.
-        assert!(!shape.contains("maybe"), "value leaked: {shape}");
-        let invalid = malformed_verdict_diagnostic("{oops}");
-        assert!(invalid.contains("cause=invalid-json"), "unexpected: {invalid}");
-        let empty = malformed_verdict_diagnostic("   ");
-        assert!(empty.contains("cause=empty"), "unexpected: {empty}");
-    }
-
-    #[tokio::test]
-    async fn binding_failure_still_reports_malformed_final_output() {
-        // A malformed repair response that rotates the backend ID but whose
-        // binding cannot persist must still fail exactly once with the
-        // bounded excerpt/hash/length of that final output.
-        let runtime = FakeReviewRuntime::with_repairs(vec![format!(
-            "malformed repair ENCRYPTION_KEY=bind-fail-secret-003 {}",
-            "q".repeat(3000),
-        )]);
-        let root = std::env::temp_dir().join(format!("lazyteam-review-bind-fail-{}", Uuid::new_v4()));
-        tokio::fs::create_dir_all(&root).await.unwrap();
-        let manager = SessionManager::new(root.join("state"));
-        let task_id = Uuid::new_v4();
-        let lock = manager.lock_session(task_id, SessionRole::Review).await;
-        // An empty backend forces the post-repair bind to fail.
-        let session = AgentSession {
-            task_id,
-            role: SessionRole::Review,
-            backend: String::new(),
-            backend_session_id: None,
-            data_dir: root.join("data"),
-            last_used_at_unix: 0,
-        };
-        let first = AgentRunResult { summary: "first malformed, no JSON".into(), backend_session_id: None };
-        let error = resolve_review_verdict_in_lease(&runtime, &root, &manager, &lock, &session, &first)
-            .await
-            .unwrap_err();
-        assert_eq!(runtime.repair_call_count(), 1, "at most one repair per lease");
-        let message = error.to_string();
-        assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
-        assert!(message.contains("len="), "diagnostic must carry length: {message}");
-        assert!(message.contains("hash="), "diagnostic must carry hash: {message}");
-        assert!(message.contains("object=absent"), "diagnostic must classify shape: {message}");
-        assert!(message.contains("cause=no-object"), "diagnostic must classify shape: {message}");
-        assert!(!message.contains("bind-fail-secret-003"), "secret leaked: {message}");
-        assert!(!message.contains(&"q".repeat(1000)), "giant output must be capped");
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn valid_repair_with_binding_failure_is_not_malformed() {
-        // A successfully parsed repair whose binding cannot persist must be
-        // reported as a session-persistence failure, never as a malformed
-        // verdict, so it cannot take the runtime-failure path.
-        let runtime = FakeReviewRuntime::with_repairs(vec![
-            r#"{"verdict":"retry","reason":"missing test","validation":[]}"#.to_string(),
-        ]);
-        let root = std::env::temp_dir().join(format!("lazyteam-review-bind-valid-{}", Uuid::new_v4()));
-        tokio::fs::create_dir_all(&root).await.unwrap();
-        let manager = SessionManager::new(root.join("state"));
-        let task_id = Uuid::new_v4();
-        let lock = manager.lock_session(task_id, SessionRole::Review).await;
-        // An empty backend forces the post-repair bind to fail.
-        let session = AgentSession {
-            task_id,
-            role: SessionRole::Review,
-            backend: String::new(),
-            backend_session_id: None,
-            data_dir: root.join("data"),
-            last_used_at_unix: 0,
-        };
-        let first = AgentRunResult { summary: "first malformed, no JSON".into(), backend_session_id: None };
-        let error = resolve_review_verdict_in_lease(&runtime, &root, &manager, &lock, &session, &first)
-            .await
-            .unwrap_err();
-        assert_eq!(runtime.repair_call_count(), 1, "at most one repair per lease");
-        let message = error.to_string();
-        assert!(!message.contains("did not return the required JSON verdict"), "valid repair misreported as malformed: {message}");
-        assert!(message.contains("could not persist"), "unexpected: {message}");
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[test]
-    fn malformed_diagnostic_is_ascii_and_bounded_for_non_ascii_output() {
-        // Accented words, ellipsis, CJK, and emoji exercise every byte
-        // alignment: classification uses `str::find` on ASCII braces only,
-        // so no mid-character slicing panic is possible, and no input
-        // bytes — ASCII or otherwise — reach the diagnostic.
-        let raw = format!(
-            "héllo wörld … {}",
-            "café Naïve \u{4e2d}\u{6587} \u{1f600} password=non-ascii-secret-\u{00e9}\u{4e2d}".repeat(40),
-        );
-        let diagnostic = malformed_verdict_diagnostic(&raw);
-        assert!(diagnostic.contains("reviewer did not return the required JSON verdict"));
-        assert!(diagnostic.contains("len="), "diagnostic must carry length");
-        assert!(diagnostic.contains("hash="), "diagnostic must carry hash");
-        assert!(diagnostic.is_ascii(), "diagnostic must be fixed-vocabulary: {diagnostic}");
-        assert!(!diagnostic.contains("non-ascii-secret"), "secret leaked: {diagnostic}");
-        assert!(diagnostic.len() < 512, "diagnostic must stay bounded: {diagnostic}");
-    }
-
-    #[tokio::test]
-    async fn repair_request_failure_embeds_no_raw_text() {
-        // Backend repair errors can embed raw event payloads, and the first
-        // output is untrusted model text: the persisted failure must carry
-        // only structural facts and fingerprints, never raw bytes.
-        let repair_error = format!(
-            "Pi RPC blew up with Bearer repair-bearer-secret-999 {} event={{\"type\":\"message_update\"}}",
-            "y".repeat(4000),
-        );
-        let runtime = FakeReviewRuntime::failing_repair(repair_error);
-        let first = format!("first malformed output password=first-output-secret {}", "w".repeat(5000));
-        let error = lease_harness(&runtime, &first).await.unwrap_err();
-        assert_eq!(runtime.repair_call_count(), 1, "at most one repair per lease");
-        let message = error.to_string();
-        assert!(message.contains("reviewer did not return the required JSON verdict"), "unexpected: {message}");
-        assert!(message.contains("format repair request failed"), "unexpected: {message}");
-        assert!(message.contains("error_kind="), "failure must fingerprint the backend error: {message}");
-        assert!(message.contains("error_len="), "failure must fingerprint the backend error: {message}");
-        assert!(message.contains("error_hash="), "failure must fingerprint the backend error: {message}");
-        for leaked in ["repair-bearer-secret-999", "first-output-secret", "message_update"] {
-            assert!(!message.contains(leaked), "raw text leaked in failure: {message}");
-        }
-        assert!(!message.contains(&"y".repeat(100)), "backend filler must be absent");
-        assert!(!message.contains(&"w".repeat(100)), "giant output must be absent");
-        assert!(message.is_ascii(), "failure must be fixed-vocabulary: {message}");
-        assert!(message.len() < 1000, "failure diagnostic must stay bounded, got {} chars", message.len());
     }
 
     #[test]
