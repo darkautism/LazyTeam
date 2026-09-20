@@ -27,7 +27,7 @@ mod security;
 mod web;
 
 pub(crate) use api::{
-    create_project, create_task, delete_task, list_projects, list_tasks, list_workers, review_evidence, ApiError, AppState,
+    create_project, create_task, delete_task, list_projects, list_tasks, list_workers, review_evidence, task_status, ApiError, AppState,
     CreateProject, CreateTask,
 };
 
@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         git_credential_key,
         git_root,
         agent_auth_updates: Default::default(),
+        model_refresh_requests: Default::default(),
     });
 
     let mcp_state = state.clone();
@@ -269,6 +270,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir().join("lazyteam-test-git"),
             agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
         });
         let mcp_state = state.clone();
         let service = StreamableHttpService::new(

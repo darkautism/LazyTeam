@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     api::delete_worker,
-    create_project, create_task, delete_task, list_projects, list_tasks, list_workers, review, review_evidence, AppState,
+    create_project, create_task, delete_task, list_projects, list_tasks, list_workers, review, review_evidence, task_status, AppState,
     CreateProject, CreateTask,
 };
 
@@ -243,6 +243,28 @@ impl LazyTeamMcp {
     async fn tasks_list(&self) -> Result<CallToolResult, McpError> {
         let Json(items) = list_tasks(State(self.state.clone())).await.map_err(api_to_mcp)?;
         json_result(&items)
+    }
+
+    #[tool(
+        name = "tasks_get",
+        title = "Get task status",
+        description = "Get one task together with its latest execution result, including failure summary and attempt metadata",
+        annotations(
+            title = "Get task status",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tasks_get(
+        &self,
+        Parameters(input): Parameters<TaskIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = Uuid::parse_str(&input.task_id)
+            .map_err(|e| McpError::invalid_params("invalid task_id", Some(serde_json::json!({"error": e.to_string()}))))?;
+        let Json(status) = task_status(State(self.state.clone()), Path(task_id)).await.map_err(api_to_mcp)?;
+        json_result(&status)
     }
 
     #[tool(
@@ -569,6 +591,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::path::PathBuf::from("/tmp/lazyteam-mcp-test-git"),
             agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
         });
         LazyTeamMcp::new(state)
     }

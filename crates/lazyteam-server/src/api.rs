@@ -42,6 +42,7 @@ pub(crate) struct AppState {
     pub(crate) git_credential_key: Option<[u8; 32]>,
     pub(crate) git_root: PathBuf,
     pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, PendingAgentAuth>>>,
+    pub(crate) model_refresh_requests: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
 pub(crate) struct PendingAgentAuth {
@@ -152,6 +153,12 @@ fn is_reviewer_retry_verdict(verdict_json: Option<&str>) -> bool {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct TaskStatus {
+    pub(crate) task: Task,
+    pub(crate) latest_execution: Option<Execution>,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct ReviewCheckout {
     pub(crate) repo_url: String,
     pub(crate) default_branch: String,
@@ -245,6 +252,7 @@ struct WorkerRuntimeConfig {
     managed_capabilities: BTreeSet<String>,
     installed_capabilities: BTreeSet<String>,
     paused: bool,
+    model_refresh_provider: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -265,6 +273,17 @@ struct AgentAuthDelivery {
     id: Uuid,
     provider: String,
     api_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentModelRefreshInput {
+    provider: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentModelRefreshQueued {
+    provider: String,
+    queued: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -403,6 +422,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/config", get(worker_runtime_config))
         .route("/api/workers/{id}/provider-key", post(queue_worker_provider_key))
         .route("/api/workers/{id}/agent-auth", get(worker_agent_auth))
+        .route("/api/workers/{id}/models/refresh", post(queue_worker_model_refresh))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
@@ -587,6 +607,17 @@ pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input):
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Task>> {
     let rows = sqlx::query("SELECT * FROM tasks WHERE state!='cancelled' ORDER BY priority DESC, created_at ASC").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(task_from_row).collect::<Result<Vec<_>,_>>().map(Json)
+}
+
+pub(crate) async fn task_status(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> ApiResult<TaskStatus> {
+    let task_row = sqlx::query("SELECT * FROM tasks WHERE id=? AND state!='cancelled'")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "task not found".into()))?;
+    let task = task_from_row(&task_row)?;
+    let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
+    let latest_execution = execution_row.as_ref().map(execution_from_row).transpose()?;
+    Ok(Json(TaskStatus { task, latest_execution }))
 }
 
 pub(crate) async fn delete_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
@@ -852,6 +883,7 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
     require_worker(&state.db, id, &headers).await?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let worker = worker_from_row(&row)?;
+    let model_refresh_provider = state.model_refresh_requests.lock().await.remove(&id);
     Ok(Json(WorkerRuntimeConfig {
         role: worker.role,
         agent: worker.agent,
@@ -859,6 +891,7 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
         managed_capabilities: worker.managed_capabilities,
         installed_capabilities: worker.installed_capabilities,
         paused: matches!(worker.state, WorkerState::Draining),
+        model_refresh_provider,
     }))
 }
 
@@ -906,6 +939,29 @@ async fn worker_agent_auth(
         }).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+async fn queue_worker_model_refresh(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<AgentModelRefreshInput>,
+) -> ApiResult<AgentModelRefreshQueued> {
+    let provider = input.provider.trim();
+    if provider.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "provider is required".into()));
+    }
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
+    let worker = worker_from_row(&row)?;
+    let candidate = worker.agent_capabilities.providers.iter()
+        .find(|candidate| candidate.id == provider)
+        .ok_or((StatusCode::BAD_REQUEST, "provider is not reported by this worker's agent runtime".into()))?;
+    if !candidate.configured {
+        return Err((StatusCode::CONFLICT, "provider authentication must be configured before refreshing its model catalog".into()));
+    }
+    state.model_refresh_requests.lock().await.insert(id, provider.to_string());
+    Ok(Json(AgentModelRefreshQueued { provider: provider.to_string(), queued: true }))
 }
 
 async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(capabilities): Json<AgentCapabilities>) -> Result<StatusCode, ApiError> {
@@ -1920,6 +1976,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
         });
         let board = task_board(State(state)).await.unwrap().0;
         assert_eq!(board.len(), 1);

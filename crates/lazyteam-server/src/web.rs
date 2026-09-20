@@ -130,6 +130,11 @@ mod tests {
         assert!(INDEX.contains("worker-config-prompt"));
         assert!(INDEX.contains("worker-provider-auth"));
         assert!(INDEX.contains("renderProviderAuth"));
+        assert!(INDEX.contains("worker-model-refresh"));
+        assert!(INDEX.contains("refreshProviderModels"));
+        assert!(!INDEX.contains("clear_model:!(provider&&model)"));
+        assert!(INDEX.contains("/models/refresh"));
+        assert!(INDEX.contains("Configure provider authentication before refreshing models"));
         assert!(INDEX.contains("onWorkerRoleChange"));
         assert!(INDEX.contains("renderWorkerModels"));
         assert!(INDEX.contains("renderAgentCatalog"));
@@ -184,6 +189,10 @@ mod tests {
         assert!(INDEX.contains("Git failed"));
         assert!(INDEX.contains("/git-probe"));
         assert!(INDEX.contains("probeProjectGit"));
+        assert!(INDEX.contains("title=\"Edit project\""));
+        assert!(INDEX.contains("toggleLabel=p.enabled?'Disable project':'Enable project'"));
+        assert!(INDEX.contains("title=\"Delete project\""));
+        assert!(INDEX.contains("title=\"Delete task\""));
         assert!(INDEX.contains("merge_pending"));
         assert!(!INDEX.contains(">Approve</button>"));
         assert!(!INDEX.contains(">Retry</button>"));

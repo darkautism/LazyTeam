@@ -13,6 +13,7 @@ const DEFAULT_WATCHDOG_PROBE_INTERVAL_SECS: u64 = 120;
 const DEFAULT_WATCHDOG_PROBE_GRACE_SECS: u64 = 30;
 const DEFAULT_WATCHDOG_MAX_MISSED_PROBES: u32 = 3;
 const DEFAULT_WATCHDOG_MAX_INACTIVE_PROBES: u32 = 3;
+const DEFAULT_WATCHDOG_TOOL_STALL_SECS: u64 = 30 * 60;
 const DEFAULT_REVIEW_SOFT_TOOL_BUDGET: u64 = 12;
 const DEFAULT_REVIEW_HARD_TOOL_BUDGET: u64 = 20;
 
@@ -57,6 +58,19 @@ fn watchdog_max_inactive_probes() -> u32 {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(DEFAULT_WATCHDOG_MAX_INACTIVE_PROBES)
         .clamp(2, 10)
+}
+
+fn watchdog_tool_stall_window() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_HARNESS_TOOL_STALL_SECS",
+        DEFAULT_WATCHDOG_TOOL_STALL_SECS,
+        30 * 60,
+        6 * 60 * 60,
+    )
+}
+
+fn tool_stalled(last_progress: Instant, now: Instant, window: Duration) -> bool {
+    now.saturating_duration_since(last_progress) >= window
 }
 
 fn review_tool_budgets() -> (u64, u64) {
@@ -292,8 +306,10 @@ impl PiRuntime {
         let probe_grace = watchdog_probe_grace();
         let max_missed_probes = watchdog_max_missed_probes();
         let max_inactive_probes = watchdog_max_inactive_probes();
+        let tool_stall_window = watchdog_tool_stall_window();
         let mut phase = RunPhase::Starting;
         let mut active_tool: Option<String> = None;
+        let mut tool_progress_at: Option<Instant> = None;
         let mut next_probe_at = Instant::now() + probe_interval;
         let mut probe_deadline: Option<Instant> = None;
         let mut missed_probes = 0u32;
@@ -355,8 +371,17 @@ impl PiRuntime {
                 }
             };
 
+            let event_type = event.get("type").and_then(Value::as_str);
             if observe_pi_activity(&event, &mut phase, &mut active_tool) {
                 inactive_probes = 0;
+                match event_type {
+                    Some("tool_execution_start") | Some("tool_execution_update") => {
+                        tool_progress_at = Some(Instant::now());
+                    }
+                    Some("tool_execution_end") => tool_progress_at = None,
+                    _ if phase != RunPhase::ToolRunning => tool_progress_at = None,
+                    _ => {}
+                }
             }
             if let Some(active) = pi_state_probe_active(&event, phase, active_tool.as_deref()) {
                 if active {
@@ -381,7 +406,31 @@ impl PiRuntime {
                 }
             }
 
-            match event.get("type").and_then(Value::as_str) {
+            if phase == RunPhase::ToolRunning {
+                if let Some(last_progress) = tool_progress_at {
+                    let now = Instant::now();
+                    if tool_stalled(last_progress, now, tool_stall_window) {
+                        let stalled_for = now.saturating_duration_since(last_progress);
+                        let tool = active_tool.as_deref().unwrap_or("unknown");
+                        tracing::warn!(
+                            session = session_name,
+                            active_tool = tool,
+                            stalled_for_secs = stalled_for.as_secs(),
+                            stall_limit_secs = tool_stall_window.as_secs(),
+                            "Pi tool produced no observable progress; aborting stalled tool run"
+                        );
+                        let reason = format!(
+                            "Pi tool '{tool}' produced no observable progress for {}s (limit {}s)",
+                            stalled_for.as_secs(),
+                            tool_stall_window.as_secs(),
+                        );
+                        abort_pi_run(&mut child, &mut stdin).await;
+                        bail!(reason);
+                    }
+                }
+            }
+
+            match event_type {
                 Some("message_update") => {
                     if let Some(delta) = event
                         .get("assistantMessageEvent")
@@ -507,6 +556,44 @@ console.log(JSON.stringify(providers));"#
                 .context("parse Pi provider probe output")?;
             Ok(providers)
         }).await.context("Pi provider probe timed out")?
+    }
+
+    pub async fn force_refresh_models(&self, provider: &str) -> anyhow::Result<()> {
+        let index = self.pi_module_index()?;
+        let import_url = serde_json::to_string(&format!("file://{}", index.display()))?;
+        let provider = serde_json::to_string(provider)?;
+        let script = format!(
+            r#"import {{ ModelRuntime }} from {import_url};
+const dir=process.env.PI_CODING_AGENT_DIR;
+const provider={provider};
+const controller=new AbortController();
+const timeout=setTimeout(()=>controller.abort(),15000);
+try {{
+  const rt=await ModelRuntime.create({{
+    authPath:dir+"/auth.json",
+    modelsPath:dir+"/models.json",
+    modelsStorePath:dir+"/models-store.json",
+    allowModelNetwork:false,
+    refreshOnCreate:false
+  }});
+  const result=await rt.refresh({{allowNetwork:true,force:true,providers:[provider],signal:controller.signal}});
+  if(result.aborted) throw new Error("model catalog refresh aborted");
+  const error=result.errors.get(provider);
+  if(error) throw error;
+}} finally {{ clearTimeout(timeout); }}
+console.log("ok");"#
+        );
+        let sandbox = self.sandbox.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+            let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
+            command.arg("--input-type=module").arg("--eval").arg(script);
+            command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = command.output().await.context("run Pi forced model catalog refresh")?;
+            if !output.status.success() {
+                bail!("Pi model catalog refresh failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+            }
+            Ok(())
+        }).await.context("Pi model catalog refresh timed out")?
     }
 
     async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
@@ -642,6 +729,31 @@ mod tests {
         assert_eq!(phase, RunPhase::ProviderRetry);
         assert!(observe_pi_activity(&json!({"type":"auto_retry_end"}), &mut phase, &mut tool));
         assert_eq!(phase, RunPhase::ModelWaiting);
+    }
+
+    #[test]
+    fn tool_stall_clock_allows_periodic_progress() {
+        let start = Instant::now();
+        let window = Duration::from_secs(30 * 60);
+        let refreshed = start + Duration::from_secs(20 * 60);
+        let now = start + Duration::from_secs(40 * 60);
+        assert!(!tool_stalled(refreshed, now, window));
+    }
+
+    #[test]
+    fn tool_stall_clock_terminates_no_progress_past_window() {
+        let start = Instant::now();
+        let window = Duration::from_secs(30 * 60);
+        assert!(tool_stalled(start, start + Duration::from_secs(31 * 60), window));
+    }
+
+    #[test]
+    fn switching_tools_resets_tool_stall_clock() {
+        let start = Instant::now();
+        let window = Duration::from_secs(30 * 60);
+        let second_tool_started = start + Duration::from_secs(29 * 60);
+        let now = start + Duration::from_secs(45 * 60);
+        assert!(!tool_stalled(second_tool_started, now, window));
     }
 
     #[test]

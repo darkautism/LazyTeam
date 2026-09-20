@@ -80,6 +80,8 @@ struct WorkerRuntimeConfig {
     installed_capabilities: BTreeSet<String>,
     #[serde(default)]
     paused: bool,
+    #[serde(default)]
+    model_refresh_provider: Option<String>,
 }
 
 fn default_runtime_slots() -> u32 { 1 }
@@ -324,6 +326,22 @@ async fn async_main() -> anyhow::Result<()> {
             ).await;
         }
     }
+    if let Some(provider) = runtime_config.model_refresh_provider.take() {
+        info!(provider = %provider, "forced model catalog refresh requested during startup");
+        match probe_runtime.force_refresh_models(&provider).await {
+            Ok(()) => {
+                agent_capabilities = probe_runtime.capabilities().await;
+                if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
+                    warn!(%error, "agent capability report after startup model refresh failed");
+                }
+            }
+            Err(error) => {
+                warn!(%error, provider = %provider, "startup model catalog refresh failed");
+                agent_capabilities.probe_error = Some(format!("model catalog refresh for {provider} failed: {error:#}"));
+                let _ = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await;
+            }
+        }
+    }
     let mut next_capability_probe = Instant::now() + Duration::from_secs(60);
     let mut active_jobs = JoinSet::<anyhow::Result<()>>::new();
     let session_manager = SessionManager::new(&args.state_dir);
@@ -371,6 +389,23 @@ async fn async_main() -> anyhow::Result<()> {
         match fetch_runtime_config(&client, &server, &worker_credential, worker_id).await {
             Ok(config) => runtime_config = config,
             Err(error) => warn!(%error, "worker runtime config refresh failed; using last known config"),
+        }
+        if let Some(provider) = runtime_config.model_refresh_provider.take() {
+            info!(provider = %provider, "forced model catalog refresh requested");
+            match probe_runtime.force_refresh_models(&provider).await {
+                Ok(()) => {
+                    agent_capabilities = probe_runtime.capabilities().await;
+                    if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
+                        warn!(%error, "agent capability report after forced model refresh failed");
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, provider = %provider, "forced model catalog refresh failed");
+                    agent_capabilities.probe_error = Some(format!("model catalog refresh for {provider} failed: {error:#}"));
+                    let _ = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await;
+                }
+            }
+            next_capability_probe = Instant::now() + Duration::from_secs(60);
         }
         if runtime_config.paused {
             if !active_jobs.is_empty() {
