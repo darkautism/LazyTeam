@@ -423,8 +423,10 @@ async fn async_main() -> anyhow::Result<()> {
         if !can_claim_work(&runtime_config.agent, &agent_capabilities) {
             if agent_capabilities.models.is_empty() {
                 tracing::debug!(active = active_jobs.len(), "worker has no usable Pi models yet; not claiming new work");
-            } else {
+            } else if !host_agent_selection_ready(&runtime_config.agent) {
                 tracing::debug!(active = active_jobs.len(), "worker has no Host provider/model selection yet; not claiming new work");
+            } else {
+                tracing::debug!(active = active_jobs.len(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "Host provider/model selection unavailable in Pi catalog; not claiming new work");
             }
             sleep(Duration::from_secs(if active_jobs.is_empty() { 3 } else { 1 })).await;
             continue;
@@ -799,10 +801,23 @@ fn host_agent_selection_ready(agent: &AgentConfig) -> bool {
         && agent.model.as_ref().is_some_and(|model| !model.trim().is_empty())
 }
 
-/// Combined claim eligibility for implementation and review slots: a usable Pi
-/// model catalog plus a fully configured Host-owned agent selection.
+/// The exact Host-configured provider/model pair must be present in the Pi
+/// capability catalog. If a refreshed probe returns only other models, the
+/// Host selection is preserved but unavailable: the worker stays idle and never
+/// clears the selection or falls back to a different model.
+fn host_selection_available(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
+    match (&agent.provider, &agent.model) {
+        (Some(provider), Some(model)) => capabilities.models.iter()
+            .any(|candidate| &candidate.provider == provider && &candidate.id == model),
+        _ => false,
+    }
+}
+
+/// Combined claim eligibility for implementation and review slots: a fully
+/// configured Host-owned agent selection whose exact provider/model pair is
+/// reported by the Pi capability catalog.
 fn can_claim_work(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
-    !capabilities.models.is_empty() && host_agent_selection_ready(agent)
+    host_agent_selection_ready(agent) && host_selection_available(agent, capabilities)
 }
 
 /// Build the slot runtime exclusively from the Host-owned agent selection.
@@ -1446,11 +1461,11 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
-    fn nonempty_catalog() -> AgentCapabilities {
+    fn catalog_with(provider: &str, id: &str) -> AgentCapabilities {
         AgentCapabilities {
             models: vec![AgentModel {
-                provider: "catalog-provider".into(),
-                id: "catalog-model".into(),
+                provider: provider.into(),
+                id: id.into(),
                 name: None,
                 context_window: None,
                 reasoning: false,
@@ -1458,6 +1473,10 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    fn nonempty_catalog() -> AgentCapabilities {
+        catalog_with("host-provider", "host-model")
     }
 
     #[test]
@@ -1487,6 +1506,26 @@ mod tests {
         };
         assert!(can_claim_work(&selected, &catalog));
         assert!(!can_claim_work(&selected, &AgentCapabilities::default()));
+    }
+
+    #[test]
+    fn worker_stays_idle_when_host_selection_absent_from_catalog() {
+        let selected = AgentConfig {
+            agent_type: "pi".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        };
+        // Refreshed probe reports only unrelated models: the Host selection is
+        // preserved (never cleared, never substituted) but unavailable, so the
+        // worker cannot claim implementation or review work.
+        let unrelated = catalog_with("other-provider", "other-model");
+        assert!(!can_claim_work(&selected, &unrelated));
+        assert!(!host_selection_available(&selected, &unrelated));
+        assert_eq!(selected.provider.as_deref(), Some("host-provider"));
+        assert_eq!(selected.model.as_deref(), Some("host-model"));
+        assert!(host_selection_available(&selected, &nonempty_catalog()));
+        assert!(can_claim_work(&selected, &nonempty_catalog()));
     }
 
     #[test]
