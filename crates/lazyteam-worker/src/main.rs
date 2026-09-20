@@ -1192,35 +1192,42 @@ fn sanitize_for_diagnostic(raw: &str, max_chars: usize) -> String {
 
 /// Redact common secret shapes without any regex dependency: PEM blocks,
 /// `name: value` / `name=value` pairs for sensitive field names (JSON or
-/// header style), `Bearer` tokens, and well-known token prefixes.
+/// header style), `Bearer` tokens, credentials embedded in URLs, and
+/// well-known token prefixes.
 fn redact_secret_values(text: &str) -> String {
     let text = redact_pem_blocks(text);
     // Bearer before fields: `Authorization: Bearer <token>` must redact the
     // credential, not just the `Bearer` scheme word a field pass would see.
     let text = redact_bearer_tokens(&text);
     let text = redact_secret_fields(&text);
+    let text = redact_url_credentials(&text);
     redact_prefixed_tokens(&text)
 }
 
-/// ASCII case-insensitive byte search. The returned index is always a char
+/// ASCII case-insensitive search that only visits char boundaries, so
+/// ordinary non-ASCII model output (accents, ellipsis, CJK, emoji) can never
+/// cause a mid-character slice panic. The returned index is always a char
 /// boundary when the needle starts with an ASCII byte, because ASCII bytes
 /// never occur inside multi-byte UTF-8 sequences.
 fn find_ascii_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
-    let haystack = haystack.as_bytes();
-    let needle = needle.as_bytes();
-    if needle.is_empty() || haystack.len() < needle.len() || from >= haystack.len() {
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() || haystack.len() < needle_bytes.len() {
         return None;
     }
-    let mut i = from;
-    while i + needle.len() <= haystack.len() {
-        if haystack[i..i + needle.len()]
+    let haystack_bytes = haystack.as_bytes();
+    let from = haystack.floor_char_boundary(from.min(haystack.len()));
+    for (rel, _) in haystack[from..].char_indices() {
+        let i = from + rel;
+        if i + needle_bytes.len() > haystack_bytes.len() {
+            break;
+        }
+        if haystack_bytes[i..i + needle_bytes.len()]
             .iter()
-            .zip(needle.iter())
+            .zip(needle_bytes.iter())
             .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
         {
             return Some(i);
         }
-        i += 1;
     }
     None
 }
@@ -1259,11 +1266,15 @@ fn redact_pem_blocks(text: &str) -> String {
 /// Sensitive field names whose associated value must not reach diagnostics.
 /// Longest-first so `access_token` wins over `token` at the same position.
 const SECRET_FIELD_NAMES: &[&str] = &[
+    "aws_secret_access_key",
+    "aws_session_token",
+    "secret_access_key",
     "access_token",
     "refresh_token",
     "client_secret",
     "private_key",
     "session_token",
+    "secretaccesskey",
     "auth_token",
     "id_token",
     "api_key",
@@ -1339,6 +1350,44 @@ fn redact_secret_field(text: &str, name: &str) -> String {
         }
         out.push_str(&text[cursor..rel + name.len()]);
         cursor = rel + name.len();
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Redact credentials embedded in URLs (`scheme://user:password@host...`)
+/// by replacing the password between the last `:` and `@`. A bare
+/// `scheme://user@host` userinfo without a password is left untouched, as
+/// are `host:port` segments, which have no `@` before the next delimiter.
+fn redact_url_credentials(text: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+    // `"://"` is ASCII, so every offset derived here is a char boundary.
+    while let Some(rel) = text[cursor..].find("://") {
+        let authority = cursor + rel + "://".len();
+        let bytes = text.as_bytes();
+        let mut end = authority;
+        while end < bytes.len() {
+            let byte = bytes[end];
+            if byte == b'/' || byte == b'?' || byte == b'#' || byte == b'"' || byte == b'\'' || bytes[end].is_ascii_whitespace() {
+                break;
+            }
+            end += 1;
+        }
+        // The last `@` in the segment separates credentials from the host,
+        // so a password containing `@` is redacted in full.
+        if let Some(at) = text[authority..end].rfind('@') {
+            let at = authority + at;
+            if let Some(colon) = text[authority..at].rfind(':') {
+                let absolute = authority + colon;
+                out.push_str(&text[cursor..=absolute]);
+                out.push_str("[redacted]");
+                cursor = at;
+                continue;
+            }
+        }
+        out.push_str(&text[cursor..authority]);
+        cursor = authority;
     }
     out.push_str(&text[cursor..]);
     out
@@ -2451,6 +2500,44 @@ mod tests {
         // must survive redaction.
         let innocent = sanitized_verdict_excerpt("the flask-based task token list is empty");
         assert!(innocent.contains("flask-based"), "false positive redaction: {innocent}");
+    }
+
+    #[test]
+    fn malformed_excerpt_redacts_aws_and_url_credentials() {
+        let raw = "review failed; env AWS_SECRET_ACCESS_KEY=aws-secret-value-abc123 config \
+            {\"secretAccessKey\": \"json-aws-secret-xyz789\"} db \
+            postgres://deploy:db-password-secret-456@db.internal:5432/app";
+        let excerpt = sanitized_verdict_excerpt(raw);
+        for leaked in [
+            "aws-secret-value-abc123",
+            "json-aws-secret-xyz789",
+            "db-password-secret-456",
+        ] {
+            assert!(!excerpt.contains(leaked), "secret leaked in excerpt: {excerpt}");
+        }
+        // The non-secret URL skeleton stays diagnosable.
+        assert!(excerpt.contains("postgres://"), "unexpected: {excerpt}");
+        assert!(excerpt.contains("db.internal"), "unexpected: {excerpt}");
+        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
+    }
+
+    #[test]
+    fn malformed_diagnostic_survives_non_ascii_output() {
+        // Accented words, ellipsis, CJK, and emoji place multi-byte
+        // characters at every excerpt-window alignment: redaction must never
+        // slice inside a UTF-8 character while scanning for secret shapes.
+        let raw = format!(
+            "héllo wörld … {}",
+            "café Naïve \u{4e2d}\u{6587} \u{1f600} password=non-ascii-secret-\u{00e9}\u{4e2d}".repeat(40),
+        );
+        let diagnostic = malformed_verdict_diagnostic(&raw);
+        assert!(diagnostic.contains("reviewer did not return the required JSON verdict"));
+        assert!(diagnostic.contains("len="), "diagnostic must carry length");
+        assert!(diagnostic.contains("hash="), "diagnostic must carry hash");
+        assert!(!diagnostic.contains("non-ascii-secret"), "secret leaked: {diagnostic}");
+        assert!(diagnostic.contains("h\u{e9}llo"), "non-ASCII prose must survive: {diagnostic}");
+        let excerpt = sanitized_verdict_excerpt(&raw);
+        assert!(excerpt.chars().count() <= MALFORMED_VERDICT_EXCERPT_CHARS);
     }
 
     #[tokio::test]
