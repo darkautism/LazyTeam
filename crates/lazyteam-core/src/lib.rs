@@ -251,6 +251,22 @@ pub enum TaskState {
     Cancelled,
 }
 
+pub const MAX_CONFLICT_GROUP_LEN: usize = 64;
+
+pub fn normalize_conflict_group(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else { return Ok(None); };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() { return Ok(None); }
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized.len() > MAX_CONFLICT_GROUP_LEN {
+        return Err(format!("conflict_group must be at most {MAX_CONFLICT_GROUP_LEN} characters"));
+    }
+    if !normalized.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+        return Err("conflict_group must match [a-z0-9_-]+".into());
+    }
+    Ok(Some(normalized))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Task {
     pub id: Uuid,
@@ -275,6 +291,8 @@ pub struct Task {
     /// reviewer retry redispatch stays in the same cycle.
     #[serde(default)]
     pub review_cycle: i64,
+    #[serde(default)]
+    pub conflict_group: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -594,10 +612,29 @@ mod tests {
             priority: 0,
             state: TaskState::Queued,
             review_cycle: 0,
+            conflict_group: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
         assert!(worker_matches_task(&worker(), &project, &task));
+    }
+
+    #[test]
+    fn conflict_group_normalizes_and_validates() {
+        assert_eq!(normalize_conflict_group(None).unwrap(), None);
+        assert_eq!(normalize_conflict_group(Some("   ")).unwrap(), None);
+        assert_eq!(normalize_conflict_group(Some("  Server-API  ")).unwrap(), Some("server-api".into()));
+        assert_eq!(normalize_conflict_group(Some("worker_runtime")).unwrap(), Some("worker_runtime".into()));
+        assert!(normalize_conflict_group(Some("has space")).is_err());
+        assert!(normalize_conflict_group(Some("has/slash")).is_err());
+        assert!(normalize_conflict_group(Some(&"a".repeat(MAX_CONFLICT_GROUP_LEN + 1))).is_err());
+    }
+
+    #[test]
+    fn conflict_group_defaults_to_none_when_missing_from_json() {
+        let raw = r#"{"id":"00000000-0000-0000-0000-000000000000","project_id":"00000000-0000-0000-0000-000000000000","title":"t","description":"","expected_outcome":"","priority":0,"state":"queued","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#;
+        let task: Task = serde_json::from_str(raw).unwrap();
+        assert_eq!(task.conflict_group, None);
     }
 
     #[test]
@@ -658,6 +695,7 @@ mod tests {
             priority: 0,
             state: TaskState::Queued,
             review_cycle: 0,
+            conflict_group: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

@@ -61,6 +61,8 @@ pub struct TaskCreateParams {
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub priority: i32,
+    #[serde(default)]
+    pub conflict_group: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -333,6 +335,7 @@ impl LazyTeamMcp {
                 preferred_tags: input.preferred_tags,
                 dependencies,
                 priority: input.priority,
+                conflict_group: input.conflict_group,
             }),
         ).await.map_err(api_to_mcp)?;
         Ok(rmcp::Json(task))

@@ -319,6 +319,8 @@ pub(crate) struct CreateTask {
     pub(crate) dependencies: Vec<Uuid>,
     #[serde(default)]
     pub(crate) priority: i32,
+    #[serde(default)]
+    pub(crate) conflict_group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -749,17 +751,20 @@ pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input):
         }
     }
     let now = Utc::now();
+    let conflict_group = lazyteam_core::normalize_conflict_group(input.conflict_group.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let task = Task {
         id: Uuid::new_v4(), project_id: input.project_id, title: input.title, description: input.description,
         expected_outcome: input.expected_outcome, acceptance_criteria: input.acceptance_criteria,
         required_tags: input.required_tags, preferred_tags: input.preferred_tags, dependencies: input.dependencies,
-        review_feedback: String::new(), priority: input.priority, state: TaskState::Queued, review_cycle: 0, created_at: now, updated_at: now,
+        review_feedback: String::new(), priority: input.priority, state: TaskState::Queued, review_cycle: 0,
+        conflict_group, created_at: now, updated_at: now,
     };
-    sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,acceptance_criteria,required_tags,preferred_tags,dependencies,review_feedback,priority,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,acceptance_criteria,required_tags,preferred_tags,dependencies,review_feedback,priority,state,conflict_group,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(task.id.to_string()).bind(task.project_id.to_string()).bind(&task.title).bind(&task.description)
         .bind(&task.expected_outcome).bind(json(&task.acceptance_criteria)?).bind(json(&task.required_tags)?)
         .bind(json(&task.preferred_tags)?).bind(json(&task.dependencies)?).bind(&task.review_feedback).bind(task.priority).bind("queued")
-        .bind(ts(task.created_at)).bind(ts(task.updated_at)).execute(&state.db).await.map_err(db_error)?;
+        .bind(&task.conflict_group).bind(ts(task.created_at)).bind(ts(task.updated_at)).execute(&state.db).await.map_err(db_error)?;
     Ok(Json(task))
 }
 
@@ -2563,6 +2568,7 @@ pub(crate) fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiEr
         preferred_tags: dejson(row.try_get("preferred_tags").map_err(internal)?)?, dependencies: dejson(row.try_get("dependencies").map_err(internal)?)?, review_feedback: row.try_get("review_feedback").map_err(internal)?, priority: row.try_get("priority").map_err(internal)?,
         state: match state.as_str() { "draft"=>TaskState::Draft,"assigned"=>TaskState::Assigned,"running"=>TaskState::Running,"review"=>TaskState::Review,"merge_pending"=>TaskState::MergePending,"done"=>TaskState::Done,"blocked"=>TaskState::Blocked,"failed"=>TaskState::Failed,"cancelled"=>TaskState::Cancelled,_=>TaskState::Queued },
         review_cycle: review_cycle.max(0),
+        conflict_group: row.try_get::<Option<String>, _>("conflict_group").unwrap_or(None),
         created_at: datetime(row.try_get("created_at").map_err(internal)?)?, updated_at: datetime(row.try_get("updated_at").map_err(internal)?)? })
 }
 
@@ -2654,6 +2660,61 @@ mod tests {
         let Json(reloaded) = get_host_settings(State(state)).await.unwrap();
         assert_eq!(reloaded.review_retry_limit, 7);
         assert_eq!(reloaded.review_failure_limit, 4);
+    }
+
+    #[tokio::test]
+    async fn conflict_group_create_read_round_trip_and_validation() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(project_id.to_string()).bind("p").bind("P").bind("https://example.invalid/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = Arc::new(AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: std::env::temp_dir(),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+        });
+        let input = CreateTask {
+            project_id,
+            title: "grouped".into(),
+            description: String::new(),
+            expected_outcome: String::new(),
+            acceptance_criteria: vec![],
+            required_tags: Default::default(),
+            preferred_tags: Default::default(),
+            dependencies: vec![],
+            priority: 0,
+            conflict_group: Some("  Server-API  ".into()),
+        };
+        let Json(created) = create_task(State(state.clone()), Json(input)).await.unwrap();
+        assert_eq!(created.conflict_group.as_deref(), Some("server-api"));
+        let Json(tasks) = list_tasks(State(state.clone())).await.unwrap();
+        assert_eq!(tasks.iter().find(|t| t.id == created.id).unwrap().conflict_group.as_deref(), Some("server-api"));
+
+        let invalid = CreateTask {
+            project_id,
+            title: "bad".into(),
+            description: String::new(),
+            expected_outcome: String::new(),
+            acceptance_criteria: vec![],
+            required_tags: Default::default(),
+            preferred_tags: Default::default(),
+            dependencies: vec![],
+            priority: 0,
+            conflict_group: Some("has space".into()),
+        };
+        let error = create_task(State(state), Json(invalid)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -2811,6 +2872,7 @@ mod tests {
                 priority: 0,
                 state: TaskState::Review,
                 review_cycle: 2,
+                conflict_group: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },

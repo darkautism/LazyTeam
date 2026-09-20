@@ -273,6 +273,12 @@ mod tests {
         // waiting cards only; actively running/reviewing cards stay unspammed.
         assert!(INDEX.contains("waitingMeta"));
         assert!(INDEX.contains("waiting-pill"));
+        assert!(INDEX.contains("conflictPill"));
+        assert!(INDEX.contains("conflict-pill"));
+        assert!(INDEX.contains("conflict_group"));
+        assert!(!INDEX.contains("<<<<<<<"));
+        assert!(!INDEX.contains(">>>>>>>"));
+        assert!(!INDEX.contains("=======\n"));
         assert!(INDEX.contains("Waiting · "));
         assert!(INDEX.contains("x.waiting"));
         assert!(INDEX.contains("no_eligible_worker"));
