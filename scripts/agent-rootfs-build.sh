@@ -32,6 +32,68 @@ done
 
 mapfile -t capabilities < <(printf '%s\n' "${!requested[@]}" | sed '/^$/d' | sort)
 
+rust_version_number() {
+  grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$1" | head -n 1
+}
+
+rust_version_at_least() {
+  local have="$1" want="$2"
+  local IFS=.
+  local -a h=() w=()
+  read -ra h <<<"$have"
+  read -ra w <<<"$want"
+  local i hn wn
+  for i in 0 1 2; do
+    hn="${h[$i]:-0}"; wn="${w[$i]:-0}"
+    if (( 10#$hn > 10#$wn )); then return 0; fi
+    if (( 10#$hn < 10#$wn )); then return 1; fi
+  done
+  return 0
+}
+
+resolve_rust_key() {
+  local requested="$1"
+  if [[ "$requested" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  if [[ "$requested" != "stable" ]]; then
+    echo "unsupported LAZYTEAM_RUST_TOOLCHAIN=$requested (expected stable or a pinned numeric version)" >&2
+    return 2
+  fi
+  local manifest rustc_line concrete
+  if manifest="$(curl --retry 2 --retry-delay 1 --retry-all-errors -fsSL https://static.rust-lang.org/dist/channel-rust-stable.toml)"; then
+    rustc_line="$(awk '/^\[pkg\.rustc\]/{found=1} found && /^version = "/{print; exit}' <<<"$manifest")"
+    concrete="$(rust_version_number "$rustc_line")"
+    if [[ "$concrete" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s\n' "$concrete"
+      return 0
+    fi
+  fi
+  local recorded="$root/current/.lazyteam-rust-version"
+  if [[ -r "$recorded" ]]; then
+    concrete="$(tr -d '[:space:]' < "$recorded")"
+    if [[ "$concrete" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+      echo "Rust stable manifest unavailable; reusing installed concrete version $concrete" >&2
+      printf '%s\n' "$concrete"
+      return 0
+    fi
+  fi
+  echo "could not resolve Rust stable to a concrete version and no installed version is available" >&2
+  return 1
+}
+
+rust_request="none"
+rust_key="none"
+if [[ -n "${requested[rust]:-}" ]]; then
+  rust_request="${LAZYTEAM_RUST_TOOLCHAIN:-stable}"
+  rust_key="$(resolve_rust_key "$rust_request")"
+  rust_version_at_least "$rust_key" "1.85" || {
+    echo "managed Rust $rust_key is below the edition-2024 floor 1.85" >&2
+    exit 1
+  }
+fi
+
 mkdir -p "$cache" "$generations"
 name="ubuntu-base-${ubuntu_version}-base-${ubuntu_arch}.tar.gz"
 release_base="https://cdimage.ubuntu.com/ubuntu-base/releases/${ubuntu_version%.*}/release"
@@ -70,7 +132,7 @@ fi
 # generation; unchanged inputs reuse the existing one.
 builder_hash="$(sha256sum "$0" | awk '{print $1}')"
 [[ "$base_hash" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "invalid Ubuntu base digest: $base_hash" >&2; exit 1; }
-cap_key="$(printf '%s\n' "$base_id" "$ubuntu_arch" "$builder_hash" "$base_hash" "${capabilities[@]}" | sha256sum | cut -c1-20)"
+cap_key="$(printf '%s\n' "$base_id" "$ubuntu_arch" "$builder_hash" "$base_hash" "${capabilities[@]}" "rust:$rust_key" | sha256sum | cut -c1-20)"
 generation="$generations/$ubuntu_version-$ubuntu_arch-$cap_key"
 rootfs="$generation/rootfs"
 ready="$generation/.ready"
@@ -94,7 +156,7 @@ if [[ -z "$preseed_archive" ]]; then
 fi
 for capability in "${capabilities[@]}"; do
   case "$capability" in
-    rust) packages+=(cargo rustc build-essential pkg-config) ;;
+    rust) packages+=(build-essential pkg-config curl ca-certificates) ;;
     python) packages+=(python3 python3-pip python3-venv) ;;
     node) packages+=(nodejs npm) ;;
     go) packages+=(golang-go) ;;
@@ -127,14 +189,15 @@ for device in null zero full random urandom; do
   [[ -e "$rootfs_stage/dev/$device" ]] || touch "$rootfs_stage/dev/$device"
 done
 
+namespace_args=(--user --map-root-user --mount --pid --fork)
+if [[ "${LAZYTEAM_TRUSTED_CONTAINER_DAEMON:-}" == "1" ]]; then
+  namespace_args=(--mount --pid --fork)
+fi
+
 if (( ${#packages[@]} > 0 )); then
   package_args="$(printf '%q ' "${packages[@]}")"
   export LAZYTEAM_BUILD_ROOTFS="$rootfs_stage"
   export LAZYTEAM_BUILD_PACKAGES="$package_args"
-  namespace_args=(--user --map-root-user --mount --pid --fork)
-  if [[ "${LAZYTEAM_TRUSTED_CONTAINER_DAEMON:-}" == "1" ]]; then
-    namespace_args=(--mount --pid --fork)
-  fi
   unshare "${namespace_args[@]}" /bin/bash -c '
     set -euo pipefail
     rootfs="$LAZYTEAM_BUILD_ROOTFS"
@@ -148,10 +211,81 @@ if (( ${#packages[@]} > 0 )); then
   '
 fi
 
+if [[ -n "${requested[rust]:-}" ]]; then
+  export LAZYTEAM_BUILD_ROOTFS="$rootfs_stage"
+  export LAZYTEAM_BUILD_RUST_KEY="$rust_key"
+  cat > "$rootfs_stage/tmp/lazyteam-rust-install.sh" <<EOF
+set -euo pipefail
+export RUSTUP_HOME=/opt/lazyteam/rustup
+export CARGO_HOME=/opt/lazyteam/cargo
+export PATH=/opt/lazyteam/cargo/bin:\$PATH
+mkdir -p "\$RUSTUP_HOME" "\$CARGO_HOME"
+curl --retry 3 --retry-delay 2 --retry-all-errors --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$rust_key" --no-modify-path
+rm -f /tmp/rustup-init.sh /tmp/lazyteam-rust-install.sh
+rustc --version
+cargo --version
+EOF
+  chmod 0755 "$rootfs_stage/tmp/lazyteam-rust-install.sh"
+  unshare "${namespace_args[@]}" /bin/bash -c '
+    set -euo pipefail
+    rootfs="$LAZYTEAM_BUILD_ROOTFS"
+    mount --make-rprivate /
+    mount --bind "$rootfs" "$rootfs"
+    mount -t proc proc "$rootfs/proc"
+    for device in null zero full random urandom; do
+      mount --bind "/dev/$device" "$rootfs/dev/$device"
+    done
+    chroot "$rootfs" /bin/bash /tmp/lazyteam-rust-install.sh
+  '
+
+  rustc_line="$(unshare "${namespace_args[@]}" /bin/bash -c '
+    set -euo pipefail
+    rootfs="$LAZYTEAM_BUILD_ROOTFS"
+    mount --make-rprivate /
+    mount --bind "$rootfs" "$rootfs"
+    chroot "$rootfs" /usr/bin/env RUSTUP_HOME=/opt/lazyteam/rustup CARGO_HOME=/opt/lazyteam/cargo /opt/lazyteam/cargo/bin/rustc --version
+  ')"
+  installed_rust="$(rust_version_number "$rustc_line")"
+  rust_version_at_least "$installed_rust" "1.85" || {
+    echo "installed managed Rust $installed_rust is below 1.85" >&2
+    exit 1
+  }
+  [[ "$installed_rust" == "$rust_key" ]] || {
+    echo "installed managed Rust $installed_rust does not match generation key $rust_key" >&2
+    exit 1
+  }
+
+  cat > "$rootfs_stage/tmp/lazyteam-edition2024-check.sh" <<'EOF'
+set -euo pipefail
+export RUSTUP_HOME=/opt/lazyteam/rustup
+export CARGO_HOME=/opt/lazyteam/cargo
+export PATH=/opt/lazyteam/cargo/bin:$PATH
+check=/tmp/lazyteam-edition2024-check
+rm -rf "$check"
+mkdir -p "$check/src"
+printf '[package]\nname = "lazyteam-edition2024-check"\nversion = "0.1.0"\nedition = "2024"\n' > "$check/Cargo.toml"
+printf 'fn main() {}\n' > "$check/src/main.rs"
+cargo metadata --no-deps --format-version 1 --manifest-path "$check/Cargo.toml" >/dev/null
+rm -rf "$check" /tmp/lazyteam-edition2024-check.sh
+EOF
+  chmod 0755 "$rootfs_stage/tmp/lazyteam-edition2024-check.sh"
+  unshare "${namespace_args[@]}" /bin/bash -c '
+    set -euo pipefail
+    rootfs="$LAZYTEAM_BUILD_ROOTFS"
+    mount --make-rprivate /
+    mount --bind "$rootfs" "$rootfs"
+    mount -t proc proc "$rootfs/proc"
+    chroot "$rootfs" /bin/bash /tmp/lazyteam-edition2024-check.sh
+  '
+fi
+
 printf '%s\n' "${capabilities[@]}" > "$rootfs_stage/.lazyteam-capabilities"
 printf '%s\n' "$base_id" > "$rootfs_stage/.lazyteam-ubuntu-version"
 printf '%s\n' "$builder_hash" > "$rootfs_stage/.lazyteam-builder-sha256"
 printf '%s\n' "$base_hash" > "$rootfs_stage/.lazyteam-base-sha256"
+printf '%s\n' "$rust_request" > "$rootfs_stage/.lazyteam-rust-request"
+printf '%s\n' "$rust_key" > "$rootfs_stage/.lazyteam-rust-version"
 rm -rf "$generation"
 mv "$staging" "$generation"
 touch "$ready"

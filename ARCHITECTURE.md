@@ -227,6 +227,8 @@ The trusted worker daemon keeps the real Git checkout and `.git` metadata outsid
 
 The initial seccomp policy deliberately stays small to preserve normal Node/Pi/Cargo behavior while denying mount/namespace escape and process-inspection primitives such as `mount`, `pivot_root`, `chroot`, `setns`, `unshare`, `ptrace`, `bpf`, and `perf_event_open`. Network access remains available because Pi and package managers need outbound access.
 
+The managed `rust` capability is infrastructure-owned: the rootfs builder installs a concrete Rust toolchain with rustup under `/opt/lazyteam`, defaults to the current stable channel (or the explicit `LAZYTEAM_RUST_TOOLCHAIN` numeric override), and refuses versions below Rust 1.85. The concrete Rust version participates in the rootfs generation key, and the worker verifies `rustc` and `cargo` through the real sandbox before activating that generation. Agents do not install or upgrade Rust themselves.
+
 ### Worker and agent configuration
 
 After a worker is enrolled, open **Workers → Configure** in the private UI. The server becomes the source of truth for the worker name, role, tags, allowed projects, slots, agent selection, provider/model selection, and initial prompt. A running worker fetches this configuration before claiming work, so changes apply to subsequent tasks without re-enrollment. The worker list shows each worker's role (`worker` or `reviewer`) as a pill next to its name.

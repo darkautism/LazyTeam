@@ -206,6 +206,10 @@ async fn async_main() -> anyhow::Result<()> {
     let mut local_installed_capabilities = load_local_installed_capabilities(&args.state_dir).await?;
     let mut agent_rootfs = build_agent_rootfs(&args.state_dir, &local_installed_capabilities).await?;
     let mut agent_sandbox = AgentSandbox::prepare(&args.state_dir, &args.pi_bin, Some(&agent_rootfs)).await?;
+    if local_installed_capabilities.contains("rust") {
+        let installed = agent_sandbox.probe_managed_rust_toolchain().await?;
+        info!(toolchain = %installed.replace('\n', "; "), "managed Rust toolchain verified through agent sandbox");
+    }
     info!(rootfs = %agent_rootfs.display(), "agent Ubuntu rootfs + intuitive tooling + sandboxed Git ready");
     if args.sandbox_diagnose {
         println!("LazyTeam agent sandbox {}", agent_sandbox.diagnostic_summary());
@@ -719,6 +723,10 @@ async fn reconcile_managed_capabilities(
         let tail = capability_build_log_tail(state_dir).await;
         let _ = report_capability_build(client, server, credential, worker_id, local_installed, "activating", &tail).await;
         let sandbox = AgentSandbox::prepare(state_dir, pi_bin, Some(&rootfs)).await?;
+        if target.contains("rust") {
+            let installed = sandbox.probe_managed_rust_toolchain().await?;
+            info!(toolchain = %installed.replace('\n', "; "), "managed Rust toolchain verified before rootfs activation");
+        }
         *agent_rootfs = rootfs;
         *local_installed = target;
         *agent_sandbox = sandbox.clone();

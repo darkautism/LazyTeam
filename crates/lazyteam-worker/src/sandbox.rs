@@ -18,6 +18,27 @@ const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", 
 /// consumed by every filesystem enforcement backend; they are not host
 /// overlays and must never grow a backend-specific allowlist.
 const CONTAINER_NATIVE_READ_ONLY: &[&str] = &["/opt/lazyteam"];
+const CONTAINER_RUSTUP_HOME: &str = "/opt/lazyteam/rustup";
+const CONTAINER_CARGO_BIN: &str = "/opt/lazyteam/cargo/bin";
+
+fn container_managed_rust_paths(container_rootfs: Option<&Path>) -> Option<(PathBuf, PathBuf)> {
+    let rootfs = container_rootfs?;
+    let rustup_home = PathBuf::from(CONTAINER_RUSTUP_HOME);
+    let cargo_bin = PathBuf::from(CONTAINER_CARGO_BIN);
+    let rustup_image = rootfs.join(rustup_home.strip_prefix("/").ok()?);
+    let cargo_image = rootfs.join(cargo_bin.strip_prefix("/").ok()?).join("cargo");
+    (rustup_image.is_dir() && cargo_image.is_file()).then_some((rustup_home, cargo_bin))
+}
+
+fn managed_rust_version(line: &str) -> Option<(u64, u64, u64)> {
+    let version = line.split_whitespace().nth(1)?;
+    let mut parts = version.split('.');
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next().unwrap_or("0").parse().ok()?,
+    ))
+}
 
 fn add_container_native_read_only(
     read_only: &mut BTreeSet<PathBuf>,
@@ -126,6 +147,16 @@ impl AgentSandbox {
         // chroot, both Landlock and the namespace fallback consume read_only.
         add_container_native_read_only(&mut read_only, container_rootfs.as_deref());
 
+        // The managed Rust proxies live inside the frozen image. Put them on
+        // PATH, but keep CARGO_HOME task-writable and point only RUSTUP_HOME at
+        // the read-only image toolchain.
+        let container_rust = container_managed_rust_paths(container_rootfs.as_deref());
+        if let Some((_, cargo_bin)) = container_rust.as_ref() {
+            let mut paths = vec![cargo_bin.clone()];
+            paths.extend(std::env::split_paths(&path));
+            path = std::env::join_paths(paths).context("compose agent PATH with managed Rust")?;
+        }
+
         if let Some(program) = resolve_program(pi_bin, &host_path) {
             if let Ok(target) = std::fs::canonicalize(&program) {
                 let runtime_root = common_ancestor(&program, &target).filter(|root| path_depth(root) >= 3)
@@ -154,13 +185,21 @@ impl AgentSandbox {
             read_only.insert(path);
         }
 
-        let rustup_home = container_rootfs.is_none().then(|| std::env::var_os("RUSTUP_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
-            .filter(|path| path.exists())
-            .and_then(|path| std::fs::canonicalize(path).ok())).flatten();
-        if let Some(path) = &rustup_home {
-            read_only.insert(path.clone());
+        let rustup_home = if let Some((rustup_home, _)) = container_rust {
+            Some(rustup_home)
+        } else if container_rootfs.is_none() {
+            std::env::var_os("RUSTUP_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+                .filter(|path| path.exists())
+                .and_then(|path| std::fs::canonicalize(path).ok())
+        } else {
+            None
+        };
+        if container_rootfs.is_none() {
+            if let Some(path) = &rustup_home {
+                read_only.insert(path.clone());
+            }
         }
 
         let sandbox = Self {
@@ -284,6 +323,31 @@ impl AgentSandbox {
             }
         }
         Ok(command)
+    }
+
+    pub async fn probe_managed_rust_toolchain(&self) -> anyhow::Result<String> {
+        let mut command = self.command("/bin/sh", &self.probe_dir, None)?;
+        command.arg("-c").arg("rustc --version && cargo --version");
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = command.output().await.context("probe managed Rust toolchain through agent sandbox")?;
+        if !output.status.success() {
+            bail!(
+                "managed Rust toolchain is not executable through the agent sandbox: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8(output.stdout).context("managed Rust probe returned non-UTF8 output")?;
+        let mut lines = stdout.lines();
+        let rustc = lines.next().context("managed Rust probe did not return rustc version")?;
+        let cargo = lines.next().context("managed Rust probe did not return cargo version")?;
+        for (name, line) in [("rustc", rustc), ("cargo", cargo)] {
+            let version = managed_rust_version(line)
+                .with_context(|| format!("parse managed {name} version from {line:?}"))?;
+            if version < (1, 85, 0) {
+                bail!("managed {name} {}.{}.{} is below the Rust 1.85 / edition-2024 floor", version.0, version.1, version.2);
+            }
+        }
+        Ok(stdout.trim().to_string())
     }
 
     async fn probe(&self) -> anyhow::Result<()> {
@@ -1190,6 +1254,27 @@ async fn set_private_file(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_rust_paths_require_image_toolchain_and_parse_versions() {
+        let root = std::env::temp_dir().join(format!(
+            "lazyteam-managed-rust-paths-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("opt/lazyteam/rustup")).unwrap();
+        std::fs::create_dir_all(root.join("opt/lazyteam/cargo/bin")).unwrap();
+        std::fs::write(root.join("opt/lazyteam/cargo/bin/cargo"), b"proxy").unwrap();
+
+        let (rustup_home, cargo_bin) = container_managed_rust_paths(Some(&root)).unwrap();
+        assert_eq!(rustup_home, PathBuf::from("/opt/lazyteam/rustup"));
+        assert_eq!(cargo_bin, PathBuf::from("/opt/lazyteam/cargo/bin"));
+        assert_eq!(managed_rust_version("rustc 1.85.0 (hash 2025-01-01)"), Some((1, 85, 0)));
+        assert_eq!(managed_rust_version("cargo 1.90.1 (hash 2025-01-01)"), Some((1, 90, 1)));
+
+        std::fs::remove_file(root.join("opt/lazyteam/cargo/bin/cargo")).unwrap();
+        assert!(container_managed_rust_paths(Some(&root)).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn container_native_paths_join_the_canonical_read_only_policy() {
