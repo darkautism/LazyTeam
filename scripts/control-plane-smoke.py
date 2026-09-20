@@ -48,6 +48,42 @@ def lease_headers(worker_headers, capability):
     return headers
 
 
+def create_broker_candidate(assignment, worker_headers, capability, review_ref, filename, content):
+    credential = worker_headers[WORKER_CREDENTIAL_HEADER]
+    git_env = dict(os.environ)
+    git_env.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": f"{WORKER_CREDENTIAL_HEADER}: {credential}",
+        "GIT_CONFIG_KEY_1": "http.extraHeader",
+        "GIT_CONFIG_VALUE_1": f"{LEASE_CAPABILITY_HEADER}: {capability}",
+    })
+    checkout = tempfile.mkdtemp(prefix="lazyteam-smoke-candidate-")
+    subprocess.run(["git", "clone", assignment["project"]["repo_url"], checkout], env=git_env, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", checkout, "config", "user.name", "LazyTeam Smoke"], check=True)
+    subprocess.run(["git", "-C", checkout, "config", "user.email", "smoke@lazyteam.test"], check=True)
+    remote_candidate = f"refs/remotes/origin/{review_ref}"
+    has_candidate = subprocess.run(
+        ["git", "-C", checkout, "show-ref", "--verify", "--quiet", remote_candidate]
+    ).returncode == 0
+    if has_candidate:
+        subprocess.run(["git", "-C", checkout, "checkout", "-B", "candidate", remote_candidate], check=True, stdout=subprocess.DEVNULL)
+    base_sha = subprocess.check_output(["git", "-C", checkout, "rev-parse", "origin/main"], text=True).strip()
+    with open(os.path.join(checkout, filename), "a", encoding="utf-8") as handle:
+        handle.write(content)
+    subprocess.run(["git", "-C", checkout, "add", filename], check=True)
+    subprocess.run(["git", "-C", checkout, "commit", "-m", "smoke candidate"], check=True, stdout=subprocess.DEVNULL)
+    candidate_sha = subprocess.check_output(["git", "-C", checkout, "rev-parse", "HEAD"], text=True).strip()
+    subprocess.run(
+        ["git", "-C", checkout, "push", "origin", f"HEAD:refs/heads/{review_ref}"],
+        env=git_env,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    return candidate_sha, base_sha
+
+
 def main():
     suffix = uuid.uuid4().hex[:8]
     git_fixture = tempfile.mkdtemp(prefix="lazyteam-smoke-git-")
@@ -482,10 +518,13 @@ def main():
     affinity_impl = read_json(affinity_impl_claim)
     affinity_exec = affinity_impl["execution"]["id"]
     affinity_ref = f"lazyteam/task-{affinity_task['id'].replace('-', '')}"
+    affinity_candidate_one, affinity_base_one = create_broker_candidate(
+        affinity_impl, worker_headers, affinity_impl["lease_capability"], affinity_ref, "AFFINITY.txt", "candidate one\n"
+    )
     affinity_finish = request(
         f"/api/executions/{affinity_exec}/finish",
         method="POST",
-        obj={"result": {"status": "completed", "summary": "affinity candidate one", "commit_sha": "affinity-one", "base_sha": "base-one", "review_ref": affinity_ref}},
+        obj={"result": {"status": "completed", "summary": "affinity candidate one", "commit_sha": affinity_candidate_one, "base_sha": affinity_base_one, "review_ref": affinity_ref}},
         headers=lease_headers(worker_headers, affinity_impl["lease_capability"]),
     )
     expect(affinity_finish.status == 204, f"affinity implementation finish failed: {affinity_finish.status}")
@@ -507,10 +546,13 @@ def main():
     affinity_retry_claim = request(f"/api/workers/{worker_id}/claim", method="POST", headers=worker_headers)
     expect(affinity_retry_claim.status == 200, f"sticky implementation retry was not reclaimed: {affinity_retry_claim.status}")
     affinity_retry = read_json(affinity_retry_claim)
+    affinity_candidate_two, affinity_base_two = create_broker_candidate(
+        affinity_retry, worker_headers, affinity_retry["lease_capability"], affinity_ref, "AFFINITY.txt", "candidate two\n"
+    )
     affinity_retry_finish = request(
         f"/api/executions/{affinity_retry['execution']['id']}/finish",
         method="POST",
-        obj={"result": {"status": "completed", "summary": "affinity candidate two", "commit_sha": "affinity-two", "base_sha": "base-two", "review_ref": affinity_ref}},
+        obj={"result": {"status": "completed", "summary": "affinity candidate two", "commit_sha": affinity_candidate_two, "base_sha": affinity_base_two, "review_ref": affinity_ref}},
         headers=lease_headers(worker_headers, affinity_retry["lease_capability"]),
     )
     expect(affinity_retry_finish.status == 204, f"affinity retry implementation finish failed: {affinity_retry_finish.status}")
