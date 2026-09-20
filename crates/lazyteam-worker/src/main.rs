@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, t
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
-use lazyteam_core::{AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict, LEASE_CAPABILITY_HEADER};
+use lazyteam_core::{can_claim_work, host_agent_selection_ready, AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict, LEASE_CAPABILITY_HEADER};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -790,34 +790,6 @@ async fn poll_agent_auth(client: &Client, server: &str, credential: &str, worker
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/agent-auth")), credential).send().await?;
     if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
     Ok(Some(ensure_success(response).await?.json().await?))
-}
-
-/// The Host-owned agent selection is claim-eligible only when both provider and
-/// model are configured. A nonempty Pi capability catalog alone must never make
-/// the worker eligible: without an explicit Host selection the worker stays idle
-/// so the server never assigns work that would launch Pi with backend defaults.
-fn host_agent_selection_ready(agent: &AgentConfig) -> bool {
-    agent.provider.as_ref().is_some_and(|provider| !provider.trim().is_empty())
-        && agent.model.as_ref().is_some_and(|model| !model.trim().is_empty())
-}
-
-/// The exact Host-configured provider/model pair must be present in the Pi
-/// capability catalog. If a refreshed probe returns only other models, the
-/// Host selection is preserved but unavailable: the worker stays idle and never
-/// clears the selection or falls back to a different model.
-fn host_selection_available(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
-    match (&agent.provider, &agent.model) {
-        (Some(provider), Some(model)) => capabilities.models.iter()
-            .any(|candidate| &candidate.provider == provider && &candidate.id == model),
-        _ => false,
-    }
-}
-
-/// Combined claim eligibility for implementation and review slots: a fully
-/// configured Host-owned agent selection whose exact provider/model pair is
-/// reported by the Pi capability catalog.
-fn can_claim_work(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
-    host_agent_selection_ready(agent) && host_selection_available(agent, capabilities)
 }
 
 /// Build the slot runtime exclusively from the Host-owned agent selection.
@@ -1721,7 +1693,7 @@ async fn persist_worker_credential(dir: &Path, credential: &str) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lazyteam_core::AgentModel;
+    use lazyteam_core::{host_selection_available, AgentModel};
 
     #[test]
     fn runtime_config_defaults_legacy_server_to_one_slot() {
