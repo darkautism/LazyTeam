@@ -197,16 +197,22 @@ mod tests {
         assert!(!INDEX.contains(">Approve</button>"));
         assert!(!INDEX.contains(">Retry</button>"));
         // Review-loop signal: durable attempt/review counts on Home cards.
+        // Completed reviews keep the "Reviews N" label; runtime failures
+        // and lost leases use separate labels and are never folded into it.
         assert!(INDEX.contains("loopCounts"));
         assert!(INDEX.contains("loopMeta"));
         assert!(INDEX.contains("isLoopingCounts"));
         assert!(INDEX.contains("Build "));
         assert!(INDEX.contains("Reviews "));
+        assert!(INDEX.contains("Runtime failures "));
+        assert!(INDEX.contains("Lost "));
         assert!(INDEX.contains("Returned "));
         assert!(INDEX.contains("Looping"));
         assert!(INDEX.contains("loop-pill"));
         assert!(INDEX.contains("looping-pill"));
         assert!(INDEX.contains("review_rounds"));
+        assert!(INDEX.contains("review_runtime_failures"));
+        assert!(INDEX.contains("review_lost_leases"));
         assert!(INDEX.contains("reviewer_retries"));
         // Current-cycle vs lifetime retries are tracked separately: the
         // per-cycle limit gates automatic redispatch while lifetime history
