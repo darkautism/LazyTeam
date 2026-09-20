@@ -141,8 +141,21 @@ struct TaskBoardItem {
     result: Option<ExecutionResult>,
     #[serde(default)]
     attempt: u32,
+    /// Completed reviews only (`reviews.state='completed'`). Runtime
+    /// `failed` rows and expired `lost` leases are reported separately via
+    /// `review_runtime_failures`/`review_lost_leases` and never folded into
+    /// this count, so "Reviews N" always means N completed rounds with a
+    /// clear denominator.
     #[serde(default)]
     review_rounds: i64,
+    /// Reviewer runtime/infrastructure failures (`reviews.state='failed'`)
+    /// for this task. Never counted as completed reviews or quality retries.
+    #[serde(default)]
+    review_runtime_failures: i64,
+    /// Expired review leases (`reviews.state='lost'`) for this task. Never
+    /// counted as completed reviews or quality retries.
+    #[serde(default)]
+    review_lost_leases: i64,
     /// Current-cycle completed reviewer `retry` verdicts. This is the count
     /// the configured per-cycle limit applies to. Kept for backward
     /// compatibility; equals `current_cycle_reviewer_retries`.
@@ -165,8 +178,8 @@ struct TaskBoardItem {
 /// completed reviewer `retry` verdicts **in the current review cycle**.
 /// Lifetime history must not gate automatic redispatch: an old task that was
 /// manually republished starts a fresh cycle, so blocking uses the
-/// current-cycle count only. Runtime `failed`/`lost` review rows stay in the
-/// total round count but must never count as reviewer disagreement, and
+/// Runtime `failed`/`lost` review rows are reported separately and must
+/// never count as reviewer disagreement, and
 /// free-form `review_feedback` prose (including Host merge-conflict text)
 /// must never trigger this signal; those belong to the
 /// structured-outcome/Insights work.
@@ -194,6 +207,36 @@ pub(crate) struct TaskStatus {
     /// Durable lifetime total of completed reviewer `retry` verdicts.
     #[serde(default)]
     pub(crate) lifetime_reviewer_retries: i64,
+    /// Completed reviews (`state='completed'`) with a clear denominator for
+    /// approve/retry statistics. Failed/lost infrastructure attempts are
+    /// reported separately and never folded in.
+    #[serde(default)]
+    pub(crate) completed_reviews: i64,
+    /// Reviewer runtime failures (`state='failed'`). Infrastructure only.
+    #[serde(default)]
+    pub(crate) review_runtime_failures: i64,
+    /// Expired review leases (`state='lost'`). Infrastructure only.
+    #[serde(default)]
+    pub(crate) review_lost_leases: i64,
+    /// Per-candidate denominator for the task's latest implementation
+    /// execution only: completed reviews for that execution. Mixed history
+    /// across older candidates stays in the task-wide counters above; this
+    /// is the unambiguous denominator for the current candidate.
+    #[serde(default)]
+    pub(crate) candidate_completed_reviews: i64,
+    /// Completed `approve` verdicts for the latest execution.
+    #[serde(default)]
+    pub(crate) candidate_completed_approvals: i64,
+    /// Completed `retry` verdicts for the latest execution. Never includes
+    /// failed/lost infrastructure attempts.
+    #[serde(default)]
+    pub(crate) candidate_completed_retries: i64,
+    /// Runtime `failed` attempts for the latest execution.
+    #[serde(default)]
+    pub(crate) candidate_runtime_failures: i64,
+    /// Expired `lost` leases for the latest execution.
+    #[serde(default)]
+    pub(crate) candidate_lost_leases: i64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -701,7 +744,36 @@ pub(crate) async fn task_status(State(state): State<Arc<AppState>>, Path(id): Pa
         .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let current_cycle_reviewer_retries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND review_cycle=? AND state='completed' AND (verdict LIKE '%\"verdict\":\"retry\"%' OR verdict LIKE '%\"verdict\": \"retry\"%')")
         .bind(id.to_string()).bind(task.review_cycle).fetch_one(&state.db).await.map_err(db_error)?;
-    Ok(Json(TaskStatus { task, latest_execution, current_cycle_reviewer_retries: current_cycle_reviewer_retries.max(0), lifetime_reviewer_retries: lifetime_reviewer_retries.max(0) }))
+    // Completed vs infrastructure attempts stay separate with a clear
+    // denominator: completed counts completed verdict rows only, while
+    // failed/lost rows are runtime/infrastructure attempts that never count
+    // as quality retries.
+    let completed_reviews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state='completed'")
+        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    let review_runtime_failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state='failed'")
+        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    let review_lost_leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state='lost'")
+        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    // Per-candidate breakdown for the latest implementation execution only,
+    // so mixed history across older candidates has an unambiguous current
+    // denominator. Approve/retry split uses completed verdict JSON only.
+    let latest_execution_id = latest_execution.as_ref().map(|e| e.id.to_string());
+    let (candidate_completed_reviews, candidate_completed_approvals, candidate_completed_retries, candidate_runtime_failures, candidate_lost_leases) = if let Some(execution_id) = latest_execution_id {
+        let completed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='completed'")
+            .bind(id.to_string()).bind(&execution_id).fetch_one(&state.db).await.map_err(db_error)?;
+        let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='completed' AND (verdict LIKE '%\"verdict\":\"approve\"%' OR verdict LIKE '%\"verdict\": \"approve\"%')")
+            .bind(id.to_string()).bind(&execution_id).fetch_one(&state.db).await.map_err(db_error)?;
+        let retries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='completed' AND (verdict LIKE '%\"verdict\":\"retry\"%' OR verdict LIKE '%\"verdict\": \"retry\"%')")
+            .bind(id.to_string()).bind(&execution_id).fetch_one(&state.db).await.map_err(db_error)?;
+        let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
+            .bind(id.to_string()).bind(&execution_id).fetch_one(&state.db).await.map_err(db_error)?;
+        let lost: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
+            .bind(id.to_string()).bind(&execution_id).fetch_one(&state.db).await.map_err(db_error)?;
+        (completed, approvals, retries, failed, lost)
+    } else {
+        (0, 0, 0, 0, 0)
+    };
+    Ok(Json(TaskStatus { task, latest_execution, current_cycle_reviewer_retries: current_cycle_reviewer_retries.max(0), lifetime_reviewer_retries: lifetime_reviewer_retries.max(0), completed_reviews: completed_reviews.max(0), review_runtime_failures: review_runtime_failures.max(0), review_lost_leases: review_lost_leases.max(0), candidate_completed_reviews: candidate_completed_reviews.max(0), candidate_completed_approvals: candidate_completed_approvals.max(0), candidate_completed_retries: candidate_completed_retries.max(0), candidate_runtime_failures: candidate_runtime_failures.max(0), candidate_lost_leases: candidate_lost_leases.max(0) }))
 }
 
 pub(crate) async fn delete_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
@@ -778,7 +850,7 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
 }
 
 async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
-    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state, COALESCE((SELECT MAX(e2.attempt) FROM executions e2 WHERE e2.task_id=t.id),0) AS board_attempt, (SELECT COUNT(*) FROM reviews r2 WHERE r2.task_id=t.id) AS board_review_rounds, (SELECT COUNT(*) FROM reviews r3 WHERE r3.task_id=t.id AND r3.state='completed' AND (r3.verdict LIKE '%\"verdict\":\"retry\"%' OR r3.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_lifetime_retries, (SELECT COUNT(*) FROM reviews r4 WHERE r4.task_id=t.id AND r4.review_cycle=t.review_cycle AND r4.state='completed' AND (r4.verdict LIKE '%\"verdict\":\"retry\"%' OR r4.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_current_retries FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
+    let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state, COALESCE((SELECT MAX(e2.attempt) FROM executions e2 WHERE e2.task_id=t.id),0) AS board_attempt, (SELECT COUNT(*) FROM reviews r2 WHERE r2.task_id=t.id AND r2.state='completed') AS board_review_rounds, (SELECT COUNT(*) FROM reviews r2f WHERE r2f.task_id=t.id AND r2f.state='failed') AS board_review_failures, (SELECT COUNT(*) FROM reviews r2l WHERE r2l.task_id=t.id AND r2l.state='lost') AS board_review_lost, (SELECT COUNT(*) FROM reviews r3 WHERE r3.task_id=t.id AND r3.state='completed' AND (r3.verdict LIKE '%\"verdict\":\"retry\"%' OR r3.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_lifetime_retries, (SELECT COUNT(*) FROM reviews r4 WHERE r4.task_id=t.id AND r4.review_cycle=t.review_cycle AND r4.state='completed' AND (r4.verdict LIKE '%\"verdict\":\"retry\"%' OR r4.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_current_retries FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
         .fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(|row| {
         let task = task_from_row(row)?;
@@ -813,11 +885,13 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
         let result = result.map(dejson).transpose()?;
         let attempt: i64 = row.try_get("board_attempt").map_err(internal)?;
         let review_rounds: i64 = row.try_get("board_review_rounds").map_err(internal)?;
+        let review_runtime_failures: i64 = row.try_get("board_review_failures").map_err(internal)?;
+        let review_lost_leases: i64 = row.try_get("board_review_lost").map_err(internal)?;
         let lifetime_reviewer_retries: i64 = row.try_get("board_lifetime_retries").map_err(internal)?;
         let current_cycle_reviewer_retries: i64 = row.try_get("board_current_retries").map_err(internal)?;
         let current_cycle_reviewer_retries = current_cycle_reviewer_retries.max(0);
         let lifetime_reviewer_retries = lifetime_reviewer_retries.max(current_cycle_reviewer_retries);
-        Ok(TaskBoardItem { task, worker, reviewer, result, attempt: attempt.max(0) as u32, review_rounds: review_rounds.max(0), reviewer_retries: current_cycle_reviewer_retries, current_cycle_reviewer_retries, lifetime_reviewer_retries })
+        Ok(TaskBoardItem { task, worker, reviewer, result, attempt: attempt.max(0) as u32, review_rounds: review_rounds.max(0), review_runtime_failures: review_runtime_failures.max(0), review_lost_leases: review_lost_leases.max(0), reviewer_retries: current_cycle_reviewer_retries, current_cycle_reviewer_retries, lifetime_reviewer_retries })
     }).collect::<Result<Vec<_>, ApiError>>().map(Json)
 }
 
@@ -974,6 +1048,36 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
             .bind(&now).bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         sqlx::query("UPDATE reviews SET state='lost',finished_at=?,lease_capability_hash=NULL,lease_until=? WHERE reviewer_worker_id=? AND state IN ('assigned','running')")
             .bind(&now).bind(&now).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        // Infrastructure-loss path: freshly lost reviewer leases count toward
+        // the same per-candidate runtime budget as expiries/failures. Only
+        // the latest execution's budget can block; stale candidates never
+        // block. History is preserved.
+        {
+            let review_failure_limit: i64 = sqlx::query_scalar("SELECT review_failure_limit FROM host_settings WHERE id=1")
+                .fetch_optional(&mut *tx).await.map_err(db_error)?.flatten().unwrap_or(DEFAULT_REVIEW_FAILURE_LIMIT);
+            let affected: Vec<(String, String)> = sqlx::query("SELECT DISTINCT task_id,execution_id FROM reviews WHERE reviewer_worker_id=? AND state='lost' AND finished_at=?")
+                .bind(id.to_string()).bind(&now).fetch_all(&mut *tx).await.map_err(db_error)?.iter().map(|row| {
+                    let task_id: String = row.try_get("task_id").map_err(internal)?;
+                    let execution_id: String = row.try_get("execution_id").map_err(internal)?;
+                    Ok::<_, ApiError>((task_id, execution_id))
+                }).collect::<Result<Vec<_>, _>>()?;
+            for (task_id, execution_id) in affected {
+                let latest: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+                    .bind(&task_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
+                if latest.as_deref() != Some(execution_id.as_str()) {
+                    continue;
+                }
+                let failed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
+                    .bind(&task_id).bind(&execution_id).fetch_one(&mut *tx).await.map_err(db_error)?;
+                let lost_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
+                    .bind(&task_id).bind(&execution_id).fetch_one(&mut *tx).await.map_err(db_error)?;
+                if review_runtime_failures_exhausted(failed_count, lost_count, review_failure_limit) {
+                    let feedback = review_runtime_blocked_feedback(failed_count, lost_count, review_failure_limit, "Last reviewer lease lost (worker paused).");
+                    sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
+                        .bind(feedback).bind(&now).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+                }
+            }
+        }
         sqlx::query("UPDATE workers SET running_slots=0,state='draining' WHERE id=?")
             .bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
     } else if authority_changed {
@@ -1270,6 +1374,7 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
+    let settings = load_host_settings(&state.db).await?;
     let rows = sqlx::query("SELECT * FROM tasks WHERE state='review' ORDER BY CASE WHEN (SELECT reviewer_worker_id FROM reviews r0 WHERE r0.task_id=tasks.id ORDER BY r0.created_at DESC LIMIT 1)=? THEN 0 ELSE 1 END, priority DESC, updated_at ASC LIMIT 100")
         .bind(worker.id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
     for row in rows {
@@ -1292,6 +1397,21 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
             .bind(task.id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
         if active > 0 { continue; }
+
+        // Bound lost-review loops: expired (`lost`) leases count as reviewer
+        // runtime failures for this implementation candidate. When
+        // failed+lost reaches the configured limit, block instead of
+        // allowing another automatic reclaim. History is preserved.
+        let failed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
+            .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+        let lost_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
+            .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+        if review_runtime_failures_exhausted(failed_count, lost_count, settings.review_failure_limit) {
+            let feedback = review_runtime_blocked_feedback(failed_count, lost_count, settings.review_failure_limit, "No further automatic review reclaim.");
+            sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
+                .bind(feedback).bind(ts(Utc::now())).bind(task.id.to_string()).execute(&state.db).await.map_err(db_error)?;
+            continue;
+        }
 
         let implementation_row = sqlx::query("SELECT * FROM workers WHERE id=?")
             .bind(execution.worker_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
@@ -1401,12 +1521,15 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
         let error = input.error.unwrap_or_else(|| "reviewer failed without an error message".into());
         sqlx::query("UPDATE reviews SET state='failed',finished_at=?,verdict=?,lease_capability_hash=NULL WHERE id=?")
             .bind(ts(now)).bind(json(&serde_json::json!({"error": error}))?).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
-        let failed_reviews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
+        // Lost leases count as reviewer runtime/infrastructure failures for
+        // the same implementation candidate: combine failed+lost rows when
+        // enforcing review_failure_limit. Historical rows are preserved.
+        let failed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
             .bind(&task_id).bind(&execution_id).fetch_one(&mut *tx).await.map_err(db_error)?;
-        if review_failures_exhausted(failed_reviews, settings.review_failure_limit) {
-            let feedback = format!(
-                "Reviewer runtime failed {failed_reviews} times for this implementation; automatic review retries stopped at limit {}. Last error: {error}", settings.review_failure_limit
-            );
+        let lost_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
+            .bind(&task_id).bind(&execution_id).fetch_one(&mut *tx).await.map_err(db_error)?;
+        if review_runtime_failures_exhausted(failed_count, lost_count, settings.review_failure_limit) {
+            let feedback = review_runtime_blocked_feedback(failed_count, lost_count, settings.review_failure_limit, &format!("Last error: {error}"));
             sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
                 .bind(feedback).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
         } else {
@@ -1646,8 +1769,10 @@ pub(crate) async fn reaper(state: Arc<AppState>) {
     }
 }
 
-async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
+pub(crate) async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
     let now = ts(Utc::now());
+    // Reviewer runtime-failure budget for expired leases. Falls back to the
+    // compiled default when host_settings is absent (fresh memory DBs).
     let expired = sqlx::query("SELECT id,task_id,worker_id FROM executions WHERE state IN ('assigned','running') AND lease_until < ?")
         .bind(&now).fetch_all(db).await?;
     for row in expired {
@@ -1666,18 +1791,48 @@ async fn reap_once(db: &SqlitePool) -> anyhow::Result<()> {
         tx.commit().await?;
     }
 
-    let expired_reviews = sqlx::query("SELECT id,task_id,reviewer_worker_id FROM reviews WHERE state IN ('assigned','running') AND lease_until < ?")
+    let review_failure_limit: i64 = sqlx::query_scalar("SELECT review_failure_limit FROM host_settings WHERE id=1")
+        .fetch_optional(db).await?.flatten().unwrap_or(DEFAULT_REVIEW_FAILURE_LIMIT);
+    let expired_reviews = sqlx::query("SELECT id,task_id,execution_id,reviewer_worker_id FROM reviews WHERE state IN ('assigned','running') AND lease_until < ?")
         .bind(&now).fetch_all(db).await?;
     for row in expired_reviews {
         let id: String = row.try_get("id")?;
         let task_id: String = row.try_get("task_id")?;
+        let execution_id: String = row.try_get("execution_id")?;
         let reviewer_worker_id: String = row.try_get("reviewer_worker_id")?;
         let mut tx = db.begin().await?;
         let changed = sqlx::query("UPDATE reviews SET state='lost',finished_at=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running')")
             .bind(&now).bind(&id).execute(&mut *tx).await?.rows_affected();
         if changed > 0 {
-            sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
-                .bind(&now).bind(&task_id).execute(&mut *tx).await?;
+            // Expired/lost reviewer attempts are bounded as reviewer runtime
+            // failures for the same (latest) implementation candidate. Below
+            // the limit the task stays in review for another claim; at the
+            // limit it becomes blocked with explicit failed/lost counts.
+            // A stale expired review for an old candidate never blocks the
+            // task: only the latest execution's budget can gate reclaim.
+            // Historical review rows are preserved; only task state changes.
+            let latest: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+                .bind(&task_id).fetch_optional(&mut *tx).await?;
+            if latest.as_deref() != Some(execution_id.as_str()) {
+                sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
+                    .bind(&now).bind(&task_id).execute(&mut *tx).await?;
+            } else {
+                let failed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
+                    .bind(&task_id).bind(&execution_id).fetch_optional(&mut *tx).await?.unwrap_or(0);
+                let lost_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
+                    .bind(&task_id).bind(&execution_id).fetch_optional(&mut *tx).await?.unwrap_or(0);
+                if failed_count + lost_count >= review_failure_limit {
+                    let total = failed_count + lost_count;
+                    let feedback = format!(
+                        "Reviewer runtime failed {total} times ({failed_count} failed, {lost_count} lost) for this implementation; automatic review retries stopped at limit {review_failure_limit}. Last lease expired without a verdict.",
+                    );
+                    sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
+                        .bind(feedback).bind(&now).bind(&task_id).execute(&mut *tx).await?;
+                } else {
+                    sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
+                        .bind(&now).bind(&task_id).execute(&mut *tx).await?;
+                }
+            }
             sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
                 .bind(&reviewer_worker_id).execute(&mut *tx).await?;
         }
@@ -1979,8 +2134,24 @@ fn db_conflict(error: sqlx::Error) -> ApiError {
     if matches!(error, sqlx::Error::Database(ref e) if e.is_unique_violation()) { (StatusCode::CONFLICT, error.to_string()) } else { db_error(error) }
 }
 
+#[allow(dead_code)]
 fn review_failures_exhausted(failed_reviews: i64, limit: i64) -> bool {
     failed_reviews >= limit
+}
+
+/// Reviewer runtime/infrastructure failure budget: `failed` + `lost` rows for
+/// the same implementation execution count together toward
+/// `review_failure_limit`. Completed verdicts (approve/retry) never count
+/// here, and these rows never count as quality retries.
+fn review_runtime_failures_exhausted(failed: i64, lost: i64, limit: i64) -> bool {
+    failed + lost >= limit
+}
+
+fn review_runtime_blocked_feedback(failed: i64, lost: i64, limit: i64, detail: &str) -> String {
+    let total = failed + lost;
+    format!(
+        "Reviewer runtime failed {total} times ({failed} failed, {lost} lost) for this implementation; automatic review retries stopped at limit {limit}. {detail}",
+    )
 }
 
 fn review_retries_exhausted(reviewer_retries: i64, limit: i64) -> bool {
@@ -2202,6 +2373,8 @@ mod tests {
             result: None,
             attempt: 3,
             review_rounds: 2,
+            review_runtime_failures: 1,
+            review_lost_leases: 1,
             reviewer_retries: 1,
             current_cycle_reviewer_retries: 1,
             lifetime_reviewer_retries: 4,
@@ -2209,6 +2382,8 @@ mod tests {
         let value = serde_json::to_value(&item).unwrap();
         assert_eq!(value["attempt"], 3);
         assert_eq!(value["review_rounds"], 2);
+        assert_eq!(value["review_runtime_failures"], 1);
+        assert_eq!(value["review_lost_leases"], 1);
         assert_eq!(value["reviewer_retries"], 1);
         assert_eq!(value["current_cycle_reviewer_retries"], 1);
         assert_eq!(value["lifetime_reviewer_retries"], 4);
@@ -2250,8 +2425,9 @@ mod tests {
             if attempt == 2 {
                 // Four review rows on the latest execution: one completed
                 // approve and one completed retry, plus one runtime `failed`
-                // and one `lost` row. The failed/lost rows stay in the total
-                // round count but must not count as reviewer disagreement.
+                // and one `lost` row. Failed/lost rows are reported
+                // separately and must not count as completed reviews or
+                // reviewer disagreement.
                 for (verdict, state) in [
                     (r#"{"verdict":"approve","reason":"ok","validation":[]}"#, "completed"),
                     (r#"{"verdict":"retry","reason":"fix it","validation":[]}"#, "completed"),
@@ -2280,7 +2456,9 @@ mod tests {
         let board = task_board(State(state)).await.unwrap().0;
         assert_eq!(board.len(), 1);
         assert_eq!(board[0].attempt, 2);
-        assert_eq!(board[0].review_rounds, 4);
+        assert_eq!(board[0].review_rounds, 2);
+        assert_eq!(board[0].review_runtime_failures, 1);
+        assert_eq!(board[0].review_lost_leases, 1);
         assert_eq!(board[0].reviewer_retries, 1);
         assert_eq!(board[0].current_cycle_reviewer_retries, 1);
         assert_eq!(board[0].lifetime_reviewer_retries, 1);
@@ -2404,5 +2582,338 @@ mod tests {
             .bind(&task_id).bind(&execution_id_2).fetch_one(&state.db).await.unwrap();
         assert_eq!(failed_reviews, 1);
         assert!(!review_failures_exhausted(failed_reviews, 3));
+    }
+
+    #[test]
+    fn lost_leases_combine_with_failed_for_runtime_budget() {
+        assert!(!review_runtime_failures_exhausted(0, 0, 3));
+        assert!(!review_runtime_failures_exhausted(1, 0, 3));
+        assert!(!review_runtime_failures_exhausted(0, 2, 3));
+        assert!(review_runtime_failures_exhausted(1, 2, 3));
+        assert!(review_runtime_failures_exhausted(0, 3, 3));
+        assert!(review_runtime_failures_exhausted(2, 2, 3));
+        let feedback = review_runtime_blocked_feedback(1, 2, 3, "Last error: boom");
+        assert!(feedback.contains("1 failed"));
+        assert!(feedback.contains("2 lost"));
+        assert!(feedback.contains("limit 3"));
+    }
+
+    #[tokio::test]
+    async fn expired_reviewer_leases_are_bounded_as_runtime_failures() {
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let expired = "2000-01-01T00:00:00+00:00";
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for (id, role) in [(&worker_id, "worker"), (&reviewer_id, "reviewer")] {
+            sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(role).bind(role).bind("idle").bind("linux").bind("x86_64")
+                .bind(PROTOCOL_VERSION as i64).bind("test").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,review_feedback,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("lease loop").bind("").bind("").bind("review").bind("").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(&task_id).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
+            .bind("failed").bind(&now).bind(&now).bind(r#"{"error":"runner crashed"}"#)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
+            .bind("assigned").bind(expired).bind(&now)
+            .execute(&db).await.unwrap();
+        reap_once(&db).await.unwrap();
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?").bind(&task_id).fetch_one(&db).await.unwrap();
+        assert_eq!(task_state, "review");
+        let lost: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state='lost'").bind(&task_id).fetch_one(&db).await.unwrap();
+        assert_eq!(lost, 1);
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
+            .bind("assigned").bind(expired).bind(&now)
+            .execute(&db).await.unwrap();
+        reap_once(&db).await.unwrap();
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?").bind(&task_id).fetch_one(&db).await.unwrap();
+        assert_eq!(task_state, "blocked");
+        let feedback: String = sqlx::query_scalar("SELECT review_feedback FROM tasks WHERE id=?").bind(&task_id).fetch_one(&db).await.unwrap();
+        assert!(feedback.contains("1 failed"), "feedback: {feedback}");
+        assert!(feedback.contains("2 lost"), "feedback: {feedback}");
+        assert!(feedback.contains("limit 3"), "feedback: {feedback}");
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=?").bind(&task_id).fetch_one(&db).await.unwrap();
+        assert_eq!(total, 3);
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
+        let task_uuid = Uuid::parse_str(&task_id).unwrap();
+        let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
+        assert_eq!(status.current_cycle_reviewer_retries, 0);
+        assert_eq!(status.lifetime_reviewer_retries, 0);
+        assert_eq!(status.completed_reviews, 0);
+        assert_eq!(status.review_runtime_failures, 1);
+        assert_eq!(status.review_lost_leases, 2);
+        let board = task_board(State(state.clone())).await.unwrap().0;
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].review_rounds, 0);
+        assert_eq!(board[0].review_runtime_failures, 1);
+        assert_eq!(board[0].review_lost_leases, 2);
+        assert_eq!(status.candidate_completed_reviews, 0);
+        assert_eq!(status.candidate_completed_approvals, 0);
+        assert_eq!(status.candidate_completed_retries, 0);
+        assert_eq!(status.candidate_runtime_failures, 1);
+        assert_eq!(status.candidate_lost_leases, 2);
+    }
+
+    #[tokio::test]
+    async fn stale_expired_review_never_blocks_new_candidate() {
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let expired = "2000-01-01T00:00:00+00:00";
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for (id, role) in [(&worker_id, "worker"), (&reviewer_id, "reviewer")] {
+            sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(role).bind(role).bind("idle").bind("linux").bind("x86_64")
+                .bind(PROTOCOL_VERSION as i64).bind("test").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,review_feedback,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("stale").bind("").bind("").bind("review").bind("").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let old_execution = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&old_execution).bind(&task_id).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let latest_execution = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&latest_execution).bind(&task_id).bind(&worker_id).bind(2_i64).bind("completed").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for _ in 0..2 {
+            sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&old_execution).bind(&reviewer_id)
+                .bind("failed").bind(&now).bind(&now).bind(r#"{"error":"old runner crashed"}"#)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&old_execution).bind(&reviewer_id)
+            .bind("assigned").bind(expired).bind(&now)
+            .execute(&db).await.unwrap();
+        reap_once(&db).await.unwrap();
+        let stale_lost: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
+            .bind(&task_id).bind(&old_execution).fetch_one(&db).await.unwrap();
+        assert_eq!(stale_lost, 1);
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?").bind(&task_id).fetch_one(&db).await.unwrap();
+        assert_eq!(task_state, "review");
+        let feedback: String = sqlx::query_scalar("SELECT review_feedback FROM tasks WHERE id=?").bind(&task_id).fetch_one(&db).await.unwrap();
+        assert!(feedback.is_empty(), "stale candidate must not write blocked feedback, got: {feedback}");
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=?").bind(&task_id).fetch_one(&db).await.unwrap();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn review_reclaim_via_claim_review_is_bounded() {
+        use axum::http::HeaderMap;
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let expired = "2000-01-01T00:00:00+00:00";
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4();
+        let reviewer_cred = "test-reviewer-cred";
+        let reviewer_hash = hash_secret(reviewer_cred);
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,git_auth_mode,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind("host").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(worker_id.clone()).bind("worker").bind("worker").bind("idle").bind("linux").bind("x86_64")
+            .bind(PROTOCOL_VERSION as i64).bind("test").bind(&now).bind(&now).bind(r#"["*"]"#).bind(Option::<String>::None)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(reviewer_id.to_string()).bind("reviewer").bind("reviewer").bind("idle").bind("linux").bind("x86_64")
+            .bind(PROTOCOL_VERSION as i64).bind("test").bind(&now).bind(&now).bind(r#"["*"]"#).bind(&reviewer_hash)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,review_feedback,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("claim loop").bind("").bind("").bind("review").bind("").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc123","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(&task_id).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(reviewer_id.to_string())
+            .bind("failed").bind(&now).bind(&now).bind(r#"{"error":"runner crashed"}"#)
+            .execute(&db).await.unwrap();
+        let state = Arc::new(AppState { db, public_url: Some("https://example.com".into()), oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
+        let headers = || {
+            let mut h = HeaderMap::new();
+            h.insert("x-lazyteam-worker-credential", reviewer_cred.parse().unwrap());
+            h
+        };
+        let is_assignment = |response: axum::response::Response| response.status() != axum::http::StatusCode::NO_CONTENT;
+        let claimed_first = claim_review(Path(reviewer_id), State(state.clone()), headers()).await.unwrap();
+        assert!(is_assignment(claimed_first), "below-limit reclaim must allow another reviewer claim");
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
+            .bind(&task_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(active, 1);
+        let active_id: String = sqlx::query_scalar("SELECT id FROM reviews WHERE task_id=? AND state IN ('assigned','running') LIMIT 1")
+            .bind(&task_id).fetch_one(&state.db).await.unwrap();
+        sqlx::query("UPDATE reviews SET lease_until=? WHERE id=?").bind(expired).bind(&active_id).execute(&state.db).await.unwrap();
+        reap_once(&state.db).await.unwrap();
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?").bind(&task_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(task_state, "review");
+        let claimed_second = claim_review(Path(reviewer_id), State(state.clone()), headers()).await.unwrap();
+        assert!(is_assignment(claimed_second), "at 2/3 failures reclaim must still be allowed");
+        let active_id2: String = sqlx::query_scalar("SELECT id FROM reviews WHERE task_id=? AND state IN ('assigned','running') LIMIT 1")
+            .bind(&task_id).fetch_one(&state.db).await.unwrap();
+        sqlx::query("UPDATE reviews SET lease_until=? WHERE id=?").bind(expired).bind(&active_id2).execute(&state.db).await.unwrap();
+        reap_once(&state.db).await.unwrap();
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?").bind(&task_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(task_state, "blocked");
+        let feedback: String = sqlx::query_scalar("SELECT review_feedback FROM tasks WHERE id=?").bind(&task_id).fetch_one(&state.db).await.unwrap();
+        assert!(feedback.contains("1 failed"), "feedback: {feedback}");
+        assert!(feedback.contains("2 lost"), "feedback: {feedback}");
+        assert!(feedback.contains("limit 3"), "feedback: {feedback}");
+        let claimed_third = claim_review(Path(reviewer_id), State(state.clone()), headers()).await.unwrap();
+        assert!(!is_assignment(claimed_third), "at-limit claim must stop automatic reclaim");
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=?").bind(&task_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn mixed_review_counters_keep_completed_separate_from_runtime() {
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for (id, role) in [(&worker_id, "worker"), (&reviewer_id, "reviewer")] {
+            sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(role).bind(role).bind("idle").bind("linux").bind("x86_64")
+                .bind(PROTOCOL_VERSION as i64).bind("test").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,review_feedback,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("mixed").bind("").bind("").bind("review").bind("").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(&task_id).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for (verdict, state) in [
+            (r#"{"verdict":"retry","reason":"fix it","validation":[]}"#, "completed"),
+            (r#"{"verdict":"approve","reason":"ok","validation":[]}"#, "completed"),
+            (r#"{"error":"runner crashed"}"#, "failed"),
+        ] {
+            sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
+                .bind(state).bind(&now).bind(&now).bind(verdict)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
+            .bind("lost").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
+        let task_uuid = Uuid::parse_str(&task_id).unwrap();
+        let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
+        assert_eq!(status.completed_reviews, 2);
+        assert_eq!(status.review_runtime_failures, 1);
+        assert_eq!(status.review_lost_leases, 1);
+        assert_eq!(status.current_cycle_reviewer_retries, 1);
+        assert_eq!(status.lifetime_reviewer_retries, 1);
+        // Per-candidate denominator is unambiguous for the latest execution.
+        assert_eq!(status.candidate_completed_reviews, 2);
+        assert_eq!(status.candidate_completed_approvals, 1);
+        assert_eq!(status.candidate_completed_retries, 1);
+        assert_eq!(status.candidate_runtime_failures, 1);
+        assert_eq!(status.candidate_lost_leases, 1);
+        let board = task_board(State(state.clone())).await.unwrap().0;
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].review_rounds, 2);
+        assert_eq!(board[0].review_runtime_failures, 1);
+        assert_eq!(board[0].review_lost_leases, 1);
+        assert_eq!(board[0].current_cycle_reviewer_retries, 1);
+        assert_eq!(board[0].lifetime_reviewer_retries, 1);
+        assert_eq!(board[0].reviewer_retries, 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_candidates_keep_per_candidate_denominator() {
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        for (id, role) in [(&worker_id, "worker"), (&reviewer_id, "reviewer")] {
+            sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(role).bind(role).bind("idle").bind("linux").bind("x86_64")
+                .bind(PROTOCOL_VERSION as i64).bind("test").bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,review_feedback,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(&task_id).bind(&project_id).bind("two candidates").bind("").bind("").bind("review").bind("").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let old_execution = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&old_execution).bind(&task_id).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let latest_execution = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&latest_execution).bind(&task_id).bind(&worker_id).bind(2_i64).bind("completed").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&old_execution).bind(&reviewer_id)
+            .bind("completed").bind(&now).bind(&now).bind(r#"{"verdict":"retry","reason":"old fix","validation":[]}"#)
+            .execute(&db).await.unwrap();
+        for (verdict, state) in [
+            (r#"{"verdict":"approve","reason":"ok","validation":[]}"#, "completed"),
+            (r#"{"error":"runner crashed"}"#, "failed"),
+        ] {
+            sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&latest_execution).bind(&reviewer_id)
+                .bind(state).bind(&now).bind(&now).bind(verdict)
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&latest_execution).bind(&reviewer_id)
+            .bind("lost").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
+        let task_uuid = Uuid::parse_str(&task_id).unwrap();
+        let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
+        assert_eq!(status.completed_reviews, 2);
+        assert_eq!(status.lifetime_reviewer_retries, 1);
+        assert_eq!(status.review_runtime_failures, 1);
+        assert_eq!(status.review_lost_leases, 1);
+        assert_eq!(status.candidate_completed_reviews, 1);
+        assert_eq!(status.candidate_completed_approvals, 1);
+        assert_eq!(status.candidate_completed_retries, 0);
+        assert_eq!(status.candidate_runtime_failures, 1);
+        assert_eq!(status.candidate_lost_leases, 1);
     }
 }
