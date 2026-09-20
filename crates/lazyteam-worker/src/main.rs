@@ -1170,9 +1170,7 @@ async fn run_task(workspace_root: &Path, sandbox: &AgentSandbox, runtime: Arc<dy
     sync_agent_workspace(&agent_workspace, &workspace).await?;
     auto_commit(&workspace, assignment).await?;
     let head_sha = git_output(&workspace, &["rev-parse", "HEAD"]).await?;
-    if head_sha == base_sha {
-        bail!("agent completed without producing any tracked change");
-    }
+    ensure_tracked_change(&head_sha, &base_sha)?;
     let commit_sha = Some(head_sha);
     let review_ref = task_branch(assignment);
     command_ok_with_auth(&workspace, "git", &["push", "origin", &format!("HEAD:refs/heads/{review_ref}")], git_auth).await?;
@@ -1222,6 +1220,17 @@ fn build_prompt(initial_prompt: &str, assignment: &Assignment) -> String {
     )
 }
 
+/// Zero-change guard: an attempt that ends exactly at the base produced no
+/// tracked delta. A retry that restored the prior candidate ends at the
+/// candidate commit instead, so amending-by-keeping still passes while a
+/// genuinely unchanged fresh task still fails.
+fn ensure_tracked_change(head_sha: &str, base_sha: &str) -> anyhow::Result<()> {
+    if head_sha.trim() == base_sha.trim() {
+        bail!("agent completed without producing any tracked change");
+    }
+    Ok(())
+}
+
 fn bounded_review_patch(mut patch: String, max_bytes: usize) -> (String, bool) {
     if patch.len() <= max_bytes { return (patch, false); }
     let mut end = max_bytes.min(patch.len());
@@ -1252,12 +1261,14 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
         let base = git_output(path, &["rev-parse", "FETCH_HEAD"]).await?;
         command_ok(path, "git", &["update-ref", &default_ref, &base]).await?;
         // A fresh execution broker repository carries the latest prior
-        // candidate for this task when one exists. Fetch it best-effort so a
+        // candidate for this task when one exists. Fetch it fail-closed so a
         // reused workspace that lost the local branch (or never saw the
         // candidate) still starts with the prior delta available.
-        fetch_seeded_candidate(path, &branch_ref, git_auth).await;
+        let seed = fetch_seeded_candidate(path, &branch_ref, git_auth).await?;
         checkout_task_branch(path, &branch).await?;
-        merge_ref_into_head(path, assignment, SEEDED_CANDIDATE_REF).await?;
+        if seed == SeedFetch::Present {
+            restore_seeded_candidate_tree(path).await?;
+        }
         merge_ref_into_head(path, assignment, &base).await?;
         return Ok(base);
     }
@@ -1274,12 +1285,14 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
     // execution repository. Check it out when present so the next attempt
     // starts with the candidate delta available; a genuinely fresh task has
     // no such ref and still starts from the current base.
-    fetch_seeded_candidate(path, &branch_ref, git_auth).await;
-    if seeded_candidate_present(path).await {
-        command_ok(path, "git", &["checkout", "-b", &branch, SEEDED_CANDIDATE_REF]).await?;
-        merge_ref_into_head(path, assignment, &base).await?;
-    } else {
-        command_ok(path, "git", &["checkout", "-b", &branch]).await?;
+    match fetch_seeded_candidate(path, &branch_ref, git_auth).await? {
+        SeedFetch::Present => {
+            command_ok(path, "git", &["checkout", "-b", &branch, SEEDED_CANDIDATE_REF]).await?;
+            merge_ref_into_head(path, assignment, &base).await?;
+        }
+        SeedFetch::Absent => {
+            command_ok(path, "git", &["checkout", "-b", &branch]).await?;
+        }
     }
     Ok(base)
 }
@@ -1290,19 +1303,85 @@ async fn prepare_workspace(path: &Path, assignment: &Assignment, git_auth: &GitA
 /// executions of the same task); reviewer checkouts are never fetched here.
 const SEEDED_CANDIDATE_REF: &str = "refs/lazyteam/seeded-candidate";
 
-/// Best-effort fetch of the task branch seeded by the server into the fresh
-/// execution repository. Missing ref (genuinely fresh task) is normal and
-/// left for the caller to detect via [`seeded_candidate_present`].
-async fn fetch_seeded_candidate(path: &Path, branch_ref: &str, git_auth: &GitAuthContext) {
-    let _ = trusted_git_command()
-        .args(["update-ref", "-d", SEEDED_CANDIDATE_REF])
-        .current_dir(path)
-        .output()
-        .await;
+/// Fetch outcome for the server-seeded prior candidate branch.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SeedFetch {
+    Present,
+    Absent,
+}
+
+/// Fetch of the task branch seeded by the server into the fresh execution
+/// repository. Fail-closed: when origin advertises the branch but the fetch
+/// fails (or the fetch cannot even confirm absence), the error propagates so
+/// the attempt fails instead of silently restarting from base and
+/// reproducing the no-tracked-change failure. Only a confirmed-absent ref
+/// (genuinely fresh task) proceeds as [`SeedFetch::Absent`].
+async fn fetch_seeded_candidate(path: &Path, branch_ref: &str, git_auth: &GitAuthContext) -> anyhow::Result<SeedFetch> {
     let mut command = trusted_git_command();
-    command.args(["fetch", "origin", &format!("{branch_ref}:{SEEDED_CANDIDATE_REF}")]).current_dir(path);
+    command.args(["fetch", "origin", &format!("+{branch_ref}:{SEEDED_CANDIDATE_REF}")]).current_dir(path);
     git_auth.apply(&mut command);
-    let _ = command.output().await;
+    let fetch = command.output().await?;
+    if fetch.status.success() && seeded_candidate_present(path).await {
+        let sha = git_output(path, &["rev-parse", "--verify", SEEDED_CANDIDATE_REF]).await?;
+        if !sha.trim().is_empty() {
+            return Ok(SeedFetch::Present);
+        }
+    }
+    if origin_advertises_branch(path, branch_ref, git_auth).await? {
+        bail!(
+            "prior candidate branch {branch_ref} exists on the execution repository but could not be fetched: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        );
+    }
+    Ok(SeedFetch::Absent)
+}
+
+/// Confirm via the execution repository whether the seeded branch exists.
+/// Errors propagate (fail closed): an unreachable origin must not be
+/// mistaken for a genuinely fresh task.
+async fn origin_advertises_branch(path: &Path, branch_ref: &str, git_auth: &GitAuthContext) -> anyhow::Result<bool> {
+    let mut command = trusted_git_command();
+    command.args(["ls-remote", "origin", branch_ref]).current_dir(path);
+    git_auth.apply(&mut command);
+    let output = command.output().await?;
+    if !output.status.success() {
+        bail!(
+            "cannot verify whether a prior candidate exists on the execution repository: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(!String::from_utf8(output.stdout).context("decode ls-remote output")?.trim().is_empty())
+}
+
+/// Restore the trusted worktree to the last valid (server-seeded) candidate
+/// tree. A failed attempt can leave the reused branch at a descendant commit
+/// (e.g. an unpushed revert/overwrite, committed before the failed push) or
+/// a dirty worktree; ancestry merging would then keep the revert and hide
+/// the prior delta from the agent. Resetting to the seeded commit restores
+/// the candidate, and the pre-reset HEAD is preserved on a backup ref for
+/// forensics so nothing is silently dropped.
+async fn restore_seeded_candidate_tree(path: &Path) -> anyhow::Result<()> {
+    let head = git_output(path, &["rev-parse", "HEAD"]).await?;
+    let seeded = git_output(path, &["rev-parse", "--verify", SEEDED_CANDIDATE_REF]).await?;
+    // A failed attempt can also leave an uncommitted revert/overwrite or an
+    // unfinished conflicted merge on top of the right commit, which would
+    // likewise hide the prior delta from the agent.
+    let dirty = !git_output(path, &["status", "--porcelain"]).await?.trim().is_empty()
+        || git_output(path, &["rev-parse", "--verify", "MERGE_HEAD"]).await.is_ok();
+    if head == seeded && !dirty {
+        return Ok(());
+    }
+    let backup = format!("refs/lazyteam/retry-backup-{}", head.chars().take(12).collect::<String>());
+    let _ = trusted_git_command().args(["update-ref", &backup, &head]).current_dir(path).output().await;
+    if trusted_git_command().args(["reset", "--hard", SEEDED_CANDIDATE_REF]).current_dir(path).status().await?.success() {
+        return Ok(());
+    }
+    // Untracked files can shadow candidate paths and block the reset; remove
+    // non-ignored untracked files (info/exclude keeps build outputs) and
+    // retry once before failing closed.
+    command_ok(path, "git", &["clean", "-fd"]).await?;
+    command_ok(path, "git", &["reset", "--hard", SEEDED_CANDIDATE_REF]).await?;
+    Ok(())
 }
 
 async fn seeded_candidate_present(path: &Path) -> bool {
@@ -1930,6 +2009,104 @@ mod tests {
         prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
         assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A failed attempt can leave the reused branch at a descendant commit
+    /// (e.g. a committed revert of the candidate, auto-committed before the
+    /// failed push). Ancestry merging would keep the revert and hide the
+    /// prior delta; the candidate tree must be restored instead.
+    #[tokio::test]
+    async fn prepare_workspace_descendant_revert_restores_candidate_tree() {
+        let root = std::env::temp_dir().join(format!("lazyteam-ws-descendant-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let (broker, work, _) = init_broker_with_base(&root).await;
+        let task_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let branch = format!("lazyteam/task-{}", task_id.simple());
+        command_ok(&work, "git", &["checkout", "-b", &branch]).await.unwrap();
+        git_commit_file(&work, "fix.txt", "prior candidate\n", "lazyteam: amend prior candidate").await;
+        command_ok(&work, "git", &["push", "origin", &format!("HEAD:refs/heads/{branch}")]).await.unwrap();
+        let seeded = git_output(&work, &["rev-parse", "HEAD"]).await.unwrap();
+        // Reused workspace at a descendant that reverts the candidate.
+        let workspace = root.join("workspace");
+        command_ok(root.as_path(), "git", &["clone", broker.to_str().unwrap(), workspace.to_str().unwrap()]).await.unwrap();
+        command_ok(&workspace, "git", &["checkout", &branch]).await.unwrap();
+        command_ok(&workspace, "git", &["config", "user.name", "LazyTeam Test"]).await.unwrap();
+        command_ok(&workspace, "git", &["config", "user.email", "lazyteam-test@local"]).await.unwrap();
+        command_ok(&workspace, "git", &["revert", "--no-edit", "HEAD"]).await.unwrap();
+        assert!(!workspace.join("fix.txt").exists());
+
+        let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 3);
+        let auth = GitAuthContext::broker("worker-secret", "lease-secret");
+        prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
+        assert_eq!(git_output(&workspace, &["rev-parse", "HEAD"]).await.unwrap(), seeded);
+        // The pre-reset descendant is preserved for forensics, not dropped.
+        assert!(!git_output(&workspace, &["for-each-ref", "refs/lazyteam/retry-backup-*"]).await.unwrap().is_empty());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A failed attempt can also leave an uncommitted revert/overwrite on an
+    /// otherwise current branch; the candidate tree must still be restored
+    /// so the agent sees the prior delta.
+    #[tokio::test]
+    async fn prepare_workspace_dirty_revert_restores_candidate_tree() {
+        let root = std::env::temp_dir().join(format!("lazyteam-ws-dirty-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let (broker, work, _) = init_broker_with_base(&root).await;
+        let task_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let branch = format!("lazyteam/task-{}", task_id.simple());
+        command_ok(&work, "git", &["checkout", "-b", &branch]).await.unwrap();
+        git_commit_file(&work, "fix.txt", "prior candidate\n", "lazyteam: amend prior candidate").await;
+        command_ok(&work, "git", &["push", "origin", &format!("HEAD:refs/heads/{branch}")]).await.unwrap();
+        let workspace = root.join("workspace");
+        command_ok(root.as_path(), "git", &["clone", broker.to_str().unwrap(), workspace.to_str().unwrap()]).await.unwrap();
+        command_ok(&workspace, "git", &["checkout", &branch]).await.unwrap();
+        tokio::fs::write(workspace.join("fix.txt"), "tampered\n").await.unwrap();
+
+        let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 3);
+        let auth = GitAuthContext::broker("worker-secret", "lease-secret");
+        prepare_workspace(&workspace, &assignment, &auth).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(workspace.join("fix.txt")).await.unwrap(), "prior candidate\n");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// Fail-closed fetch: when the execution repository advertises the task
+    /// branch but its objects cannot be fetched, preparation must error
+    /// instead of silently restarting from base.
+    #[tokio::test]
+    async fn prepare_workspace_seed_fetch_failure_is_fail_closed() {
+        let root = std::env::temp_dir().join(format!("lazyteam-ws-fetchfail-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let (broker, _, _) = init_broker_with_base(&root).await;
+        let task_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let branch = format!("lazyteam/task-{}", task_id.simple());
+        // Advertise a task branch whose objects are missing: ls-remote sees
+        // the ref, but fetching it fails. Written directly because
+        // update-ref refuses a nonexistent object.
+        let ref_path = broker.join("refs").join("heads").join("lazyteam").join(format!("task-{}", task_id.simple()));
+        tokio::fs::create_dir_all(ref_path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&ref_path, format!("{}\n", "a".repeat(40))).await.unwrap();
+        let workspace = root.join("workspace");
+        let assignment = workspace_test_assignment(broker.to_str().unwrap(), task_id, project_id, 3);
+        let auth = GitAuthContext::broker("worker-secret", "lease-secret");
+        let error = prepare_workspace(&workspace, &assignment, &auth).await.expect_err("unfetchable candidate must fail closed");
+        assert!(error.to_string().contains("could not be fetched"), "unexpected error: {error}");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn tracked_change_guard_fails_at_base_and_passes_at_candidate() {
+        // Genuinely unchanged fresh task: HEAD == base still fails, so the
+        // zero-change completion error is preserved.
+        assert!(ensure_tracked_change("abc123", "abc123").is_err());
+        let error = ensure_tracked_change("abc123", "abc123").unwrap_err();
+        assert!(error.to_string().contains("without producing any tracked change"));
+        // Retry that restored the prior candidate ends at the candidate
+        // commit: amending-by-keeping passes the guard.
+        assert!(ensure_tracked_change("candidate-sha", "base-sha").is_ok());
     }
 
     /// A genuinely fresh task (no seeded candidate) still starts from the
