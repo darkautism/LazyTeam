@@ -1276,9 +1276,15 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
             crate::git_broker::remove_task_repo(&state, execution.id).await?;
             continue;
         }
-        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,lease_capability_hash) VALUES(?,?,?,?,?,?,?,?)")
+        // Snapshot the worker backend in effect at claim time so Insights
+        // breakdowns read durable per-attempt history, never mutable worker
+        // metadata. Columns are populated for rows claimed after the
+        // attempt-backend migration; older rows keep NULL ("unrecorded").
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,lease_capability_hash,worker_agent_type,worker_provider,worker_model) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(execution.id.to_string()).bind(task.id.to_string()).bind(worker.id.to_string()).bind(attempt)
-            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash).execute(&mut *tx).await.map_err(db_error)?;
+            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash)
+            .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone())
+            .execute(&mut *tx).await.map_err(db_error)?;
         sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
             .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
@@ -1367,11 +1373,15 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         // redispatch stays in the same cycle; only a manual retry_task bumps
         // tasks.review_cycle. Historical rows keep their original cycle and
         // remain counted in lifetime totals.
+        // Snapshot the reviewer backend at claim time alongside the cycle so
+        // Insights breakdowns read durable per-attempt history, never mutable
+        // worker metadata.
         let review_cycle: i64 = sqlx::query_scalar("SELECT review_cycle FROM tasks WHERE id=?")
             .bind(task.id.to_string()).fetch_one(&mut *tx).await.map_err(db_error)?;
-        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,review_cycle) VALUES(?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(review.id.to_string()).bind(task.id.to_string()).bind(execution.id.to_string()).bind(worker.id.to_string())
-            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash).bind(review_cycle).execute(&mut *tx).await.map_err(db_conflict)?;
+            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash)
+            .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone()).bind(review_cycle).execute(&mut *tx).await.map_err(db_conflict)?;
         sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
             .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;

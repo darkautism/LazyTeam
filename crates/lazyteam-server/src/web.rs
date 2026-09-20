@@ -226,5 +226,47 @@ mod tests {
         assert!(INDEX.contains("compactCard(t.title,cardSummary(x),"));
         // Looping derives from durable counts only, never review_feedback prose.
         assert!(!INDEX.contains("review_feedback"));
+        // Host Insights: durable worker/reviewer/main-gate statistics.
+        assert!(INDEX.contains(r#"data-page="insights""#));
+        assert!(INDEX.contains("id=\"page-insights\""));
+        assert!(INDEX.contains("/api/insights"));
+        assert!(INDEX.contains("insights-window"));
+        assert!(INDEX.contains("refreshInsights"));
+        assert!(INDEX.contains("renderInsights"));
+        assert!(INDEX.contains("setInsightsWindow"));
+        assert!(INDEX.contains("Reviewer quality vs runtime"));
+        assert!(INDEX.contains("Main gate"));
+        assert!(INDEX.contains("Completion time"));
+        assert!(INDEX.contains("Implementation by worker"));
+        assert!(INDEX.contains("Reviewer by worker"));
+        assert!(INDEX.contains("Retry and send-back reasons"));
+        assert!(INDEX.contains("Lifetime retries"));
+        assert!(INDEX.contains("Current-cycle retries"));
+        assert!(INDEX.contains("merge-conflict redispatch"));
+        assert!(INDEX.contains("never model-quality failures"));
+        assert!(INDEX.contains("main_gate_merge_conflict"));
+        assert!(INDEX.contains("main_gate_upstream_moved"));
+        assert!(INDEX.contains("reviewer_retries_current_cycle"));
+        assert!(INDEX.contains("reviews_runtime_failed"));
+        assert!(INDEX.contains("/api/tasks/'"));
+        assert!(INDEX.contains("Gate outcome"));
+        assert!(INDEX.contains("Backend / provider / model"));
+        // Task detail exposes durable gate outcomes, never current task state.
+        assert!(!INDEX.contains("esc(t.state)"));
+        // Evidence drill-down: every task/execution/review/event ID is an
+        // action opening the state-independent history bundle, which works
+        // for queued retries and cancelled tasks too.
+        assert!(INDEX.contains("Evidence drill-down"));
+        assert!(INDEX.contains("showInsightEvidence"));
+        assert!(INDEX.contains("insightEvidenceLink"));
+        assert!(INDEX.contains("/history"));
+        assert!(INDEX.contains("insights-evidence"));
+        assert!(INDEX.contains("insightVerdictText"));
+        // Insights history never filters on mutable task state.
+        assert!(!INDEX.contains("state!='cancelled'"));
+        // Evidence drill-down surfaces the review-cycle epoch.
+        assert!(INDEX.contains("review_cycle"));
+        assert!(INDEX.contains("cycle "));
+        assert!(!INDEX.contains("/api/tasks/'+esc(r.task_id)+'/review"));
     }
 }
