@@ -1,4 +1,4 @@
-use std::{path::{Path, PathBuf}, process::Stdio};
+use std::{collections::BTreeMap, path::{Path, PathBuf}, process::Stdio};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -75,6 +75,566 @@ fn tool_stalled(last_progress: Instant, now: Instant, window: Duration) -> bool 
     now.saturating_duration_since(last_progress) >= window
 }
 
+const MAX_TOOL_NAME_LEN: usize = 32;
+const MAX_TOOL_CALL_ID_LEN: usize = 64;
+const MAX_COMMAND_SUMMARY_LEN: usize = 80;
+const MAX_FINGERPRINT_BYTES: usize = 4096;
+
+/// Bounded safe diagnostics for the currently active Pi tool call.
+///
+/// Only fixed-vocabulary labels, sanitized identifiers, counts, durations,
+/// and a stable hash are retained. Raw tool arguments, command payload text,
+/// credentials, and transcripts are never stored here or in any durable
+/// watchdog message built from this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveToolState {
+    name: String,
+    call_id: Option<String>,
+    started_at: Instant,
+    last_progress_at: Instant,
+    update_count: u64,
+    args_available: bool,
+    command_class: String,
+    program: Option<String>,
+    command_summary: String,
+    fingerprint: String,
+}
+
+impl ActiveToolState {
+    fn name_label(&self) -> &str {
+        &self.name
+    }
+}
+
+fn sanitize_label(raw: &str, max_len: usize) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        .take(max_len)
+        .collect();
+    if filtered.is_empty() {
+        "unknown".to_string()
+    } else {
+        filtered
+    }
+}
+
+fn fnv1a64_hex_tool(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn extract_tool_name(event: &Value) -> String {
+    let raw = event
+        .get("toolName")
+        .or_else(|| event.get("tool_name"))
+        .or_else(|| event.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    sanitize_label(raw.trim(), MAX_TOOL_NAME_LEN)
+}
+
+fn extract_tool_call_id(event: &Value) -> Option<String> {
+    const KEYS: &[&str] = &["toolCallId", "tool_call_id", "callId", "call_id", "toolUseId", "tool_use_id"];
+    for key in KEYS {
+        if let Some(raw) = event.get(*key).and_then(Value::as_str) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(sanitize_label(trimmed, MAX_TOOL_CALL_ID_LEN));
+            }
+        }
+    }
+    for container in ["toolCall", "tool_call", "toolUse", "tool_use", "data"] {
+        if let Some(obj) = event.get(container).and_then(Value::as_object) {
+            for key in KEYS {
+                if let Some(raw) = obj.get(*key).and_then(Value::as_str) {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        return Some(sanitize_label(trimmed, MAX_TOOL_CALL_ID_LEN));
+                    }
+                }
+            }
+            if let Some(raw) = obj.get("id").and_then(Value::as_str) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() && container != "data" {
+                    return Some(sanitize_label(trimmed, MAX_TOOL_CALL_ID_LEN));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Locate the tool-argument payload without cloning raw content into durable
+/// state. Returns `None` when the Pi RPC event schema exposes no arguments.
+fn tool_args_value(event: &Value) -> Option<&Value> {
+    const KEYS: &[&str] = &["input", "args", "arguments", "params", "parameters", "toolInput", "tool_input"];
+    for key in KEYS {
+        if let Some(value) = event.get(*key) {
+            if !is_null_like(value) {
+                return Some(value);
+            }
+        }
+    }
+    for container in ["toolCall", "tool_call", "toolUse", "tool_use", "data"] {
+        if let Some(obj) = event.get(container).and_then(Value::as_object) {
+            for key in KEYS {
+                if let Some(value) = obj.get(*key) {
+                    if !is_null_like(value) {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+    }
+    // Some schemas inline the command beside the tool name on tool events.
+    // Only treated as args for tool execution events (never for get_state
+    // responses, which also use a `command` key for the RPC method name).
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("tool_execution_start") | Some("tool_execution_update")
+    ) {
+        if let Some(value) = event.get("command") {
+            if value.is_string() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn is_null_like(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+/// Extract a bounded raw command string for classification only. The returned
+/// string is used transiently to derive a redacted class/program/hash and is
+/// never persisted itself.
+fn raw_command_from_args(args: &Value, event: &Value) -> Option<String> {
+    if let Some(s) = args.as_str() {
+        return bounded_raw_command(s);
+    }
+    if let Some(obj) = args.as_object() {
+        for key in ["command", "cmd", "script", "code", "text", "input"] {
+            if let Some(s) = obj.get(key).and_then(Value::as_str) {
+                if let Some(cmd) = bounded_raw_command(s) {
+                    return Some(cmd);
+                }
+            }
+        }
+    }
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("tool_execution_start") | Some("tool_execution_update")
+    ) {
+        if let Some(s) = event.get("command").and_then(Value::as_str) {
+            return bounded_raw_command(s);
+        }
+    }
+    None
+}
+
+fn bounded_raw_command(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bounded: String = trimmed.chars().take(MAX_FINGERPRINT_BYTES).collect();
+    if bounded.is_empty() { None } else { Some(bounded) }
+}
+
+/// Closed vocabulary of executable basenames that may appear in durable
+/// diagnostics. The program token is emitted only on exact membership, so an
+/// attacker-controlled or secret-bearing argv[0] (a token, a path, or a
+/// script name) can never be echoed back. Unknown programs still get a stable
+/// fingerprint for correlation, but no name.
+const KNOWN_PROGRAMS: &[&str] = &[
+    "cargo", "rustc", "gcc", "g++", "cc", "c++", "clang", "clang++", "ld",
+    "git", "gh", "glab",
+    "curl", "wget", "aria2c",
+    "ssh", "scp", "rsync", "sftp",
+    "npm", "pnpm", "yarn", "bun", "deno", "node",
+    "make", "just", "ninja", "cmake",
+    "docker", "podman", "nerdctl",
+    "kubectl", "helm", "terraform", "ansible", "ansible-playbook",
+    "python", "python3", "pip", "pip3", "uv", "pytest", "pytest-3",
+    "nextest", "cargo-nextest",
+    "go", "java", "mvn", "gradle", "dotnet", "ruby", "bundle",
+    "php", "composer", "perl", "lua", "rscript", "julia",
+    "sqlite3", "psql", "mysql", "redis-cli",
+    "tar", "zip", "unzip", "7z",
+    "ls", "cat", "echo", "grep", "rg", "fd", "find", "head", "tail",
+    "sed", "awk", "jq", "yq", "cut", "sort", "uniq", "wc", "diff",
+    "less", "more", "file", "stat", "du", "df", "tee", "xargs",
+    "chmod", "mkdir", "rm", "cp", "mv", "ln", "touch",
+    "sleep", "systemctl", "journalctl",
+    "apt", "apt-get", "dpkg", "yum", "dnf", "apk", "pacman", "brew",
+];
+
+/// Programs whose redacted summary may include an allowlisted subcommand.
+/// Every other program is summarized by its bare name alone.
+const SUMMARY_WITH_SUBCOMMAND: &[&str] = &[
+    "cargo", "git", "npm", "pnpm", "yarn", "bun", "make", "just", "go",
+    "docker", "podman", "kubectl",
+];
+
+const SHELL_PROGRAMS: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "ksh"];
+
+/// Wrapper flags that consume a following value while peeling. Best-effort
+/// only and applied solely to leading wrapper arguments; unknown flags are
+/// skipped singly without a value.
+const WRAPPER_VALUE_FLAGS: &[&str] = &[
+    "-u", "--user", "-g", "--group", "-s", "--signal", "--kill-after",
+    "-n", "-o", "-e", "-i", "--unset", "-C", "--directory",
+];
+
+/// Quote-aware shell word splitter. Quoted spans stay one token (quote
+/// characters removed); `;`, `&`, `|`, `(`, `)` terminate words so only the
+/// leading command is considered.
+fn split_shell_words(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                in_word = true;
+                continue;
+            }
+            if c == q {
+                quote = None;
+                continue;
+            }
+            cur.push(c);
+            in_word = true;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                in_word = true;
+            }
+            c if c.is_whitespace() | matches!(c, ';' | '&' | '|' | '(' | ')') => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        out.push(cur);
+    }
+    out
+}
+
+fn strip_outer_quotes(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'"' || bytes[0] == b'\'')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        &token[1..token.len() - 1]
+    } else {
+        token
+    }
+}
+
+/// Lowercase basename: `/usr/bin/cargo` and `cargo` are the same program.
+/// Basename is taken before any wrapper comparison so absolute wrapper
+/// paths (`/usr/bin/env`, `/usr/bin/sudo`) still peel correctly.
+fn exe_basename(token: &str) -> String {
+    strip_outer_quotes(token.trim())
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn is_flag(token: &str) -> bool {
+    token.len() > 1 && token.starts_with('-')
+}
+
+/// `FOO=bar` assignments (value may itself contain `/`, `$`, etc.).
+fn is_env_assignment(token: &str) -> bool {
+    if token.starts_with('-') {
+        return false;
+    }
+    let Some((key, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_bare_number(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_digit())
+}
+
+/// `-c`/`-lc`/`-exc` style shell flags (not `--long` forms).
+fn is_shell_c_flag(token: &str) -> bool {
+    token.len() > 1
+        && token.starts_with('-')
+        && !token.starts_with("--")
+        && token.contains('c')
+}
+
+/// Skip leading wrapper flags (and their values) plus env assignments.
+/// Stops at the first real operand; everything from there is kept verbatim.
+fn skip_wrapper_lead(tokens: &[String], extra_values: bool) -> Vec<String> {
+    let mut rest = tokens;
+    loop {
+        let Some(first) = rest.first() else {
+            break;
+        };
+        if is_flag(first) {
+            let take_value = WRAPPER_VALUE_FLAGS.contains(&first.as_str());
+            rest = &rest[1.min(rest.len())..];
+            if take_value && !rest.is_empty() {
+                rest = &rest[1.min(rest.len())..];
+            }
+            continue;
+        }
+        if is_env_assignment(first) {
+            rest = &rest[1.min(rest.len())..];
+            continue;
+        }
+        if extra_values {
+            if is_bare_number(first) {
+                rest = &rest[1.min(rest.len())..];
+                continue;
+            }
+        }
+        break;
+    }
+    rest.to_vec()
+}
+
+/// Peel shell wrappers to the effective command tokens, so `bash -lc`,
+/// `sudo`, `env FOO=x`, and `timeout 300` prefixes still identify the
+/// underlying program. Bounded depth; returns whatever remains.
+fn peel_shell_tokens(raw: &str) -> Vec<String> {
+    let mut tokens = split_shell_words(raw);
+    for _ in 0..6 {
+        if tokens.is_empty() {
+            break;
+        }
+        let base = exe_basename(&tokens[0]);
+        if SHELL_PROGRAMS.contains(&base.as_str()) {
+            if let Some(pos) = tokens.iter().position(|t| is_shell_c_flag(t)) {
+                let rest = tokens[pos + 1..].join(" ");
+                let rest = strip_outer_quotes(rest.trim());
+                if rest.is_empty() {
+                    tokens.clear();
+                    break;
+                }
+                let next = split_shell_words(rest);
+                if next == tokens {
+                    break;
+                }
+                tokens = next;
+                continue;
+            }
+            // `bash script.sh ...`: drop the shell and its flags. The script
+            // path itself is untrusted and gated by KNOWN_PROGRAMS below.
+            let next: Vec<String> = tokens.into_iter().skip(1).filter(|t| !is_flag(t)).collect();
+            tokens = next;
+            continue;
+        }
+        if matches!(base.as_str(), "sudo" | "doas" | "su" | "runuser") {
+            tokens = skip_wrapper_lead(&tokens[1..], false);
+            continue;
+        }
+        if base == "env" {
+            tokens = skip_wrapper_lead(&tokens[1..], false);
+            continue;
+        }
+        if matches!(base.as_str(), "time" | "nice" | "stdbuf") {
+            tokens = skip_wrapper_lead(&tokens[1..], false);
+            continue;
+        }
+        if base == "timeout" {
+            tokens = skip_wrapper_lead(&tokens[1..], true);
+            continue;
+        }
+        if is_env_assignment(&tokens[0]) {
+            tokens = skip_wrapper_lead(&tokens, false);
+            continue;
+        }
+        break;
+    }
+    tokens
+}
+
+/// First operand that could be a subcommand. Flags, assignments, paths,
+/// expansions, and quoted payloads are never candidates, so a secret-bearing
+/// path such as `/tmp/ghp_...` can never become one. Membership in the
+/// per-program allowlist below is still required before emission.
+fn subcommand_candidate(tokens: &[String]) -> Option<String> {
+    tokens.iter().skip(1).find_map(|token| {
+        let cleaned = strip_outer_quotes(token.trim());
+        if cleaned.is_empty()
+            || cleaned.starts_with('-')
+            || cleaned.chars().any(|c| matches!(c, '=' | '/' | '$' | '\\'))
+        {
+            return None;
+        }
+        Some(cleaned.to_ascii_lowercase())
+    })
+}
+
+/// Closed per-program subcommand vocabulary. Only an exact member may be
+/// emitted into durable summaries; everything else degrades to the bare
+/// program name.
+fn allowed_subcommand(program: &str, sub: &str) -> bool {
+    let list: &[&str] = match program {
+        "cargo" => &[
+            "test", "check", "build", "clippy", "fmt", "run", "doc", "bench",
+            "clean", "update", "install", "publish", "tree", "audit", "metadata",
+        ],
+        "git" => &[
+            "fetch", "pull", "push", "status", "diff", "log", "show", "checkout",
+            "switch", "clone", "add", "commit", "reset", "rebase", "merge",
+            "stash", "branch", "tag", "remote", "submodule", "worktree",
+            "rev-parse", "ls-files", "blame", "bisect", "init", "config",
+            "clean", "mv", "rm", "grep",
+        ],
+        "npm" | "pnpm" | "yarn" | "bun" => &[
+            "test", "run", "build", "install", "ci", "lint", "check", "start",
+            "exec", "audit", "publish",
+        ],
+        "deno" => &["test", "run", "lint", "fmt", "check"],
+        "docker" | "podman" | "nerdctl" => &[
+            "build", "run", "pull", "push", "images", "ps", "exec", "logs",
+            "compose", "login", "tag", "rm", "rmi",
+        ],
+        "kubectl" => &[
+            "get", "describe", "apply", "delete", "logs", "exec", "create",
+            "config", "top", "rollout", "drain",
+        ],
+        "helm" => &["install", "upgrade", "list", "status", "lint", "template"],
+        "terraform" => &["plan", "apply", "init", "validate", "fmt", "show", "destroy"],
+        "ansible" | "ansible-playbook" => &["playbook", "ping", "lint"],
+        "make" | "just" => &["test", "check", "build", "lint", "clean", "install", "all", "fmt", "vet"],
+        "go" => &["test", "build", "vet", "run", "mod", "install", "fmt", "generate"],
+        "cargo-nextest" | "nextest" | "pytest" | "pytest-3" => &[],
+        "python" | "python3" => &["pytest", "unittest"],
+        "uv" | "pip" | "pip3" => &["install", "test", "run", "sync", "lock", "audit"],
+        _ => &[],
+    };
+    list.contains(&sub)
+}
+
+fn classify_tokens(program: &str, sub: Option<&str>) -> &'static str {
+    match (program, sub) {
+        ("cargo", Some("test")) => "cargo-test",
+        ("cargo", Some("check")) => "cargo-check",
+        ("cargo", Some("build")) => "cargo-build",
+        ("cargo", Some("clippy")) => "cargo-clippy",
+        ("cargo", Some("fmt")) => "cargo-fmt",
+        ("cargo", _) => "cargo",
+        ("git" | "gh" | "glab", _) => "git",
+        ("curl" | "wget" | "aria2c", _) => "network-fetch",
+        ("ssh" | "scp" | "rsync" | "sftp", _) => "network-ssh",
+        ("npm" | "pnpm" | "yarn" | "bun" | "deno", _) => "node-build",
+        ("docker" | "podman" | "nerdctl", _) => "container",
+        ("kubectl" | "helm" | "terraform" | "ansible" | "ansible-playbook", _) => "deploy",
+        ("make" | "just" | "ninja" | "cmake", _) => "build",
+        ("pytest" | "pytest-3", _) => "python-test",
+        ("nextest" | "cargo-nextest", _) => "cargo-test",
+        ("python" | "python3", Some("pytest")) | ("python" | "python3", Some("unittest")) => "python-test",
+        ("python" | "python3" | "uv" | "pip" | "pip3", _) => "python",
+        ("go", _) => "go",
+        ("rustc", _) => "rustc-build",
+        ("gcc" | "g++" | "cc" | "c++" | "clang" | "clang++" | "ld", _) => "compiler",
+        ("java" | "mvn" | "gradle" | "dotnet", _) => "jvm-build",
+        ("sleep", _) => "sleep-wait",
+        ("ls" | "cat" | "echo" | "grep" | "rg" | "fd" | "find" | "head" | "tail" | "sed" | "awk" | "jq" | "yq" | "cut" | "sort" | "uniq" | "wc" | "diff" | "less" | "more" | "file" | "stat" | "du" | "df" | "tee", _) => "shell-inspect",
+        _ => "generic-shell",
+    }
+}
+
+fn classify_bash_command(raw: &str) -> (String, Option<String>, String) {
+    let tokens = peel_shell_tokens(raw);
+    let program = tokens
+        .first()
+        .map(|t| exe_basename(t))
+        .filter(|p| KNOWN_PROGRAMS.contains(&p.as_str()));
+    let Some(program) = program else {
+        return ("generic-shell".to_string(), None, "generic-shell".to_string());
+    };
+    // Defense in depth: the candidate already excludes flags, assignments,
+    // paths, and expansions, and only an allowlisted subcommand is emitted.
+    let sub = subcommand_candidate(&tokens).filter(|s| allowed_subcommand(&program, s));
+    let class = classify_tokens(&program, sub.as_deref());
+    let summary = if SUMMARY_WITH_SUBCOMMAND.contains(&program.as_str()) {
+        match sub {
+            Some(s) => format!("{program} {s}"),
+            None => program.clone(),
+        }
+    } else {
+        program.clone()
+    };
+    let summary = summary.chars().take(MAX_COMMAND_SUMMARY_LEN).collect::<String>();
+    (class.to_string(), Some(program), summary)
+}
+
+/// Derive the durable bash/non-bash diagnostic from one tool event. Only
+/// fixed-vocabulary class labels, sanitized program tokens, lengths, and the
+/// stable hash leave this function; raw arguments never do.
+fn derive_tool_command(tool_name: &str, event: &Value) -> (bool, String, Option<String>, String, String) {
+    let Some(args) = tool_args_value(event) else {
+        return (false, "args-unavailable".to_string(), None, "args-unavailable".to_string(), "none".to_string());
+    };
+    if tool_name == "bash" {
+        match raw_command_from_args(args, event) {
+            Some(raw) => {
+                let fingerprint = fnv1a64_hex_tool(raw.as_bytes());
+                let (class, program, summary) = classify_bash_command(&raw);
+                (true, class, program, summary, fingerprint)
+            }
+            None => {
+                // Args were exposed but carried no recognizable command string.
+                let serialized = serde_json::to_string(args).unwrap_or_default();
+                let bounded: String = serialized.chars().take(MAX_FINGERPRINT_BYTES).collect();
+                (true, "bash-no-command".to_string(), None, "bash-no-command".to_string(), fnv1a64_hex_tool(bounded.as_bytes()))
+            }
+        }
+    } else {
+        let serialized = serde_json::to_string(args).unwrap_or_default();
+        let bounded: String = serialized.chars().take(MAX_FINGERPRINT_BYTES).collect();
+        (true, "non-bash".to_string(), None, "non-bash".to_string(), fnv1a64_hex_tool(bounded.as_bytes()))
+    }
+}
+
 fn review_tool_budgets() -> (u64, u64) {
     let soft = std::env::var("LAZYTEAM_REVIEW_SOFT_TOOL_BUDGET")
         .ok()
@@ -124,7 +684,246 @@ impl RunPhase {
     }
 }
 
-fn observe_pi_activity(event: &Value, phase: &mut RunPhase, active_tool: &mut Option<String>) -> bool {
+/// Pi executes tool calls in parallel (`executeToolCallsParallel` in the Pi
+/// bundle), so the watchdog tracks every in-flight call keyed by its
+/// tool-call id instead of a single "active tool". Updates are routed by id
+/// (never by bare tool name across calls); a completion removes only its own
+/// call. Events without an id fall back to stalest same-name matching or a
+/// bounded anonymous slot, so a missing id degrades one entry, never the
+/// whole table.
+#[derive(Debug, Default)]
+struct ActiveTools {
+    calls: BTreeMap<String, ActiveToolState>,
+    anon_seq: u64,
+}
+
+/// Upper bound on tracked in-flight calls; the stalest entry is evicted past
+/// it so a pathological event stream cannot grow memory without bound.
+const MAX_ACTIVE_TOOLS: usize = 32;
+/// Upper bound on per-call entries rendered into one durable brief.
+const MAX_BRIEF_TOOLS: usize = 4;
+
+impl ActiveTools {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn any(&self) -> bool {
+        !self.calls.is_empty()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.calls.len()
+    }
+
+    /// Short label for log fields: distinct tool names, bounded.
+    fn label(&self) -> String {
+        if self.calls.is_empty() {
+            return "none".to_string();
+        }
+        let mut names: Vec<&str> = self.calls.values().map(|s| s.name.as_str()).collect();
+        names.sort();
+        names.dedup();
+        let extra = names.len().saturating_sub(3);
+        let mut label = names.into_iter().take(3).collect::<Vec<_>>().join("+");
+        if extra > 0 {
+            label.push_str(&format!("+{extra}"));
+        }
+        label
+    }
+
+    /// The stalest in-flight call past the stall window, if any. Only the
+    /// earliest `last_progress_at` can stall first, so one entry determines
+    /// the watchdog decision while the brief still lists the rest.
+    fn stalest_stalled(&self, now: Instant, window: Duration) -> Option<&ActiveToolState> {
+        let stalest = self.calls.values().min_by_key(|s| s.last_progress_at)?;
+        if tool_stalled(stalest.last_progress_at, now, window) {
+            Some(stalest)
+        } else {
+            None
+        }
+    }
+
+    /// Bounded multi-call brief for durable failure evidence. Earliest idle
+    /// first, capped at MAX_BRIEF_TOOLS entries plus a remainder count.
+    fn brief(&self, now: Instant) -> String {
+        if self.calls.is_empty() {
+            return "tool=none".to_string();
+        }
+        let mut ordered: Vec<&ActiveToolState> = self.calls.values().collect();
+        ordered.sort_by_key(|s| s.last_progress_at);
+        let mut out = format!("tools={}", self.calls.len());
+        for state in ordered.into_iter().take(MAX_BRIEF_TOOLS) {
+            out.push_str(" [");
+            out.push_str(&format_tool_diagnostic(state, now));
+            out.push(']');
+        }
+        if self.calls.len() > MAX_BRIEF_TOOLS {
+            out.push_str(&format!(" +{} more", self.calls.len() - MAX_BRIEF_TOOLS));
+        }
+        out
+    }
+
+    fn stalest_key(&self) -> Option<String> {
+        self.calls
+            .iter()
+            .min_by_key(|(_, s)| s.last_progress_at)
+            .map(|(k, _)| k.clone())
+    }
+
+    fn insert_state(&mut self, key: String, state: ActiveToolState) {
+        if self.calls.len() >= MAX_ACTIVE_TOOLS && !self.calls.contains_key(&key) {
+            if let Some(old) = self.stalest_key() {
+                self.calls.remove(&old);
+            }
+        }
+        self.calls.insert(key, state);
+    }
+
+    fn on_start(&mut self, event: &Value, name: String, now: Instant) {
+        let call_id = extract_tool_call_id(event);
+        let (args_available, command_class, program, command_summary, fingerprint) =
+            derive_tool_command(&name, event);
+        let key = match &call_id {
+            Some(id) => format!("id:{id}"),
+            None => {
+                self.anon_seq = self.anon_seq.wrapping_add(1);
+                format!("anon:{}:{}", name, self.anon_seq)
+            }
+        };
+        self.insert_state(
+            key,
+            ActiveToolState {
+                name,
+                call_id,
+                started_at: now,
+                last_progress_at: now,
+                update_count: 0,
+                args_available,
+                command_class,
+                program,
+                command_summary,
+                fingerprint,
+            },
+        );
+    }
+
+    /// Adopt freshly exposed arguments on a later update (the start may have
+    /// carried none). Only upgrades `args-unavailable` entries and only from
+    /// the event routed to this same call.
+    fn adopt_args(state: &mut ActiveToolState, event: &Value) {
+        if state.args_available || tool_args_value(event).is_none() {
+            return;
+        }
+        let name = state.name.clone();
+        let (args_available, command_class, program, command_summary, fingerprint) =
+            derive_tool_command(&name, event);
+        state.args_available = args_available;
+        state.command_class = command_class;
+        state.program = program;
+        state.command_summary = command_summary;
+        state.fingerprint = fingerprint;
+    }
+
+    fn on_update(&mut self, event: &Value, name: String, now: Instant) {
+        if let Some(id) = extract_tool_call_id(event) {
+            let key = format!("id:{id}");
+            if let Some(state) = self.calls.get_mut(&key) {
+                state.last_progress_at = now;
+                state.update_count += 1;
+                if state.call_id.is_none() {
+                    state.call_id = Some(id);
+                }
+                Self::adopt_args(state, event);
+                return;
+            }
+            // Update for an unknown id (e.g. a missed start): track it so
+            // its stall timing is still observed, counting this as progress.
+            self.on_start(event, name, now);
+            if let Some(state) = self.calls.get_mut(&key) {
+                state.update_count = 1;
+            }
+            return;
+        }
+        // Single in-flight call with an unattributed update: no siblings to
+        // confuse, so refresh it (preserves legacy single-tool behavior).
+        if name == "unknown" && self.calls.len() == 1 {
+            if let Some(state) = self.calls.values_mut().next() {
+                state.last_progress_at = now;
+                state.update_count += 1;
+                Self::adopt_args(state, event);
+            }
+            return;
+        }
+        // No id: route to the stalest same-name call, else an anonymous slot.
+        let routed = self
+            .calls
+            .iter()
+            .filter(|(_, s)| s.name == name)
+            .min_by_key(|(_, s)| s.last_progress_at)
+            .map(|(k, _)| k.clone());
+        match routed {
+            Some(key) => {
+                if let Some(state) = self.calls.get_mut(&key) {
+                    state.last_progress_at = now;
+                    state.update_count += 1;
+                    Self::adopt_args(state, event);
+                }
+            }
+            None => self.on_start(event, name, now),
+        }
+    }
+
+    fn on_end(&mut self, event: &Value, name: &str) {
+        if let Some(id) = extract_tool_call_id(event) {
+            self.calls.remove(&format!("id:{id}"));
+            return;
+        }
+        // Single in-flight call with an unattributed end: unambiguous.
+        if name == "unknown" && self.calls.len() == 1 {
+            if let Some(key) = self.calls.keys().next().cloned() {
+                self.calls.remove(&key);
+            }
+            return;
+        }
+        // No id: drop only the stalest same-name call, never its siblings.
+        // (Real Pi end events always carry the id; this is a fallback.)
+        let routed = self
+            .calls
+            .iter()
+            .filter(|(_, s)| s.name == name)
+            .min_by_key(|(_, s)| s.last_progress_at)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = routed {
+            self.calls.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
+    fn single(&self) -> Option<&ActiveToolState> {
+        if self.calls.len() == 1 {
+            self.calls.values().next()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn get(&self, call_id: &str) -> Option<&ActiveToolState> {
+        self.calls.get(&format!("id:{call_id}"))
+    }
+}
+
+fn observe_pi_activity(
+    event: &Value,
+    phase: &mut RunPhase,
+    active: &mut ActiveTools,
+    now: Instant,
+) -> bool {
     match event.get("type").and_then(Value::as_str) {
         Some("agent_start") | Some("turn_start") | Some("message_start") | Some("message_update") => {
             *phase = RunPhase::ModelStreaming;
@@ -135,17 +934,27 @@ fn observe_pi_activity(event: &Value, phase: &mut RunPhase, active_tool: &mut Op
             true
         }
         Some("tool_execution_start") => {
-            *active_tool = event.get("toolName").and_then(Value::as_str).map(str::to_string);
+            let name = extract_tool_name(event);
+            active.on_start(event, name, now);
             *phase = RunPhase::ToolRunning;
             true
         }
         Some("tool_execution_update") => {
+            let name = extract_tool_name(event);
+            active.on_update(event, name, now);
             *phase = RunPhase::ToolRunning;
             true
         }
         Some("tool_execution_end") => {
-            *active_tool = None;
-            *phase = RunPhase::ModelWaiting;
+            let name = extract_tool_name(event);
+            active.on_end(event, &name);
+            // A completion clears only its own call: siblings stay tracked
+            // and the phase stays ToolRunning until the last one ends.
+            *phase = if active.is_empty() {
+                RunPhase::ModelWaiting
+            } else {
+                RunPhase::ToolRunning
+            };
             true
         }
         Some("compaction_start") => {
@@ -172,7 +981,7 @@ fn observe_pi_activity(event: &Value, phase: &mut RunPhase, active_tool: &mut Op
     }
 }
 
-fn pi_state_probe_active(event: &Value, phase: RunPhase, active_tool: Option<&str>) -> Option<bool> {
+fn pi_state_probe_active(event: &Value, phase: RunPhase, has_active_tool: bool) -> Option<bool> {
     if event.get("type").and_then(Value::as_str) != Some("response")
         || event.get("command").and_then(Value::as_str) != Some("get_state")
     {
@@ -189,8 +998,23 @@ fn pi_state_probe_active(event: &Value, phase: RunPhase, active_tool: Option<&st
         streaming
             || compacting
             || pending
-            || active_tool.is_some()
+            || has_active_tool
             || matches!(phase, RunPhase::ToolRunning | RunPhase::Compacting | RunPhase::ProviderRetry),
+    )
+}
+
+/// Durable stall diagnostic. Emits only bounded sanitized identifiers,
+/// fixed-vocabulary class labels, counts, durations, and the stable hash —
+/// never raw arguments, command payloads, or transcripts.
+fn format_tool_diagnostic(state: &ActiveToolState, now: Instant) -> String {
+    let started_ago = now.saturating_duration_since(state.started_at).as_secs();
+    let idle_for = now.saturating_duration_since(state.last_progress_at).as_secs();
+    let call_id = state.call_id.as_deref().unwrap_or("none");
+    let program = state.program.as_deref().unwrap_or("none");
+    let args = if state.args_available { "available" } else { "unavailable" };
+    format!(
+        "tool={} call_id={} updates={} started_ago={}s idle={}s class={} program={} summary='{}' fingerprint={} args={}",
+        state.name, call_id, state.update_count, started_ago, idle_for, state.command_class, program, state.command_summary, state.fingerprint, args,
     )
 }
 
@@ -459,8 +1283,7 @@ impl PiRuntime {
         let max_inactive_probes = watchdog_max_inactive_probes();
         let tool_stall_window = watchdog_tool_stall_window();
         let mut phase = RunPhase::Starting;
-        let mut active_tool: Option<String> = None;
-        let mut tool_progress_at: Option<Instant> = None;
+        let mut active_tools = ActiveTools::new();
         let mut next_probe_at = Instant::now() + probe_interval;
         let mut probe_deadline: Option<Instant> = None;
         let mut missed_probes = 0u32;
@@ -482,19 +1305,21 @@ impl PiRuntime {
                     let now = Instant::now();
                     if probe_deadline.take().is_some() {
                         missed_probes += 1;
+                        let tool_brief = active_tools.brief(now);
+                        let tool_label = active_tools.label();
                         tracing::warn!(
                             session = session_name,
                             phase = phase.as_str(),
-                            active_tool = active_tool.as_deref().unwrap_or("none"),
+                            active_tool = tool_label.as_str(),
                             missed_probes,
                             max_missed_probes,
                             "Pi harness liveness probe timed out"
                         );
                         if missed_probes >= max_missed_probes {
                             let reason = format!(
-                                "Pi harness unresponsive after {missed_probes} liveness probes; phase={} active_tool={}",
+                                "Pi harness unresponsive after {missed_probes} liveness probes; phase={} {}",
                                 phase.as_str(),
-                                active_tool.as_deref().unwrap_or("none"),
+                                tool_brief,
                             );
                             abort_pi_run(&mut child, &mut stdin).await;
                             bail!(reason);
@@ -523,18 +1348,13 @@ impl PiRuntime {
             };
 
             let event_type = event.get("type").and_then(Value::as_str);
-            if observe_pi_activity(&event, &mut phase, &mut active_tool) {
+            // Tool progress is tied strictly to tool execution events.
+            // Periodic `get_state` responses refresh liveness only and must
+            // never refresh the tool stall clock (see `pi_state_probe_active`).
+            if observe_pi_activity(&event, &mut phase, &mut active_tools, Instant::now()) {
                 inactive_probes = 0;
-                match event_type {
-                    Some("tool_execution_start") | Some("tool_execution_update") => {
-                        tool_progress_at = Some(Instant::now());
-                    }
-                    Some("tool_execution_end") => tool_progress_at = None,
-                    _ if phase != RunPhase::ToolRunning => tool_progress_at = None,
-                    _ => {}
-                }
             }
-            if let Some(active) = pi_state_probe_active(&event, phase, active_tool.as_deref()) {
+            if let Some(active) = pi_state_probe_active(&event, phase, active_tools.any()) {
                 if active {
                     inactive_probes = 0;
                 } else {
@@ -547,9 +1367,11 @@ impl PiRuntime {
                         "Pi harness responded but reports no active model, tool, compaction, retry, or queued work"
                     );
                     if inactive_probes >= max_inactive_probes {
+                        let tool_brief = active_tools.brief(Instant::now());
                         let reason = format!(
-                            "Pi harness stayed inactive for {inactive_probes} consecutive state probes; phase={}",
+                            "Pi harness stayed inactive for {inactive_probes} consecutive state probes; phase={} {}",
                             phase.as_str(),
+                            tool_brief,
                         );
                         abort_pi_run(&mut child, &mut stdin).await;
                         bail!(reason);
@@ -558,26 +1380,29 @@ impl PiRuntime {
             }
 
             if phase == RunPhase::ToolRunning {
-                if let Some(last_progress) = tool_progress_at {
-                    let now = Instant::now();
-                    if tool_stalled(last_progress, now, tool_stall_window) {
-                        let stalled_for = now.saturating_duration_since(last_progress);
-                        let tool = active_tool.as_deref().unwrap_or("unknown");
-                        tracing::warn!(
-                            session = session_name,
-                            active_tool = tool,
-                            stalled_for_secs = stalled_for.as_secs(),
-                            stall_limit_secs = tool_stall_window.as_secs(),
-                            "Pi tool produced no observable progress; aborting stalled tool run"
-                        );
-                        let reason = format!(
-                            "Pi tool '{tool}' produced no observable progress for {}s (limit {}s)",
-                            stalled_for.as_secs(),
-                            tool_stall_window.as_secs(),
-                        );
-                        abort_pi_run(&mut child, &mut stdin).await;
-                        bail!(reason);
-                    }
+                let now = Instant::now();
+                if let Some(stalled) = active_tools.stalest_stalled(now, tool_stall_window) {
+                    let stalled_for = now.saturating_duration_since(stalled.last_progress_at);
+                    let diagnostic = format_tool_diagnostic(stalled, now);
+                    let tool_count = active_tools.len();
+                    tracing::warn!(
+                        session = session_name,
+                        active_tool = stalled.name_label(),
+                        stalled_for_secs = stalled_for.as_secs(),
+                        stall_limit_secs = tool_stall_window.as_secs(),
+                        active_tools = tool_count,
+                        "Pi tool produced no observable progress; aborting stalled tool run"
+                    );
+                    let reason = format!(
+                        "Pi tool '{}' produced no observable progress for {}s (limit {}s); active_tools={} {}",
+                        stalled.name,
+                        stalled_for.as_secs(),
+                        tool_stall_window.as_secs(),
+                        tool_count,
+                        diagnostic,
+                    );
+                    abort_pi_run(&mut child, &mut stdin).await;
+                    bail!(reason);
                 }
             }
 
@@ -900,38 +1725,384 @@ mod tests {
         assert!(source.contains("http://127.0.0.1:12345/mcp/cap"));
     }
 
+    /// Real Pi RPC shapes, per the Pi bundle: parallel tool calls emit
+    /// `{type, toolCallId, toolName, args}` with bash args as
+    /// `{command, timeout?}`, updates adding `partialResult`, and ends
+    /// carrying `{result, isError}`.
+    fn pi_bash_start(id: &str, command: &str) -> Value {
+        json!({
+            "type": "tool_execution_start",
+            "toolCallId": id,
+            "toolName": "bash",
+            "args": {"command": command, "timeout": 300},
+        })
+    }
+
+    fn pi_bash_update(id: &str, command: &str) -> Value {
+        json!({
+            "type": "tool_execution_update",
+            "toolCallId": id,
+            "toolName": "bash",
+            "args": {"command": command},
+            "partialResult": {"content": []},
+        })
+    }
+
+    fn pi_tool_end(id: &str, tool: &str) -> Value {
+        json!({
+            "type": "tool_execution_end",
+            "toolCallId": id,
+            "toolName": tool,
+            "result": {"content": []},
+            "isError": false,
+        })
+    }
+
     #[test]
     fn harness_activity_tracks_tool_compaction_and_retry_phases() {
         let mut phase = RunPhase::Starting;
-        let mut tool = None;
+        let mut tools = ActiveTools::new();
+        let now = Instant::now();
 
-        assert!(observe_pi_activity(&json!({"type":"message_update"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"message_update"}), &mut phase, &mut tools, now));
         assert_eq!(phase, RunPhase::ModelStreaming);
 
         assert!(observe_pi_activity(
-            &json!({"type":"tool_execution_start","toolName":"bash"}),
+            &pi_bash_start("call-harness-1", "cargo test"),
             &mut phase,
-            &mut tool,
+            &mut tools,
+            now,
         ));
         assert_eq!(phase, RunPhase::ToolRunning);
-        assert_eq!(tool.as_deref(), Some("bash"));
+        assert_eq!(tools.single().map(|s| s.name.as_str()), Some("bash"));
 
-        assert!(observe_pi_activity(&json!({"type":"tool_execution_update"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(
+            &pi_bash_update("call-harness-1", "cargo test"),
+            &mut phase,
+            &mut tools,
+            now,
+        ));
         assert_eq!(phase, RunPhase::ToolRunning);
+        assert_eq!(tools.single().map(|s| s.update_count), Some(1));
 
-        assert!(observe_pi_activity(&json!({"type":"tool_execution_end"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&pi_tool_end("call-harness-1", "bash"), &mut phase, &mut tools, now));
         assert_eq!(phase, RunPhase::ModelWaiting);
-        assert!(tool.is_none());
+        assert!(tools.is_empty());
 
-        assert!(observe_pi_activity(&json!({"type":"compaction_start"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"compaction_start"}), &mut phase, &mut tools, now));
         assert_eq!(phase, RunPhase::Compacting);
-        assert!(observe_pi_activity(&json!({"type":"compaction_end"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"compaction_end"}), &mut phase, &mut tools, now));
         assert_eq!(phase, RunPhase::ModelWaiting);
 
-        assert!(observe_pi_activity(&json!({"type":"auto_retry_start"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"auto_retry_start"}), &mut phase, &mut tools, now));
         assert_eq!(phase, RunPhase::ProviderRetry);
-        assert!(observe_pi_activity(&json!({"type":"auto_retry_end"}), &mut phase, &mut tool));
+        assert!(observe_pi_activity(&json!({"type":"auto_retry_end"}), &mut phase, &mut tools, now));
         assert_eq!(phase, RunPhase::ModelWaiting);
+    }
+
+    #[test]
+    fn silent_bash_tool_preserves_timing_and_call_identity() {
+        let mut phase = RunPhase::Starting;
+        let mut tools = ActiveTools::new();
+        let start = Instant::now();
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"bash","toolCallId":"call-silent-1"}),
+            &mut phase,
+            &mut tools,
+            start,
+        ));
+        let state = tools.single().expect("active bash tool");
+        assert_eq!(state.name, "bash");
+        assert_eq!(state.call_id.as_deref(), Some("call-silent-1"));
+        assert_eq!(state.update_count, 0);
+        assert_eq!(state.started_at, start);
+        assert_eq!(state.last_progress_at, start);
+        // No args exposed by this schema shape: record that explicitly while
+        // still preserving timing/update-count/call-id evidence.
+        assert!(!state.args_available);
+        assert_eq!(state.command_class, "args-unavailable");
+        let diagnostic = format_tool_diagnostic(state, start + Duration::from_secs(30 * 60));
+        assert!(diagnostic.contains("tool=bash"));
+        assert!(diagnostic.contains("call_id=call-silent-1"));
+        assert!(diagnostic.contains("updates=0"));
+        assert!(diagnostic.contains("args=unavailable"));
+        assert!(diagnostic.contains("args-unavailable"));
+    }
+
+    #[test]
+    fn updating_bash_tool_counts_progress_for_stall_clock() {
+        let mut phase = RunPhase::Starting;
+        let mut tools = ActiveTools::new();
+        let start = Instant::now();
+        assert!(observe_pi_activity(
+            &pi_bash_start("call-live-1", "cargo test --locked"),
+            &mut phase,
+            &mut tools,
+            start,
+        ));
+        assert_eq!(tools.single().map(|s| s.command_class.as_str()), Some("cargo-test"));
+        assert_eq!(tools.single().and_then(|s| s.program.as_deref()), Some("cargo"));
+        let later = start + Duration::from_secs(10 * 60);
+        assert!(observe_pi_activity(
+            &pi_bash_update("call-live-1", "cargo test --locked"),
+            &mut phase,
+            &mut tools,
+            later,
+        ));
+        let state = tools.single().expect("active bash tool");
+        assert_eq!(state.update_count, 1);
+        assert_eq!(state.last_progress_at, later);
+        // `partialResult` payloads are progress signals, never diagnostics:
+        // the stored summary stays redacted and the fingerprint stable.
+        assert_eq!(state.command_summary, "cargo test");
+        // Periodic progress keeps the stall clock fresh.
+        assert!(!tool_stalled(state.last_progress_at, start + Duration::from_secs(35 * 60), Duration::from_secs(30 * 60)));
+        // Silence past the window still stalls.
+        assert!(tool_stalled(state.last_progress_at, later + Duration::from_secs(31 * 60), Duration::from_secs(30 * 60)));
+    }
+
+    #[test]
+    fn parallel_tool_calls_track_by_call_id_not_name() {
+        let mut phase = RunPhase::Starting;
+        let mut tools = ActiveTools::new();
+        let start = Instant::now();
+        assert!(observe_pi_activity(&pi_bash_start("call-a", "cargo test"), &mut phase, &mut tools, start));
+        let mid = start + Duration::from_secs(60);
+        assert!(observe_pi_activity(&pi_bash_start("call-b", "git fetch origin"), &mut phase, &mut tools, mid));
+        // A later parallel start must not overwrite the earlier call.
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.get("call-a").map(|s| s.command_class.as_str()), Some("cargo-test"));
+        assert_eq!(tools.get("call-b").map(|s| s.command_class.as_str()), Some("git"));
+        // An update for call-b is routed by id and leaves call-a's clock alone.
+        let later = start + Duration::from_secs(120);
+        assert!(observe_pi_activity(&pi_bash_update("call-b", "git fetch origin"), &mut phase, &mut tools, later));
+        assert_eq!(tools.get("call-a").map(|s| s.last_progress_at), Some(start));
+        assert_eq!(tools.get("call-a").map(|s| s.update_count), Some(0));
+        assert_eq!(tools.get("call-b").map(|s| s.last_progress_at), Some(later));
+        assert_eq!(tools.get("call-b").map(|s| s.update_count), Some(1));
+        // Completing call-a removes only call-a; the phase stays ToolRunning.
+        assert!(observe_pi_activity(&pi_tool_end("call-a", "bash"), &mut phase, &mut tools, later));
+        assert_eq!(phase, RunPhase::ToolRunning);
+        assert!(tools.get("call-a").is_none());
+        assert!(tools.get("call-b").is_some());
+        // The stall decision observes the remaining call, not the cleared one.
+        let window = Duration::from_secs(30 * 60);
+        let stall_at = later + Duration::from_secs(31 * 60);
+        let stalled = tools.stalest_stalled(stall_at, window).expect("call-b stalls");
+        assert_eq!(stalled.call_id.as_deref(), Some("call-b"));
+        assert_eq!(stalled.command_class, "git");
+        // Draining the last call returns to ModelWaiting with an empty table.
+        assert!(observe_pi_activity(&pi_tool_end("call-b", "bash"), &mut phase, &mut tools, stall_at));
+        assert_eq!(phase, RunPhase::ModelWaiting);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn id_less_events_route_to_stalest_same_name_call() {
+        let mut phase = RunPhase::Starting;
+        let mut tools = ActiveTools::new();
+        let first = Instant::now();
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"bash","args":{"command":"cargo test"}}),
+            &mut phase,
+            &mut tools,
+            first,
+        ));
+        let second = first + Duration::from_secs(60);
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"bash","args":{"command":"git fetch"}}),
+            &mut phase,
+            &mut tools,
+            second,
+        ));
+        assert_eq!(tools.len(), 2);
+        // An id-less update refreshes only the stalest same-name entry.
+        let later = first + Duration::from_secs(120);
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_update","toolName":"bash"}),
+            &mut phase,
+            &mut tools,
+            later,
+        ));
+        let progressed: Vec<_> = tools.calls.values().filter(|s| s.last_progress_at == later).collect();
+        assert_eq!(progressed.len(), 1);
+        assert_eq!(progressed[0].command_class, "cargo-test");
+        // An id-less end drops only one same-name entry, not its sibling.
+        // (The update above refreshed the cargo entry, so the untouched git
+        // entry is now the stalest and goes first.)
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_end","toolName":"bash"}),
+            &mut phase,
+            &mut tools,
+            later,
+        ));
+        assert_eq!(phase, RunPhase::ToolRunning);
+        let remaining = tools.single().expect("one sibling remains");
+        assert_eq!(remaining.command_class, "cargo-test");
+        assert_eq!(remaining.update_count, 1);
+        assert_eq!(remaining.last_progress_at, later);
+    }
+
+    #[test]
+    fn non_bash_tool_uses_non_bash_class() {
+        let mut phase = RunPhase::Starting;
+        let mut tools = ActiveTools::new();
+        let now = Instant::now();
+        assert!(observe_pi_activity(
+            &json!({"type":"tool_execution_start","toolName":"read","toolCallId":"call-read-1","args":{"path":"src/main.rs"}}),
+            &mut phase,
+            &mut tools,
+            now,
+        ));
+        let state = tools.single().expect("active tool");
+        assert_eq!(state.name, "read");
+        assert_eq!(state.command_class, "non-bash");
+        assert!(state.args_available);
+        let diagnostic = format_tool_diagnostic(state, now);
+        assert!(diagnostic.contains("class=non-bash"));
+        assert!(!diagnostic.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn secret_bearing_bash_args_never_appear_in_durable_diagnostic() {
+        let token = "ghp_super_secret_token_abc123";
+        let password = "s3cr3t-p4ssw0rd-value";
+        let path_secret = "ghp_path_secret_xyz789";
+        // Exact Pi RPC shape (`args.command`) including the wrapper and
+        // secret-path forms that previously leaked through the subcommand.
+        let cases = [
+            (format!("cargo test --token {token} --password {password}"), "cargo-test", "cargo test"),
+            (format!("git -C /tmp/{path_secret} fetch"), "git", "git fetch"),
+            (format!("bash -lc \"cargo test --token {token}\""), "cargo-test", "cargo test"),
+            (format!("sudo curl https://example.com/?token={token}"), "network-fetch", "curl"),
+            (format!("env API_KEY={password} cargo test"), "cargo-test", "cargo test"),
+        ];
+        let mut phase = RunPhase::Starting;
+        let mut tools = ActiveTools::new();
+        let now = Instant::now();
+        for (i, (command, _, _)) in cases.iter().enumerate() {
+            let id = format!("call-secret-{i}");
+            assert!(observe_pi_activity(&pi_bash_start(&id, command), &mut phase, &mut tools, now));
+        }
+        assert_eq!(phase, RunPhase::ToolRunning);
+        // The durable multi-call brief carries every entry: no secret may
+        // appear anywhere in it, in any form (raw, path, or query string).
+        let brief = tools.brief(now);
+        assert!(brief.contains("tools=5"));
+        for secret in [token, password, path_secret] {
+            assert!(!brief.contains(secret), "durable brief leaks a secret");
+        }
+        for (i, (command, class, summary)) in cases.iter().enumerate() {
+            let id = format!("call-secret-{i}");
+            let state = tools.get(&id).expect("tracked call");
+            assert_eq!(&state.command_class, class, "class for {command:?}");
+            assert_eq!(&state.command_summary, summary, "summary for {command:?}");
+            assert!(state.args_available);
+            let diagnostic = format_tool_diagnostic(state, now);
+            for secret in [token, password, path_secret] {
+                assert!(!diagnostic.contains(secret), "diagnostic leaks a secret for {command:?}");
+            }
+        }
+        // Stable fingerprint lets operators correlate without raw content.
+        let first = tools.get("call-secret-0").expect("tracked call");
+        assert_eq!(first.fingerprint.len(), 16);
+        // Same command always yields the same fingerprint.
+        let (_, _, _, _, again) = derive_tool_command(
+            "bash",
+            &json!({"args": {"command": format!("cargo test --token {token} --password {password}") }}),
+        );
+        assert_eq!(again, first.fingerprint);
+    }
+
+    #[test]
+    fn unknown_program_names_stay_out_of_durable_output() {
+        // A secret-bearing argv[0] (script path or bare token-like binary)
+        // must never be echoed: closed program vocabulary degrades to
+        // generic-shell while the fingerprint still correlates.
+        for command in [
+            "/tmp/ghp_runner_secret_abc123.sh --token xyz",
+            "ghp_binary_secret_abc123 run --yes",
+            "bash /tmp/deploy_secret_abc123.sh",
+        ] {
+            let (class, program, summary) = classify_bash_command(command);
+            assert_eq!(class, "generic-shell", "class for {command:?}");
+            assert!(program.is_none(), "program for {command:?}");
+            assert_eq!(summary, "generic-shell", "summary for {command:?}");
+            assert!(!summary.contains("secret"), "summary for {command:?}");
+        }
+    }
+
+    #[test]
+    fn bash_command_classes_cover_expected_families() {
+        let (class, program, summary) = classify_bash_command("cargo check --locked");
+        assert_eq!(class, "cargo-check");
+        assert_eq!(program.as_deref(), Some("cargo"));
+        assert_eq!(summary, "cargo check");
+        let (class, _, summary) = classify_bash_command("git fetch origin main");
+        assert_eq!(class, "git");
+        assert_eq!(summary, "git fetch");
+        let (class, _, _) = classify_bash_command("curl https://example.com/pkg.tar.gz");
+        assert_eq!(class, "network-fetch");
+        let (class, program, summary) = classify_bash_command("sleep 900");
+        assert_eq!(class, "sleep-wait");
+        assert_eq!(program.as_deref(), Some("sleep"));
+        assert_eq!(summary, "sleep");
+        // Redacted summaries never carry URLs, flags, or payloads.
+        let (_, _, summary) = classify_bash_command("curl https://example.com/secret?token=abc --retry 5");
+        assert_eq!(summary, "curl");
+        assert!(!summary.contains("example.com"));
+    }
+
+    #[test]
+    fn bash_wrapper_forms_identify_the_underlying_program() {
+        let cases = [
+            ("bash -lc \"cargo test --locked\"", "cargo-test", Some("cargo"), "cargo test"),
+            ("bash -c 'git fetch origin'", "git", Some("git"), "git fetch"),
+            ("bash -lc 'sleep 900'", "sleep-wait", Some("sleep"), "sleep"),
+            ("sudo cargo test", "cargo-test", Some("cargo"), "cargo test"),
+            ("sudo -u worker cargo test", "cargo-test", Some("cargo"), "cargo test"),
+            ("env FOO=x cargo test", "cargo-test", Some("cargo"), "cargo test"),
+            ("FOO=x cargo test --locked", "cargo-test", Some("cargo"), "cargo test"),
+            ("/usr/bin/cargo test", "cargo-test", Some("cargo"), "cargo test"),
+            ("/usr/bin/sudo cargo check", "cargo-check", Some("cargo"), "cargo check"),
+            ("/usr/bin/env FOO=x cargo test", "cargo-test", Some("cargo"), "cargo test"),
+            ("timeout 300 cargo build", "cargo-build", Some("cargo"), "cargo build"),
+            ("kubectl get pods", "deploy", Some("kubectl"), "kubectl get"),
+            ("gcc -O2 -o app main.c", "compiler", Some("gcc"), "gcc"),
+        ];
+        for (command, class, program, summary) in cases {
+            let (got_class, got_program, got_summary) = classify_bash_command(command);
+            assert_eq!(got_class, class, "class for {command:?}");
+            assert_eq!(got_program.as_deref(), program, "program for {command:?}");
+            assert_eq!(got_summary, summary, "summary for {command:?}");
+        }
+    }
+
+    #[test]
+    fn state_probe_responses_are_not_tool_progress() {
+        let mut phase = RunPhase::Starting;
+        let mut tools = ActiveTools::new();
+        let start = Instant::now();
+        assert!(observe_pi_activity(
+            &pi_bash_start("call-probe-1", "cargo test"),
+            &mut phase,
+            &mut tools,
+            start,
+        ));
+        let progress_before = tools.single().expect("active tool").last_progress_at;
+        let updates_before = tools.single().expect("active tool").update_count;
+        let probe = json!({
+            "type":"response",
+            "command":"get_state",
+            "success":true,
+            "data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0}
+        });
+        assert!(!observe_pi_activity(&probe, &mut phase, &mut tools, start + Duration::from_secs(60)));
+        let state = tools.single().expect("active tool still tracked");
+        assert_eq!(state.last_progress_at, progress_before);
+        assert_eq!(state.update_count, updates_before);
+        // The probe still reports the tool as active for liveness purposes.
+        assert_eq!(pi_state_probe_active(&probe, phase, tools.any()), Some(true));
     }
 
     #[test]
@@ -968,7 +2139,7 @@ mod tests {
             "data":{"isStreaming":true,"isCompacting":false,"pendingMessageCount":0}
         });
         assert_eq!(
-            pi_state_probe_active(&streaming, RunPhase::ModelWaiting, None),
+            pi_state_probe_active(&streaming, RunPhase::ModelWaiting, false),
             Some(true),
         );
 
@@ -979,11 +2150,11 @@ mod tests {
             "data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0}
         });
         assert_eq!(
-            pi_state_probe_active(&idle, RunPhase::ModelWaiting, None),
+            pi_state_probe_active(&idle, RunPhase::ModelWaiting, false),
             Some(false),
         );
         assert_eq!(
-            pi_state_probe_active(&idle, RunPhase::ToolRunning, Some("bash")),
+            pi_state_probe_active(&idle, RunPhase::ToolRunning, true),
             Some(true),
         );
     }
