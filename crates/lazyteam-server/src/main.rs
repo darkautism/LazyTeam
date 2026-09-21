@@ -44,6 +44,8 @@ struct Args {
     git_root: PathBuf,
     #[arg(long, env = "LAZYTEAM_OAUTH_PASSWORD")]
     oauth_password: Option<String>,
+    #[arg(long, env = "LAZYTEAM_OAUTH_DATABASE", default_value = "data/oauth.db")]
+    oauth_database: PathBuf,
     #[arg(long, env = "LAZYTEAM_PRODUCTION", default_value_t = false)]
     production: bool,
     #[arg(long, env = "LAZYTEAM_ADMIN_TOKEN")]
@@ -153,7 +155,9 @@ async fn main() -> anyhow::Result<()> {
         agent_auth_updates: Default::default(),
         model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
     });
-    let oauth_state = oauth::state(&state);
+    let oauth_state = oauth::state(&state, &args.oauth_database)
+        .await
+        .context("open OAuth database")?;
 
     let mcp_state = state.clone();
     let mcp_service = StreamableHttpService::new(
