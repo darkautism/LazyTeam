@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         agent_auth_updates: Default::default(),
         model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
     });
+    let oauth_state = oauth::state(&state);
 
     let mcp_state = state.clone();
     let mcp_service = StreamableHttpService::new(
@@ -170,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
         .route_service("/", root_mcp_service)
         .route_service("/mcp", mcp_service)
         .route_layer(middleware::from_fn_with_state(
-            state.clone(),
+            oauth_state.clone(),
             oauth::require_mcp_auth,
         ));
 
@@ -180,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(insights::router())
         .merge(git_broker::router())
         .merge(review::router())
-        .merge(oauth::router())
+        .merge(oauth::router(oauth_state))
         .merge(mcp_router)
         .layer(DefaultBodyLimit::max(security::MAX_REQUEST_BODY))
         .layer(middleware::from_fn(security::middleware))

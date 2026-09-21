@@ -8,11 +8,13 @@ rust-version.workspace = true
 [dependencies]
 aes-gcm.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 lazyteam-core = { path = "../lazyteam-core" }
+oauth = { git = "https://github.com/darkautism/oauth.git", rev = "86bd4c96ca9ab826869aa2b711ef117881e8b61c" }
 rand.workspace = true
 reqwest.workspace = true
 rmcp = { version = "3.4", features = ["server", "transport-streamable-http-server"] }
