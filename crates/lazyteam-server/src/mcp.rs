@@ -61,6 +61,8 @@ pub struct TaskCreateParams {
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub priority: i32,
+    #[serde(default)]
+    pub conflict_group: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -189,6 +191,8 @@ struct TaskMergeOutput {
     merge_commit_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     merge_conflict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rereview_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -331,6 +335,7 @@ impl LazyTeamMcp {
                 preferred_tags: input.preferred_tags,
                 dependencies,
                 priority: input.priority,
+                conflict_group: input.conflict_group,
             }),
         ).await.map_err(api_to_mcp)?;
         Ok(rmcp::Json(task))
@@ -445,19 +450,34 @@ impl LazyTeamMcp {
         if evidence.task.state != lazyteam_core::TaskState::MergePending {
             return Err(McpError::internal_error("task must be merge_pending before Host publish", None));
         }
-        let merge_commit_sha = match crate::git_broker::publish_reviewed_task(&self.state, &evidence).await {
-            Ok(sha) => sha,
-            Err((StatusCode::CONFLICT, message)) if message.starts_with("merge conflict with current ") => {
-                let reason = format!("Host merge could not be completed cleanly. {message}. Resolve the merge conflicts against the current default branch, preserve the reviewed task intent, validate the result, and resubmit for review.");
-                let transition = review::retry_task_with_gate(&self.state, task_id, Some(&reason), Some("merge_conflict")).await.map_err(api_to_mcp)?;
+        use crate::git_broker::PublishReviewedOutcome;
+        let merge_commit_sha = match crate::git_broker::publish_reviewed_task(&self.state, &evidence).await.map_err(api_to_mcp)? {
+            PublishReviewedOutcome::Merged(sha) => sha,
+            PublishReviewedOutcome::Conflict(conflict) => {
+                let summary = crate::git_broker::conflict_summary(&conflict);
+                let reason = format!("Host final integration hit current upstream after review. {summary}\n\nThis is an upstream integration conflict, not a reviewer-quality rejection. Resolve against current upstream {}, preserve both upstream behavior and the original task intent, then return through the normal integration check and review flow.", conflict.upstream_sha);
+                let evidence_json = serde_json::to_string(&conflict).map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let transition = review::retry_task_with_gate_evidence(&self.state, task_id, Some(&reason), Some("merge_conflict"), Some(&evidence_json)).await.map_err(api_to_mcp)?;
                 return Ok(rmcp::Json(TaskMergeOutput {
                     task_id: transition.task_id,
                     state: transition.state,
                     merge_commit_sha: None,
-                    merge_conflict: Some(message),
+                    merge_conflict: Some(summary),
+                    rereview_reason: None,
                 }));
             }
-            Err(error) => return Err(api_to_mcp(error)),
+            PublishReviewedOutcome::Rereview(snapshot) => {
+                let reviewed_upstream = evidence.checkout.upstream_sha.as_deref().unwrap_or("unknown");
+                let reason = format!("Upstream advanced after approval from {} to {}. The same candidate still integrates cleanly, but its effective integrated diff changed, so implementation is not being rerun; review the refreshed integration snapshot against the same task contract.", reviewed_upstream, snapshot.upstream_sha);
+                let transition = review::rereview_after_upstream_move(&self.state, task_id, &reason).await.map_err(api_to_mcp)?;
+                return Ok(rmcp::Json(TaskMergeOutput {
+                    task_id: transition.task_id,
+                    state: transition.state,
+                    merge_commit_sha: None,
+                    merge_conflict: None,
+                    rereview_reason: Some(reason),
+                }));
+            }
         };
         let transition = review::merged_task(&self.state, task_id, &merge_commit_sha).await.map_err(api_to_mcp)?;
         Ok(rmcp::Json(TaskMergeOutput {
@@ -465,6 +485,7 @@ impl LazyTeamMcp {
             state: transition.state,
             merge_commit_sha: Some(merge_commit_sha),
             merge_conflict: None,
+            rereview_reason: None,
         }))
     }
 

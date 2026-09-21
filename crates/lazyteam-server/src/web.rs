@@ -23,7 +23,8 @@ mod tests {
         assert!(INDEX.contains(r#"data-page="home""#));
         assert!(INDEX.contains(r#"data-page="projects""#));
         assert!(INDEX.contains(r#"data-page="workers""#));
-        assert!(INDEX.contains("sessionStorage.setItem(TOKEN_KEY,token)"));
+        assert!(INDEX.contains("localStorage.setItem(TOKEN_KEY,token)"));
+        assert!(INDEX.contains("sessionStorage.removeItem(TOKEN_KEY)"));
         assert!(INDEX.contains("Connected"));
         assert!(!INDEX.contains("Admin token stored for this browser session"));
         assert!(INDEX.contains("/api/task-board"));
@@ -268,5 +269,21 @@ mod tests {
         assert!(INDEX.contains("review_cycle"));
         assert!(INDEX.contains("cycle "));
         assert!(!INDEX.contains("/api/tasks/'+esc(r.task_id)+'/review"));
+        // Scheduler waiting diagnostics: machine-readable reason + detail on
+        // waiting cards only; actively running/reviewing cards stay unspammed.
+        assert!(INDEX.contains("waitingMeta"));
+        assert!(INDEX.contains("waiting-pill"));
+        assert!(INDEX.contains("conflictPill"));
+        assert!(INDEX.contains("conflict-pill"));
+        assert!(INDEX.contains("conflict_group"));
+        assert!(!INDEX.contains("<<<<<<<"));
+        assert!(!INDEX.contains(">>>>>>>"));
+        assert!(!INDEX.contains("=======\n"));
+        assert!(INDEX.contains("Waiting · "));
+        assert!(INDEX.contains("x.waiting"));
+        assert!(INDEX.contains("no_eligible_worker"));
+        assert!(INDEX.contains("review_failure_limit"));
+        // Insights evidence drill-down renders the same waiting diagnostic.
+        assert!(INDEX.contains("h.waiting"));
     }
 }

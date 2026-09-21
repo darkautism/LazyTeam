@@ -8,9 +8,10 @@ use axum::{
     Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use lazyteam_core::{GitCredential, Project};
+use lazyteam_core::{GitCredential, IntegrationSnapshot, MergeConflictEvidence, MergeConflictFile, Project};
 use rmcp::schemars::JsonSchema;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::{io::AsyncWriteExt, process::Command};
 use uuid::Uuid;
@@ -537,33 +538,314 @@ pub(crate) async fn review_diff(
     Ok(review_page(&text, None, display_path, start_line, limit))
 }
 
+const MAX_CONFLICT_FILES: usize = 20;
+const MAX_CONFLICT_FILE_CHARS: usize = 2_000;
+const MAX_CONFLICT_TOTAL_CHARS: usize = 8_000;
+const MAX_CONFLICT_TEXT_BYTES: u64 = 64 * 1024;
+
+fn conflict_kind(status: &str) -> &'static str {
+    match status {
+        "UU" => "both_modified",
+        "AA" => "both_added",
+        "DD" => "both_deleted",
+        "DU" => "deleted_by_us",
+        "UD" => "deleted_by_them",
+        "AU" => "added_by_us",
+        "UA" => "added_by_them",
+        _ => "unmerged",
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let out: String = chars.by_ref().take(max_chars).collect();
+    (out, chars.next().is_some())
+}
+
+async fn effective_diff_hash(repo: &Path, upstream_sha: &str, integration_sha: &str) -> Result<String, ApiError> {
+    let output = git_run(
+        &HostGitAuth::none(),
+        Command::new("git").arg("-C").arg(repo).args(["diff", "--no-ext-diff", "--binary", upstream_sha, integration_sha, "--"]),
+    ).await?;
+    if !output.status.success() {
+        return Err((StatusCode::BAD_GATEWAY, format!("host Git integration diff failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
+    }
+    Ok(format!("{:x}", Sha256::digest(&output.stdout)))
+}
+
+async fn collect_conflict_evidence(
+    workspace: &Path,
+    candidate_sha: &str,
+    base_sha: &str,
+    upstream_sha: &str,
+    default_branch: &str,
+) -> MergeConflictEvidence {
+    let unmerged = git_output(
+        &HostGitAuth::none(),
+        Command::new("git").arg("-C").arg(workspace).args(["diff", "--name-only", "--diff-filter=U"]),
+    ).await.unwrap_or_default();
+    let porcelain = git_output(
+        &HostGitAuth::none(),
+        Command::new("git").arg("-C").arg(workspace).args(["status", "--porcelain=v1", "--untracked-files=no"]),
+    ).await.unwrap_or_default();
+    let mut status_by_path = std::collections::BTreeMap::new();
+    for line in porcelain.lines() {
+        if line.len() < 4 { continue; }
+        let status = line.chars().take(2).collect::<String>();
+        if !matches!(status.as_str(), "UU" | "AA" | "DD" | "DU" | "UD" | "AU" | "UA") { continue; }
+        let raw = line[3..].trim();
+        let path = raw.split_once(" -> ").map(|(_, new)| new).unwrap_or(raw).trim_matches('"').to_string();
+        status_by_path.insert(path, status);
+    }
+    let mut paths = unmerged.lines().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    let mut truncated = paths.len() > MAX_CONFLICT_FILES;
+    let mut remaining = MAX_CONFLICT_TOTAL_CHARS;
+    let mut files = Vec::new();
+    for path in paths.into_iter().take(MAX_CONFLICT_FILES) {
+        let status = status_by_path.get(&path).cloned().unwrap_or_else(|| "UU".to_string());
+        let kind = conflict_kind(&status).to_string();
+        let worktree_path = workspace.join(&path);
+        let size_bytes = tokio::fs::metadata(&worktree_path).await.ok().map(|m| m.len());
+        if size_bytes.is_some_and(|size| size > MAX_CONFLICT_TEXT_BYTES) {
+            files.push(MergeConflictFile { path, status, kind, binary: false, size_bytes, excerpt: None, excerpt_truncated: true });
+            truncated = true;
+            continue;
+        }
+        let bytes = tokio::fs::read(&worktree_path).await.unwrap_or_default();
+        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+            files.push(MergeConflictFile { path, status, kind, binary: true, size_bytes, excerpt: None, excerpt_truncated: false });
+            continue;
+        }
+        let text = std::str::from_utf8(&bytes).unwrap_or_default();
+        let marker_excerpt = if let Some(start) = text.find("<<<<<<<") {
+            let end = text[start..].find(">>>>>>>").map(|offset| start + offset + ">>>>>>>".len()).unwrap_or(text.len());
+            Some(&text[start..end])
+        } else {
+            None
+        };
+        let fallback;
+        let source = if let Some(excerpt) = marker_excerpt {
+            excerpt
+        } else {
+            fallback = git_output(
+                &HostGitAuth::none(),
+                Command::new("git").arg("-C").arg(workspace).args(["diff", "--cc", "--no-ext-diff", "--unified=3", "--", &path]),
+            ).await.unwrap_or_default();
+            fallback.as_str()
+        };
+        let cap = MAX_CONFLICT_FILE_CHARS.min(remaining);
+        let (excerpt, excerpt_truncated) = if cap == 0 || source.trim().is_empty() {
+            (None, cap == 0)
+        } else {
+            let (excerpt, cut) = truncate_chars(source, cap);
+            remaining = remaining.saturating_sub(excerpt.chars().count());
+            (Some(excerpt), cut)
+        };
+        if excerpt_truncated || remaining == 0 { truncated = true; }
+        files.push(MergeConflictFile { path, status, kind, binary: false, size_bytes, excerpt, excerpt_truncated });
+    }
+    MergeConflictEvidence {
+        candidate_sha: candidate_sha.to_string(),
+        candidate_base_sha: base_sha.to_string(),
+        upstream_sha: upstream_sha.to_string(),
+        default_branch: default_branch.to_string(),
+        files,
+        truncated,
+    }
+}
+
+pub(crate) fn conflict_summary(evidence: &MergeConflictEvidence) -> String {
+    let mut out = format!(
+        "Integration conflict: candidate {} (base {}) against current {} {}. Conflicted files:",
+        evidence.candidate_sha.chars().take(12).collect::<String>(),
+        evidence.candidate_base_sha.chars().take(12).collect::<String>(),
+        evidence.default_branch,
+        evidence.upstream_sha.chars().take(12).collect::<String>(),
+    );
+    for file in &evidence.files {
+        out.push_str(&format!("\n- {} [{}:{}]", file.path, file.kind, file.status));
+    }
+    if evidence.truncated { out.push_str("\n- [conflict evidence truncated]"); }
+    out
+}
+
+/// Reconcile one implementation candidate with the current upstream before a
+/// reviewer is allowed to spend a turn. The result is stored inside the
+/// existing ExecutionResult and immutable Git objects/refs in that execution's
+/// task repository; no new workflow entity is created.
+pub(crate) async fn prepare_integration_snapshot(
+    state: &AppState,
+    project: &Project,
+    execution_id: Uuid,
+    result: &lazyteam_core::ExecutionResult,
+) -> Result<IntegrationSnapshot, ApiError> {
+    let candidate_sha = result.commit_sha.as_deref().ok_or((StatusCode::CONFLICT, "implementation execution has no candidate commit".into()))?;
+    let base_sha = result.base_sha.as_deref().ok_or((StatusCode::CONFLICT, "implementation execution has no pinned base commit".into()))?;
+    let review_ref = result.review_ref.as_deref().ok_or((StatusCode::CONFLICT, "implementation execution has no candidate ref".into()))?;
+    let task_repo = task_repo_path(state, execution_id);
+    verify_reviewed_candidate(&task_repo, review_ref, candidate_sha, base_sha).await?;
+
+    let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
+        .bind(project.id.to_string()).fetch_one(&state.db).await.map_err(internal)?;
+    let credential = api::git_credential_from_row(state, &project_row)?;
+    let upstream_url = upstream_repo_url(&project.repo_url, &credential).map_err(internal)?;
+    let auth = HostGitAuth::prepare(state, &credential).await.map_err(internal)?;
+    let integration_result = async {
+        let mirror = project_mirror(state, project.id);
+        if !mirror.exists() {
+            return Err((StatusCode::CONFLICT, "Host project mirror is missing; retry the task to rebuild it".into()));
+        }
+        refresh_project_mirror(&mirror, &upstream_url, &auth).await?;
+        let default_ref = format!("refs/heads/{}", project.default_branch);
+        let upstream_sha = git_output(
+            &auth,
+            Command::new("git").arg("-C").arg(&mirror).args(["rev-parse", "--verify", &default_ref]),
+        ).await?;
+        let upstream_sha = upstream_sha.trim().to_string();
+        let upstream_ref = format!("refs/lazyteam/upstream/{upstream_sha}");
+        git_ok(
+            &HostGitAuth::none(),
+            Command::new("git").arg("-C").arg(&task_repo).args(["fetch", "--no-tags", &mirror.to_string_lossy(), &format!("{default_ref}:{upstream_ref}")]),
+        ).await?;
+
+        if upstream_sha == base_sha {
+            let integration_ref = format!("refs/lazyteam/integration/{candidate_sha}");
+            git_ok(
+                &HostGitAuth::none(),
+                Command::new("git").arg("-C").arg(&task_repo).args(["update-ref", &integration_ref, candidate_sha]),
+            ).await?;
+            let effective_diff_hash = effective_diff_hash(&task_repo, &upstream_sha, candidate_sha).await?;
+            return Ok(IntegrationSnapshot {
+                candidate_sha: candidate_sha.to_string(), candidate_base_sha: base_sha.to_string(), upstream_sha,
+                integration_sha: Some(candidate_sha.to_string()), effective_diff_hash: Some(effective_diff_hash), conflict: None,
+            });
+        }
+
+        let root = state.git_root.join("integrations");
+        tokio::fs::create_dir_all(&root).await.map_err(internal)?;
+        let workspace = root.join(format!("{execution_id}-{}", Uuid::new_v4()));
+        if workspace.exists() { tokio::fs::remove_dir_all(&workspace).await.map_err(internal)?; }
+        let snapshot = async {
+            git_ok(&HostGitAuth::none(), Command::new("git").args(["clone", "--no-checkout"]).arg(&mirror).arg(&workspace)).await?;
+            git_ok(&HostGitAuth::none(), Command::new("git").arg("-C").arg(&workspace).args(["checkout", "-B", "lazyteam-integration", &upstream_sha])).await?;
+            let candidate_ref = format!("refs/heads/{review_ref}:refs/lazyteam/candidate");
+            git_ok(&HostGitAuth::none(), Command::new("git").arg("-C").arg(&workspace).arg("fetch").arg(&task_repo).arg(candidate_ref)).await?;
+            let merge = git_run(
+                &HostGitAuth::none(),
+                Command::new("git").arg("-C").arg(&workspace)
+                    .args(["-c", &format!("user.name={}", project.contributor.name)])
+                    .args(["-c", &format!("user.email={}", project.contributor.email)])
+                    .args(["merge", "--no-edit", "refs/lazyteam/candidate"]),
+            ).await?;
+            if !merge.status.success() {
+                let conflict = collect_conflict_evidence(&workspace, candidate_sha, base_sha, &upstream_sha, &project.default_branch).await;
+                return Ok(IntegrationSnapshot {
+                    candidate_sha: candidate_sha.to_string(), candidate_base_sha: base_sha.to_string(), upstream_sha: upstream_sha.clone(),
+                    integration_sha: None, effective_diff_hash: None, conflict: Some(conflict),
+                });
+            }
+            let integration_sha = git_output(&HostGitAuth::none(), Command::new("git").arg("-C").arg(&workspace).args(["rev-parse", "HEAD"])).await?;
+            let integration_sha = integration_sha.trim().to_string();
+            let integration_ref = format!("refs/lazyteam/integration/{integration_sha}");
+            git_ok(
+                &HostGitAuth::none(),
+                Command::new("git").arg("-C").arg(&task_repo).args(["fetch", "--no-tags", &workspace.to_string_lossy(), &format!("{integration_sha}:{integration_ref}")]),
+            ).await?;
+            let effective_diff_hash = effective_diff_hash(&workspace, &upstream_sha, &integration_sha).await?;
+            Ok(IntegrationSnapshot {
+                candidate_sha: candidate_sha.to_string(), candidate_base_sha: base_sha.to_string(), upstream_sha: upstream_sha.clone(),
+                integration_sha: Some(integration_sha), effective_diff_hash: Some(effective_diff_hash), conflict: None,
+            })
+        }.await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        snapshot
+    }.await;
+    auth.cleanup().await;
+    integration_result
+}
+
+pub(crate) enum PublishReviewedOutcome {
+    Merged(String),
+    Conflict(MergeConflictEvidence),
+    Rereview(IntegrationSnapshot),
+}
+
 pub(crate) async fn publish_reviewed_task(
     state: &AppState,
     evidence: &api::ReviewEvidence,
-) -> Result<String, ApiError> {
-    let review_ref = evidence.checkout.review_ref.as_deref().ok_or((
-        StatusCode::CONFLICT,
-        "reviewed execution has no candidate ref".into(),
-    ))?;
-    let candidate_sha = evidence.checkout.commit_sha.as_deref().ok_or((
-        StatusCode::CONFLICT,
-        "reviewed execution has no candidate commit".into(),
-    ))?;
-    let base_sha = evidence.checkout.base_sha.as_deref().ok_or((
-        StatusCode::CONFLICT,
-        "reviewed execution has no pinned base commit".into(),
-    ))?;
-    let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
-        .bind(evidence.project.id.to_string())
-        .fetch_one(&state.db)
-        .await
-        .map_err(internal)?;
+) -> Result<PublishReviewedOutcome, ApiError> {
+    let review_ref = evidence.checkout.review_ref.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate ref".into()))?;
+    let candidate_sha = evidence.checkout.commit_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate commit".into()))?;
+    let base_sha = evidence.checkout.base_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no pinned base commit".into()))?;
+
+    // Pin final publication to the exact integration context approved by the
+    // latest completed reviewer for this execution. Legacy rows without pins
+    // fall back to the previous safe Host merge behavior.
+    let reviewed = sqlx::query("SELECT upstream_sha,integration_sha,effective_diff_hash FROM reviews WHERE task_id=? AND execution_id=? AND state='completed' AND (verdict LIKE '%\"verdict\":\"approve\"%' OR verdict LIKE '%\"verdict\": \"approve\"%') ORDER BY finished_at DESC LIMIT 1")
+        .bind(evidence.task.id.to_string()).bind(evidence.execution.id.to_string())
+        .fetch_optional(&state.db).await.map_err(internal)?;
+    let reviewed_pins = reviewed.as_ref().and_then(|row| {
+        Some((
+            row.try_get::<Option<String>, _>("upstream_sha").ok()??,
+            row.try_get::<Option<String>, _>("integration_sha").ok()??,
+            row.try_get::<Option<String>, _>("effective_diff_hash").ok()??,
+        ))
+    });
+
+    if reviewed_pins.is_none() {
+        let project_row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(evidence.project.id.to_string()).fetch_one(&state.db).await.map_err(internal)?;
+        let credential = api::git_credential_from_row(state, &project_row)?;
+        let upstream_url = upstream_repo_url(&evidence.project.repo_url, &credential).map_err(internal)?;
+        let auth = HostGitAuth::prepare(state, &credential).await.map_err(internal)?;
+        let legacy = publish_reviewed_task_inner(state, evidence, review_ref, candidate_sha, base_sha, &upstream_url, &auth).await;
+        auth.cleanup().await;
+        return legacy.map(PublishReviewedOutcome::Merged);
+    }
+    let (reviewed_upstream, reviewed_integration, reviewed_diff_hash) = reviewed_pins.unwrap();
+
+    let mut execution_result = evidence.execution.result.clone().ok_or((StatusCode::CONFLICT, "reviewed execution has no result".into()))?;
+    let current = prepare_integration_snapshot(state, &evidence.project, evidence.execution.id, &execution_result).await?;
+    execution_result.integration = Some(current.clone());
+    sqlx::query("UPDATE executions SET result=? WHERE id=? AND state='completed'")
+        .bind(serde_json::to_string(&execution_result).map_err(internal)?)
+        .bind(evidence.execution.id.to_string()).execute(&state.db).await.map_err(internal)?;
+
+    if let Some(conflict) = current.conflict.clone() {
+        return Ok(PublishReviewedOutcome::Conflict(conflict));
+    }
+    let current_integration = current.integration_sha.clone().ok_or((StatusCode::CONFLICT, "clean final integration has no commit".into()))?;
+    let current_diff_hash = current.effective_diff_hash.as_deref().ok_or((StatusCode::CONFLICT, "clean final integration has no effective diff hash".into()))?;
+
+    let publish_sha = if current.upstream_sha == reviewed_upstream {
+        // Same upstream world the reviewer saw: publish the exact reviewed
+        // integration commit, not a freshly-created equivalent merge commit.
+        reviewed_integration
+    } else if current_diff_hash == reviewed_diff_hash {
+        // Upstream moved, but the effective candidate delta is byte-for-byte
+        // unchanged. This is unrelated upstream movement, not a reason to
+        // spend another reviewer turn.
+        current_integration
+    } else {
+        return Ok(PublishReviewedOutcome::Rereview(current));
+    };
+
+    let task_repo = task_repo_path(state, evidence.execution.id);
+    verify_reviewed_candidate(&task_repo, review_ref, candidate_sha, base_sha).await?;
+    let kind = git_output(&HostGitAuth::none(), Command::new("git").arg("-C").arg(&task_repo).args(["cat-file", "-t", &publish_sha])).await?;
+    if kind.trim() != "commit" {
+        return Err((StatusCode::CONFLICT, "reviewed integration object is missing from the task repository".into()));
+    }
+    let project_row = sqlx::query("SELECT * FROM projects WHERE id=?").bind(evidence.project.id.to_string()).fetch_one(&state.db).await.map_err(internal)?;
     let credential = api::git_credential_from_row(state, &project_row)?;
     let upstream_url = upstream_repo_url(&evidence.project.repo_url, &credential).map_err(internal)?;
     let auth = HostGitAuth::prepare(state, &credential).await.map_err(internal)?;
-    let result = publish_reviewed_task_inner(state, evidence, review_ref, candidate_sha, base_sha, &upstream_url, &auth).await;
+    let destination = format!("{publish_sha}:refs/heads/{}", evidence.project.default_branch);
+    let pushed = git_push_ok(&auth, Command::new("git").arg("-C").arg(&task_repo).arg("push").arg(&upstream_url).arg(destination)).await;
     auth.cleanup().await;
-    result
+    pushed?;
+    Ok(PublishReviewedOutcome::Merged(publish_sha))
 }
 
 async fn publish_reviewed_task_inner(
@@ -1218,6 +1500,7 @@ mod tests {
             validation: vec![],
             warnings: vec![],
             artifacts: vec![],
+            integration: None,
         };
         sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
             .bind(exec1.to_string()).bind(task_id.to_string()).bind(worker_id.to_string()).bind(1_i64)
@@ -1388,12 +1671,92 @@ mod tests {
             validation: vec![],
             warnings: vec![],
             artifacts: vec![],
+            integration: None,
         };
         sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
             .bind(execution_id.to_string()).bind(fixture.task_id.to_string()).bind(fixture.worker_id.to_string()).bind(attempt)
             .bind("completed").bind(&fixture.now).bind(&fixture.now).bind(serde_json::to_string(&result).unwrap())
             .execute(&fixture.state.db).await.unwrap();
         sha.trim().to_string()
+    }
+
+    async fn execution_result(fixture: &SeedFixture, execution_id: Uuid) -> lazyteam_core::ExecutionResult {
+        let raw: String = sqlx::query_scalar("SELECT result FROM executions WHERE id=?")
+            .bind(execution_id.to_string()).fetch_one(&fixture.state.db).await.unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    async fn advance_upstream(fixture: &SeedFixture, file: &str, content: &str) -> String {
+        let no_auth = HostGitAuth::none();
+        let work = fixture.root.join(format!("upstream-advance-{}", Uuid::new_v4()));
+        git_ok(&no_auth, Command::new("git").args(["clone", "--branch", "main", &fixture.project.repo_url, &work.to_string_lossy()])).await.unwrap();
+        for args in [["config", "user.name", "LazyTeam Test"], ["config", "user.email", "test@lazyteam.local"]] {
+            git_ok(&no_auth, Command::new("git").arg("-C").arg(&work).args(args)).await.unwrap();
+        }
+        tokio::fs::write(work.join(file), content).await.unwrap();
+        git_ok(&no_auth, Command::new("git").arg("-C").arg(&work).args(["add", file])).await.unwrap();
+        git_ok(&no_auth, Command::new("git").arg("-C").arg(&work).args(["commit", "-m", "advance upstream"])).await.unwrap();
+        git_ok(&no_auth, Command::new("git").arg("-C").arg(&work).args(["push", "origin", "HEAD:refs/heads/main"])).await.unwrap();
+        git_output(&no_auth, Command::new("git").arg("-C").arg(&work).args(["rev-parse", "HEAD"])).await.unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn integration_snapshot_same_upstream_is_candidate() {
+        let fixture = seed_fixture().await;
+        let execution_id = Uuid::new_v4();
+        let candidate = record_completed_candidate(&fixture, execution_id, 1, "fix.txt", "candidate\n").await;
+        let result = execution_result(&fixture, execution_id).await;
+        let snapshot = prepare_integration_snapshot(&fixture.state, &fixture.project, execution_id, &result).await.unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(snapshot.upstream_sha, fixture.base_sha);
+        assert_eq!(snapshot.integration_sha.as_deref(), Some(candidate.as_str()));
+        assert!(snapshot.effective_diff_hash.is_some());
+        assert!(snapshot.conflict.is_none());
+        let repo = fixture.state.git_root.join("tasks").join(format!("{execution_id}.git"));
+        let pinned = git_output(&HostGitAuth::none(), Command::new("git").arg("-C").arg(&repo).args(["rev-parse", &format!("refs/lazyteam/integration/{candidate}")])).await.unwrap();
+        assert_eq!(pinned.trim(), candidate);
+        let _ = tokio::fs::remove_dir_all(&fixture.root).await;
+    }
+
+    #[tokio::test]
+    async fn integration_snapshot_cleanly_merges_advanced_upstream() {
+        let fixture = seed_fixture().await;
+        let execution_id = Uuid::new_v4();
+        let candidate = record_completed_candidate(&fixture, execution_id, 1, "fix.txt", "candidate\n").await;
+        let upstream = advance_upstream(&fixture, "unrelated.txt", "upstream\n").await;
+        let result = execution_result(&fixture, execution_id).await;
+        let snapshot = prepare_integration_snapshot(&fixture.state, &fixture.project, execution_id, &result).await.unwrap();
+        assert!(snapshot.is_clean());
+        assert_eq!(snapshot.upstream_sha, upstream);
+        let integrated = snapshot.integration_sha.as_deref().unwrap();
+        assert_ne!(integrated, candidate);
+        let repo = fixture.state.git_root.join("tasks").join(format!("{execution_id}.git"));
+        let fix = git_output(&HostGitAuth::none(), Command::new("git").arg("-C").arg(&repo).args(["show", &format!("{integrated}:fix.txt")])).await.unwrap();
+        let unrelated = git_output(&HostGitAuth::none(), Command::new("git").arg("-C").arg(&repo).args(["show", &format!("{integrated}:unrelated.txt")])).await.unwrap();
+        assert_eq!(fix.trim(), "candidate");
+        assert_eq!(unrelated.trim(), "upstream");
+        let _ = tokio::fs::remove_dir_all(&fixture.root).await;
+    }
+
+    #[tokio::test]
+    async fn integration_snapshot_reports_real_conflict_against_current_upstream() {
+        let fixture = seed_fixture().await;
+        let execution_id = Uuid::new_v4();
+        let candidate = record_completed_candidate(&fixture, execution_id, 1, "base.txt", "candidate\n").await;
+        let upstream = advance_upstream(&fixture, "base.txt", "upstream\n").await;
+        let result = execution_result(&fixture, execution_id).await;
+        let snapshot = prepare_integration_snapshot(&fixture.state, &fixture.project, execution_id, &result).await.unwrap();
+        assert!(!snapshot.is_clean());
+        assert_eq!(snapshot.candidate_sha, candidate);
+        assert_eq!(snapshot.upstream_sha, upstream);
+        assert!(snapshot.integration_sha.is_none());
+        let conflict = snapshot.conflict.expect("same-file edits must conflict");
+        assert_eq!(conflict.files.len(), 1);
+        assert_eq!(conflict.files[0].path, "base.txt");
+        assert_eq!(conflict.files[0].status, "UU");
+        assert_eq!(conflict.files[0].kind, "both_modified");
+        assert!(conflict.files[0].excerpt.as_deref().is_some_and(|text| text.contains("<<<<<<<")));
+        let _ = tokio::fs::remove_dir_all(&fixture.root).await;
     }
 
     async fn seeded_ref(state: &Arc<crate::AppState>, execution_id: Uuid, allowed_ref: &str) -> Option<String> {

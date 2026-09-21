@@ -19,7 +19,9 @@ pub const DEFAULT_WORKER_PROMPT: &str = "You are an autonomous LazyTeam coding w
 
 pub const LEGACY_DEFAULT_REVIEWER_PROMPT: &str = "You are an independent senior LazyTeam reviewer. Review the exact pinned candidate commit in the provided repository checkout, not the worker's claims. Read the task contract and acceptance criteria, inspect the implementation and surrounding code, and run focused validation when practical. Treat the implementation worker as untrusted evidence: verify changed behavior yourself. Do not modify source code, create commits, push branches, merge, or broaden scope. Approve only when the candidate is correct, complete, scoped, and supported by evidence. Otherwise request a retry with a concise, actionable reason. Your final response must be exactly one JSON object with this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[\"...\"]}.";
 
-pub const DEFAULT_REVIEWER_PROMPT: &str = "You are an independent senior LazyTeam reviewer. Review the exact pinned candidate commit in the provided repository checkout, not the worker's claims. Treat the task description and every acceptance criterion as the review contract. Before deciding, complete one full review sweep: map every acceptance criterion to concrete evidence, inspect the entire candidate diff plus relevant surrounding code, check for unrelated or generated-file changes, and run focused validation when practical. Do not stop after finding the first defect. Collect every material blocker you can substantiate during this pass, then report them together so the implementation worker can fix them in one retry. If some area cannot be reviewed because of a concrete blocker, say what could not be checked. Treat the implementation worker as untrusted evidence: verify changed behavior yourself. Do not modify source code, create commits, push branches, merge, or broaden scope. Approve only when the candidate is correct, complete, scoped, and supported by evidence. Otherwise request a retry whose reason enumerates all discovered blockers from the completed sweep, with file/criterion context where useful. Your final response must be exactly one JSON object with this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[\"...\"]}.";
+pub const LEGACY_FULL_SWEEP_REVIEWER_PROMPT: &str = "You are an independent senior LazyTeam reviewer. Review the exact pinned candidate commit in the provided repository checkout, not the worker's claims. Treat the task description and every acceptance criterion as the review contract. Before deciding, complete one full review sweep: map every acceptance criterion to concrete evidence, inspect the entire candidate diff plus relevant surrounding code, check for unrelated or generated-file changes, and run focused validation when practical. Do not stop after finding the first defect. Collect every material blocker you can substantiate during this pass, then report them together so the implementation worker can fix them in one retry. If some area cannot be reviewed because of a concrete blocker, say what could not be checked. Treat the implementation worker as untrusted evidence: verify changed behavior yourself. Do not modify source code, create commits, push branches, merge, or broaden scope. Approve only when the candidate is correct, complete, scoped, and supported by evidence. Otherwise request a retry whose reason enumerates all discovered blockers from the completed sweep, with file/criterion context where useful. Your final response must be exactly one JSON object with this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[\"...\"]}.";
+
+pub const DEFAULT_REVIEWER_PROMPT: &str = "You are an independent senior LazyTeam reviewer. Review the exact pinned candidate commit in the provided repository checkout, not the worker's claims. Treat the task description and every acceptance criterion as the review contract. Before deciding, complete one full review sweep: map every acceptance criterion to concrete evidence, inspect the entire candidate diff plus relevant surrounding code, check for unrelated or generated-file changes, and run focused validation when practical. Do not stop after finding the first defect. Collect every material blocker you can substantiate during this pass, then report them together so the implementation worker can fix them in one retry. If some area cannot be reviewed because of a concrete blocker, say what could not be checked. Treat the implementation worker as untrusted evidence: verify changed behavior yourself. Do not modify source code, create commits, push branches, merge, or broaden scope. Approve only when the candidate is correct, complete, scoped, and supported by evidence. Otherwise request a retry whose reason enumerates all discovered blockers from the completed sweep, with file/criterion context where useful. When the review is complete, call the `submit_review` MCP tool with verdict approve|retry, a non-empty reason, and a validation list. The tool call is the verdict; do not return the verdict as prose or JSON. If the tool reports invalid arguments, correct them and call it again without redoing the review.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -249,6 +251,22 @@ pub enum TaskState {
     Cancelled,
 }
 
+pub const MAX_CONFLICT_GROUP_LEN: usize = 64;
+
+pub fn normalize_conflict_group(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else { return Ok(None); };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() { return Ok(None); }
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized.len() > MAX_CONFLICT_GROUP_LEN {
+        return Err(format!("conflict_group must be at most {MAX_CONFLICT_GROUP_LEN} characters"));
+    }
+    if !normalized.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+        return Err("conflict_group must match [a-z0-9_-]+".into());
+    }
+    Ok(Some(normalized))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Task {
     pub id: Uuid,
@@ -273,6 +291,8 @@ pub struct Task {
     /// reviewer retry redispatch stays in the same cycle.
     #[serde(default)]
     pub review_cycle: i64,
+    #[serde(default)]
+    pub conflict_group: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -324,6 +344,60 @@ pub struct ExecutionResult {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub artifacts: Vec<String>,
+    /// Host-computed view of this candidate against the current upstream.
+    /// This lives on the existing execution result so retries/reviews share
+    /// one durable candidate envelope instead of inventing a conflict state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<IntegrationSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MergeConflictFile {
+    pub path: String,
+    pub status: String,
+    pub kind: String,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    #[serde(default)]
+    pub excerpt_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct MergeConflictEvidence {
+    pub candidate_sha: String,
+    pub candidate_base_sha: String,
+    pub upstream_sha: String,
+    pub default_branch: String,
+    #[serde(default)]
+    pub files: Vec<MergeConflictFile>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct IntegrationSnapshot {
+    pub candidate_sha: String,
+    pub candidate_base_sha: String,
+    pub upstream_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_sha: Option<String>,
+    /// Stable hash of the effective `upstream -> integrated` diff. Final
+    /// publication uses it conservatively: equality means the already
+    /// reviewed effective change survived a later upstream move unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_diff_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<MergeConflictEvidence>,
+}
+
+impl IntegrationSnapshot {
+    pub fn is_clean(&self) -> bool {
+        self.integration_sha.is_some() && self.conflict.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,9 +426,16 @@ pub struct ReviewLease {
 pub struct ReviewCheckout {
     pub repo_url: String,
     pub default_branch: String,
+    /// Original implementation candidate ref/SHA.
     pub review_ref: String,
     pub commit_sha: String,
     pub base_sha: Option<String>,
+    /// Upstream and integrated result actually presented to this reviewer.
+    /// Older servers omit these and retain legacy candidate-vs-base review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,19 +449,76 @@ pub struct ReviewAssignment {
     pub lease_capability: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewVerdictKind {
     Approve,
     Retry,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ReviewVerdict {
     pub verdict: ReviewVerdictKind,
     pub reason: String,
     #[serde(default)]
     pub validation: Vec<String>,
+}
+
+/// Merged required tags for scheduler matching: project runner labels plus
+/// task-required tags. Single source of truth for tag matching so claim
+/// selection and waiting diagnostics cannot drift apart.
+pub fn required_tags_for(project: &Project, task: &Task) -> Tags {
+    let mut required = project.required_worker_tags.clone();
+    required.extend(task.required_tags.clone());
+    required
+}
+
+/// Single tag predicate shared by matching and diagnostics. Wildcards (`*`
+/// or `any`, case-insensitive) on either side match anything.
+pub fn tag_value_matches(actual: Option<&String>, wanted: &str) -> bool {
+    if wanted == "*" || wanted.eq_ignore_ascii_case("any") {
+        return true;
+    }
+    actual.is_some_and(|actual| actual == wanted || actual == "*" || actual.eq_ignore_ascii_case("any"))
+}
+
+/// Required (key, wanted) pairs the worker does not satisfy. Empty means all
+/// required tags match. Uses the same predicate as `worker_matches_task`.
+pub fn tag_mismatches(worker: &Worker, project: &Project, task: &Task) -> Vec<(String, String)> {
+    required_tags_for(project, task)
+        .into_iter()
+        .filter(|(key, wanted)| !tag_value_matches(worker.tags.get(key), wanted))
+        .collect()
+}
+
+/// Tag/scope match ignoring slot capacity and worker liveness state. Used by
+/// diagnostics to separate "no eligible worker" from "no free slot" while
+/// reusing the same tag/project predicates as claim selection.
+pub fn worker_tags_scope_match(worker: &Worker, project: &Project, task: &Task) -> bool {
+    worker_can_run_project(worker, project) && tag_mismatches(worker, project, task).is_empty()
+}
+
+/// Host-owned agent selection is claim-eligible only when both provider and
+/// model are configured. Mirrors the worker-side claim gate so server
+/// diagnostics report the same backend truth.
+pub fn host_agent_selection_ready(agent: &AgentConfig) -> bool {
+    agent.provider.as_ref().is_some_and(|provider| !provider.trim().is_empty())
+        && agent.model.as_ref().is_some_and(|model| !model.trim().is_empty())
+}
+
+/// The exact Host-configured provider/model pair must be present in the Pi
+/// capability catalog. Shared with the worker claim gate.
+pub fn host_selection_available(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
+    match (&agent.provider, &agent.model) {
+        (Some(provider), Some(model)) => capabilities.models.iter()
+            .any(|candidate| &candidate.provider == provider && &candidate.id == model),
+        _ => false,
+    }
+}
+
+/// Combined backend eligibility for implementation and review slots.
+pub fn can_claim_work(agent: &AgentConfig, capabilities: &AgentCapabilities) -> bool {
+    host_agent_selection_ready(agent) && host_selection_available(agent, capabilities)
 }
 
 pub fn worker_can_run_project(worker: &Worker, project: &Project) -> bool {
@@ -396,19 +534,7 @@ pub fn worker_matches_task(worker: &Worker, project: &Project, task: &Task) -> b
     if worker.running_slots >= worker.slots || !worker_can_run_project(worker, project) {
         return false;
     }
-
-    let mut required = project.required_worker_tags.clone();
-    required.extend(task.required_tags.clone());
-
-    required.into_iter().all(|(key, wanted)| {
-        if wanted == "*" || wanted.eq_ignore_ascii_case("any") {
-            return true;
-        }
-        worker
-            .tags
-            .get(&key)
-            .is_some_and(|actual| actual == &wanted || actual == "*" || actual.eq_ignore_ascii_case("any"))
-    })
+    tag_mismatches(worker, project, task).is_empty()
 }
 
 pub fn worker_preference_score(worker: &Worker, task: &Task) -> i32 {
@@ -486,10 +612,29 @@ mod tests {
             priority: 0,
             state: TaskState::Queued,
             review_cycle: 0,
+            conflict_group: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
         assert!(worker_matches_task(&worker(), &project, &task));
+    }
+
+    #[test]
+    fn conflict_group_normalizes_and_validates() {
+        assert_eq!(normalize_conflict_group(None).unwrap(), None);
+        assert_eq!(normalize_conflict_group(Some("   ")).unwrap(), None);
+        assert_eq!(normalize_conflict_group(Some("  Server-API  ")).unwrap(), Some("server-api".into()));
+        assert_eq!(normalize_conflict_group(Some("worker_runtime")).unwrap(), Some("worker_runtime".into()));
+        assert!(normalize_conflict_group(Some("has space")).is_err());
+        assert!(normalize_conflict_group(Some("has/slash")).is_err());
+        assert!(normalize_conflict_group(Some(&"a".repeat(MAX_CONFLICT_GROUP_LEN + 1))).is_err());
+    }
+
+    #[test]
+    fn conflict_group_defaults_to_none_when_missing_from_json() {
+        let raw = r#"{"id":"00000000-0000-0000-0000-000000000000","project_id":"00000000-0000-0000-0000-000000000000","title":"t","description":"","expected_outcome":"","priority":0,"state":"queued","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#;
+        let task: Task = serde_json::from_str(raw).unwrap();
+        assert_eq!(task.conflict_group, None);
     }
 
     #[test]
@@ -550,6 +695,7 @@ mod tests {
             priority: 0,
             state: TaskState::Queued,
             review_cycle: 0,
+            conflict_group: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

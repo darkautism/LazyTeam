@@ -11,6 +11,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{ApiError, AppState};
+use crate::api::{load_diag_context, task_from_row, waiting_for_task_with_ctx, WaitingInfo};
 
 pub(crate) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -1059,6 +1060,13 @@ pub(crate) struct TaskHistory {
     pub(crate) reviews: Vec<HistoryReview>,
     pub(crate) gate_events: Vec<HistoryGateEvent>,
     pub(crate) gate_available: bool,
+    /// Scheduler waiting diagnostic for currently-waiting tasks
+    /// (`queued`/`review`); `None` for active or terminal states. Same
+    /// read-only predicates as claim selection, shared with the task
+    /// board, so the evidence drill-down answers why idle capacity is
+    /// not taking the task without reading logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting: Option<WaitingInfo>,
 }
 
 /// Compact execution-result evidence: status/summary/candidate pointers only.
@@ -1216,7 +1224,30 @@ async fn task_history(
         }
     }
 
-    Ok(Json(TaskHistory { task, executions, reviews, gate_events, gate_available }))
+    // Scheduler waiting diagnostic for the drill-down: computed from the
+    // same read-only predicates as claim selection. Skipped (None) on
+    // pre-migration databases without the affinity column, where the
+    // diagnostic cannot run; history evidence itself stays available.
+    let waiting = if column_exists(db, "tasks", "sticky_worker_id").await {
+        match sqlx::query("SELECT * FROM tasks WHERE id=?")
+            .bind(id.to_string())
+            .fetch_optional(db)
+            .await
+        {
+            Ok(Some(full_row)) => match task_from_row(&full_row) {
+                Ok(task) => match load_diag_context(db).await {
+                    Ok(ctx) => waiting_for_task_with_ctx(db, &ctx, &task).await.unwrap_or(None),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(TaskHistory { task, executions, reviews, gate_events, gate_available, waiting }))
 }
 
 async fn latest_exec_worker(db: &sqlx::SqlitePool, execution_id: &Option<String>) -> Option<String> {
@@ -1664,6 +1695,37 @@ mod tests {
         assert_eq!(bundle.gate_events.len(), 1);
         assert_eq!(bundle.gate_events[0].id, event_id);
         assert_eq!(bundle.gate_events[0].kind, "sent_back");
+    }
+
+    #[tokio::test]
+    async fn history_bundle_carries_waiting_diagnostic() {
+        use sha2::{Digest, Sha256};
+        let db = memory_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let cred_hash: String = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            Sha256::digest("hist-cred".as_bytes()),
+        );
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash,agent_provider,agent_model,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&worker_id).bind("w").bind("worker").bind("idle").bind("linux").bind("x86_64")
+            .bind(6_i64).bind("test").bind(&now).bind(&now).bind(r#"["*"]"#).bind(&cred_hash)
+            .bind("prov").bind("mod").bind(r#"{"models":[{"provider":"prov","id":"mod"}]}"#)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = state_with(db);
+        let Json(bundle) = task_history(Path(task_id), State(state)).await.unwrap();
+        let waiting = bundle.waiting.expect("queued task carries waiting diagnostic");
+        assert_eq!(waiting.reason, "awaiting_claim");
+        assert!(waiting.detail.contains('w'), "detail: {}", waiting.detail);
+        assert!(!waiting.detail.contains(&cred_hash));
     }
 
     #[tokio::test]

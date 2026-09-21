@@ -6,6 +6,7 @@ use lazyteam_core::{AgentCapabilities, AgentLoginMode, AgentModel, AgentModelCos
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, Instant};
+use uuid::Uuid;
 
 use crate::sandbox::AgentSandbox;
 
@@ -389,9 +390,9 @@ fn review_tool_budgets() -> (u64, u64) {
 
 fn review_steer_message(completed_tools: u64, soft: u64, hard: u64) -> Option<&'static str> {
     if completed_tools == soft {
-        Some("You have completed substantial review inspection. Avoid repeating checks already performed. If the acceptance criteria are now resolved, return the required final JSON verdict; continue using tools only for a concrete unresolved question.")
+        Some("You have completed substantial review inspection. Avoid repeating checks already performed. If the acceptance criteria are now resolved, call submit_review; continue using tools only for a concrete unresolved question.")
     } else if completed_tools == hard {
-        Some("Conclude the review now unless one specific unresolved acceptance criterion still requires evidence. Do not repeat prior repository inspection. Return the required final JSON verdict as soon as that concrete question is resolved.")
+        Some("Conclude the review now unless one specific unresolved acceptance criterion still requires evidence. Do not repeat prior repository inspection. Call submit_review as soon as that concrete question is resolved.")
     } else {
         None
     }
@@ -633,23 +634,17 @@ pub trait AgentRuntime: Send + Sync {
     fn kind(&self) -> &'static str;
     async fn capabilities(&self) -> AgentCapabilities;
     async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult>;
-    async fn run_review(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
-        self.run(workspace, prompt, backend_session_id).await
-    }
-    /// One narrow same-session formatting repair: re-emit the already-decided
-    /// verdict in the required JSON shape without performing another review.
-    /// The default reuses the supplied logical session so the model can
-    /// reformat its immediately preceding decision.
-    async fn repair_review_verdict(&self, workspace: &Path, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
-        self.run(workspace, REVIEW_VERDICT_REPAIR_PROMPT, backend_session_id).await
+    fn supports_reviewer_mcp(&self) -> bool { false }
+    async fn run_review_with_mcp(
+        &self,
+        _workspace: &Path,
+        _prompt: &str,
+        _backend_session_id: Option<&str>,
+        _mcp_endpoint: &str,
+    ) -> anyhow::Result<AgentRunResult> {
+        bail!("{} runtime does not support reviewer MCP attachment", self.kind())
     }
 }
-
-/// Narrow in-lease repair prompt: the substantive review and evidence are
-/// fixed; the model must only re-emit its already-decided verdict in the
-/// required JSON shape. It must not start another code review or inspect
-/// files.
-pub const REVIEW_VERDICT_REPAIR_PROMPT: &str = "Your substantive review is complete and its evidence is fixed. Do not perform another code review, do not inspect files, and do not use tools. Re-emit only your already-decided verdict as a single JSON object with exactly this shape: {\"verdict\":\"approve\"|\"retry\",\"reason\":\"...\",\"validation\":[...]}. The verdict field must be approve or retry and reason must be non-empty. Return only that JSON object, with no prose and no code fences.";
 
 #[derive(Debug, Clone)]
 pub struct PiRuntime {
@@ -658,6 +653,90 @@ pub struct PiRuntime {
     pub model: Option<String>,
     pub session_dir: Option<PathBuf>,
     pub sandbox: AgentSandbox,
+}
+
+struct TempExtension(PathBuf);
+impl Drop for TempExtension {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+
+fn pi_reviewer_mcp_bridge_source(endpoint: &str) -> anyhow::Result<String> {
+    let endpoint = serde_json::to_string(endpoint)?;
+    Ok(format!(r#"const endpoint = {endpoint};
+// Dependency-free by design: this file lives in a per-slot session directory,
+// outside Pi's package tree. Semantic validation belongs to the Rust MCP slot.
+const params = {{
+  type: "object",
+  additionalProperties: true,
+  properties: {{
+    verdict: {{ description: "Required: approve or retry" }},
+    reason: {{ description: "Required non-empty review reason" }},
+    validation: {{ description: "Required array of validation evidence strings" }},
+  }},
+}};
+
+export default function lazyteamReviewerMcp(pi) {{
+  pi.registerTool({{
+    name: "submit_review",
+    label: "Submit review",
+    description: "Submit the terminal LazyTeam review verdict through MCP. If the server rejects arguments, correct them and call again without redoing the review.",
+    parameters: params,
+    executionMode: "sequential",
+    async execute(_toolCallId, input) {{
+      const body = {{
+        jsonrpc: "2.0",
+        id: `review-${{Date.now()}}-${{Math.random()}}`,
+        method: "tools/call",
+        params: {{
+          _meta: {{
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {{}},
+          }},
+          name: "submit_review",
+          arguments: input,
+        }},
+      }};
+      const response = await fetch(endpoint, {{
+        method: "POST",
+        headers: {{
+          "content-type": "application/json",
+          "accept": "application/json, text/event-stream",
+          "MCP-Protocol-Version": "2026-07-28",
+          "Mcp-Method": "tools/call",
+          "Mcp-Name": "submit_review",
+        }},
+        body: JSON.stringify(body),
+      }});
+      const result = await response.json();
+      if (!response.ok || result.error) throw new Error(result.error?.message || `review MCP HTTP ${{response.status}}`);
+      const tool = result.result || {{}};
+      const text = Array.isArray(tool.content)
+        ? tool.content.filter((item) => item?.type === "text").map((item) => item.text).join("\\n")
+        : "";
+      if (tool.isError) throw new Error(text || "submit_review rejected");
+      return {{
+        content: Array.isArray(tool.content) ? tool.content : [{{ type: "text", text: "Review verdict accepted" }}],
+        details: tool.structuredContent || {{}},
+      }};
+    }},
+  }});
+
+  // Reused reviewer sessions may persist an older active-tool allowlist from
+  // before submit_review existed. Repair that session-local state explicitly
+  // once the extension runtime is bound.
+  pi.on("session_start", () => {{
+    if (!pi.getAllTools().some((tool) => tool.name === "submit_review")) {{
+      throw new Error("submit_review registered extension tool is unavailable");
+    }}
+    const active = new Set(pi.getActiveTools());
+    active.add("submit_review");
+    pi.setActiveTools([...active]);
+    if (!pi.getActiveTools().includes("submit_review")) {{
+      throw new Error("submit_review could not be activated for reviewer session");
+    }}
+  }});
+}}
+"#))
 }
 
 fn agent_model_from_pi(model: &Value) -> Option<AgentModel> {
@@ -684,6 +763,7 @@ impl PiRuntime {
         prompt: &str,
         backend_session_id: Option<&str>,
         review_budgets: Option<(u64, u64)>,
+        extension: Option<&Path>,
     ) -> anyhow::Result<AgentRunResult> {
         if let Some(session_dir) = &self.session_dir {
             tokio::fs::create_dir_all(session_dir).await?;
@@ -702,6 +782,11 @@ impl PiRuntime {
         }
         if let Some(provider) = &self.provider { command.arg("--provider").arg(provider); }
         if let Some(model) = &self.model { command.arg("--model").arg(model); }
+        if let Some(extension) = extension {
+            // Reviewer verdict transport must be deterministic: load only the
+            // explicit slot bridge, not ambient/project extensions.
+            command.arg("--no-extensions").arg("--extension").arg(extension);
+        }
         command.current_dir(workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         command.kill_on_drop(true);
 
@@ -724,6 +809,7 @@ impl PiRuntime {
 
         let mut lines = BufReader::new(stdout).lines();
         let mut requested_final = false;
+        let mut reviewer_final_nudged = false;
         let mut summary = String::new();
         let mut completed_tools = 0u64;
         let probe_interval = watchdog_probe_interval();
@@ -867,6 +953,10 @@ impl PiRuntime {
                     let _ = child.kill().await;
                     bail!("Pi requested interactive extension UI; worker tasks must be unattended");
                 }
+                Some("extension_error") if extension.is_some() => {
+                    let _ = child.kill().await;
+                    bail!("Pi reviewer MCP bridge failed to load");
+                }
                 Some("tool_execution_end") => {
                     if let Some((soft, hard)) = review_budgets {
                         completed_tools += 1;
@@ -890,11 +980,27 @@ impl PiRuntime {
                     }
                 }
                 Some("agent_settled") if !requested_final => {
-                    requested_final = true;
-                    let request = json!({"id":"final-text","type":"get_last_assistant_text"});
-                    stdin.write_all(request.to_string().as_bytes()).await?;
-                    stdin.write_all(b"\n").await?;
-                    stdin.flush().await?;
+                    if review_budgets.is_some() && !reviewer_final_nudged {
+                        reviewer_final_nudged = true;
+                        tracing::warn!(
+                            session = session_name,
+                            "reviewer settled without terminal verdict; issuing one same-session submit_review nudge"
+                        );
+                        let request = json!({
+                            "id":"review-final-nudge",
+                            "type":"prompt",
+                            "message":"Your substantive code review is already complete. Do not inspect files or redo the review. Call the submit_review tool now using the verdict, reason, and validation evidence you already decided. Do not answer with prose or JSON."
+                        });
+                        stdin.write_all(request.to_string().as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await?;
+                    } else {
+                        requested_final = true;
+                        let request = json!({"id":"final-text","type":"get_last_assistant_text"});
+                        stdin.write_all(request.to_string().as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await?;
+                    }
                 }
                 Some("response") if event.get("id").and_then(Value::as_str) == Some("final-text") => {
                     if event.get("success").and_then(Value::as_bool) == Some(true) {
@@ -1094,22 +1200,30 @@ impl AgentRuntime for PiRuntime {
     }
 
     async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
-        self.run_rpc(workspace, prompt, backend_session_id, None).await
+        self.run_rpc(workspace, prompt, backend_session_id, None, None).await
     }
 
-    async fn run_review(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+    fn supports_reviewer_mcp(&self) -> bool { self.session_dir.is_some() }
+
+    async fn run_review_with_mcp(
+        &self,
+        workspace: &Path,
+        prompt: &str,
+        backend_session_id: Option<&str>,
+        mcp_endpoint: &str,
+    ) -> anyhow::Result<AgentRunResult> {
+        let session_dir = self.session_dir.as_ref().context("Pi reviewer MCP requires a session directory")?;
+        tokio::fs::create_dir_all(session_dir).await?;
+        let path = session_dir.join(format!("review-mcp-{}.ts", Uuid::new_v4().simple()));
+        tokio::fs::write(&path, pi_reviewer_mcp_bridge_source(mcp_endpoint)?).await?;
+        let extension = TempExtension(path);
         self.run_rpc(
             workspace,
             prompt,
             backend_session_id,
             Some(review_tool_budgets()),
+            Some(&extension.0),
         ).await
-    }
-
-    async fn repair_review_verdict(&self, workspace: &Path, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
-        // Cheap in-lease reformat in the same logical reviewer session: no
-        // tool budgets or steering, so the model just re-emits its decision.
-        self.run_rpc(workspace, REVIEW_VERDICT_REPAIR_PROMPT, backend_session_id, None).await
     }
 }
 
@@ -1124,6 +1238,18 @@ mod tests {
         assert!(review_steer_message(13, 12, 20).is_none());
         assert!(review_steer_message(20, 12, 20).is_some());
         assert!(review_steer_message(21, 12, 20).is_none());
+    }
+
+    #[test]
+    fn reviewer_mcp_bridge_is_dependency_free_and_registers_terminal_tool() {
+        let source = pi_reviewer_mcp_bridge_source("http://127.0.0.1:12345/mcp/cap").unwrap();
+        assert!(!source.contains("import "), "temporary reviewer extension must not depend on node module resolution");
+        assert!(source.contains("name: \"submit_review\""));
+        assert!(source.contains("method: \"tools/call\""));
+        assert!(source.contains("pi.on(\"session_start\""));
+        assert!(source.contains("pi.setActiveTools"));
+        assert!(source.contains("active.add(\"submit_review\")"));
+        assert!(source.contains("http://127.0.0.1:12345/mcp/cap"));
     }
 
     #[test]

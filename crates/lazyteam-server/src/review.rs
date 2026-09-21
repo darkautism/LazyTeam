@@ -82,14 +82,25 @@ pub(crate) async fn merged_task(state: &AppState, id: Uuid, merge_commit_sha: &s
     let candidate_sha: Option<String> = result_raw.flatten()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|value| value.get("commit_sha").and_then(|v| v.as_str()).map(str::to_string));
+    let approved_integration: Option<(String, Option<String>)> = sqlx::query("SELECT integration_sha,upstream_sha FROM reviews WHERE task_id=? AND execution_id=? AND state='completed' AND integration_sha IS NOT NULL AND (verdict LIKE '%\"verdict\":\"approve\"%' OR verdict LIKE '%\"verdict\": \"approve\"%') ORDER BY finished_at DESC LIMIT 1")
+        .bind(id.to_string()).bind(&latest_execution_id).fetch_optional(&state.db).await.map_err(internal)?
+        .and_then(|row| {
+            let integration: Option<String> = row.try_get("integration_sha").ok()?;
+            integration.map(|sha| (sha, row.try_get("upstream_sha").ok().flatten()))
+        });
     let now = Utc::now().to_rfc3339();
-    // Distinct durable gate outcome: a clean fast-forward of the reviewed
-    // candidate is `merged`; publishing a reconciled commit after upstream
-    // moved is `upstream_moved`. Insights counts them as separate outcomes.
-    let (gate_kind, gate_reason) = match candidate_sha.as_deref() {
-        Some(candidate) if candidate == merge_commit_sha => ("merged", "fast-forward of reviewed candidate".to_string()),
-        Some(candidate) => ("upstream_moved", format!("upstream moved after review of {candidate}; host published {merge_commit_sha}")),
-        None => ("merged", format!("host published {merge_commit_sha}")),
+    // A merge commit that the reviewer explicitly saw is a normal reviewed
+    // merge even when it is not the original implementation candidate. Only
+    // a publish commit beyond that approved integration is an upstream move
+    // after review.
+    let (gate_kind, gate_reason) = match (candidate_sha.as_deref(), approved_integration.as_ref()) {
+        (Some(candidate), _) if candidate == merge_commit_sha => ("merged", "fast-forward of reviewed candidate".to_string()),
+        (_, Some((integration, upstream))) if integration == merge_commit_sha => (
+            "merged",
+            format!("published reviewed integration against upstream {}", upstream.as_deref().unwrap_or("unknown")),
+        ),
+        (Some(candidate), _) => ("upstream_moved", format!("upstream moved after review of {candidate}; host published {merge_commit_sha}")),
+        (None, _) => ("merged", format!("host published {merge_commit_sha}")),
     };
     let gate_reason: String = gate_reason.chars().take(2000).collect();
     let gate_available = gate_table_exists(&state.db).await;
@@ -206,6 +217,10 @@ pub(crate) async fn retry_task(state: &AppState, id: Uuid, reason: Option<&str>)
 /// records a Host merge-conflict redispatch so Insights never folds merge
 /// conflicts into reviewer/model quality. Other states record no gate event.
 pub(crate) async fn retry_task_with_gate(state: &AppState, id: Uuid, reason: Option<&str>, gate_kind: Option<&str>) -> Result<TaskTransition, ApiError> {
+    retry_task_with_gate_evidence(state, id, reason, gate_kind, None).await
+}
+
+pub(crate) async fn retry_task_with_gate_evidence(state: &AppState, id: Uuid, reason: Option<&str>, gate_kind: Option<&str>, evidence_json: Option<&str>) -> Result<TaskTransition, ApiError> {
     let current: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
         .bind(id.to_string()).fetch_optional(&state.db).await.map_err(internal)?;
     let Some(current) = current else { return Err((StatusCode::NOT_FOUND, "task not found".into())); };
@@ -265,7 +280,12 @@ pub(crate) async fn retry_task_with_gate(state: &AppState, id: Uuid, reason: Opt
     // The gate event commits atomically with the merge_pending -> queued
     // transition so the outcome cannot be lost between the two writes.
     if let (Some((kind, gate_reason)), true) = (gate, gate_available) {
-        sqlx::query("INSERT INTO main_gate_events(id,task_id,execution_id,kind,reason,merge_commit_sha,created_at) VALUES(?,?,?,?,?,?,?)")
+        let evidence = if kind == "merge_conflict" {
+            evidence_json.map(|raw| raw.chars().take(16_384).collect::<String>())
+        } else {
+            None
+        };
+        sqlx::query("INSERT INTO main_gate_events(id,task_id,execution_id,kind,reason,merge_commit_sha,created_at,evidence) VALUES(?,?,?,?,?,?,?,?)")
             .bind(Uuid::new_v4().to_string())
             .bind(id.to_string())
             .bind(latest_execution_id)
@@ -273,10 +293,26 @@ pub(crate) async fn retry_task_with_gate(state: &AppState, id: Uuid, reason: Opt
             .bind(gate_reason)
             .bind(Option::<String>::None)
             .bind(&now)
+            .bind(evidence)
             .execute(&mut *tx).await.map_err(internal)?;
     }
     tx.commit().await.map_err(internal)?;
     Ok(TaskTransition { task_id: id, state: "queued".into() })
+}
+
+/// Upstream moved after an approval, but the candidate still integrates
+/// cleanly with a materially different effective diff. No implementation work
+/// is needed: return the same execution directly to review without bumping the
+/// quality review cycle or creating a fake reviewer retry.
+pub(crate) async fn rereview_after_upstream_move(state: &AppState, id: Uuid, reason: &str) -> Result<TaskTransition, ApiError> {
+    let now = Utc::now().to_rfc3339();
+    let changed = sqlx::query("UPDATE tasks SET state='review',review_feedback=?,updated_at=? WHERE id=? AND state='merge_pending'")
+        .bind(reason.chars().take(2000).collect::<String>()).bind(&now).bind(id.to_string())
+        .execute(&state.db).await.map_err(internal)?.rows_affected();
+    if changed == 0 {
+        return Err((StatusCode::CONFLICT, "task changed while returning updated integration to review".into()));
+    }
+    Ok(TaskTransition { task_id: id, state: "review".into() })
 }
 
 async fn ensure_no_active_reviewer(state: &AppState, id: Uuid) -> Result<(), ApiError> {
@@ -367,6 +403,59 @@ mod tests {
         let state = state_with(db.clone());
         merged_task(&state, task_id, "merged-sha").await.unwrap();
         assert_eq!(gate_kind(&db, task_id).await.as_deref(), Some("upstream_moved"));
+    }
+
+    #[tokio::test]
+    async fn merged_task_treats_explicitly_reviewed_integration_as_merged() {
+        let db = memory_db().await;
+        let (task_id, execution_id) = seed_merge_pending(&db, "candidate").await;
+        let reviewer = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .bind(&reviewer).bind("reviewer").bind("reviewer").bind("idle").bind("linux").bind("x86_64")
+            .bind(6_i64).bind("test").bind(&now).bind(&now).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,started_at,finished_at,verdict,created_at,upstream_sha,integration_sha,effective_diff_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(&reviewer)
+            .bind("completed").bind(&now).bind(&now).bind(&now).bind(r#"{"verdict":"approve","reason":"ok"}"#).bind(&now)
+            .bind("upstream").bind("reviewed-merge").bind("hash").execute(&db).await.unwrap();
+        let state = state_with(db.clone());
+        merged_task(&state, task_id, "reviewed-merge").await.unwrap();
+        assert_eq!(gate_kind(&db, task_id).await.as_deref(), Some("merged"));
+        let reason: String = sqlx::query_scalar("SELECT reason FROM main_gate_events WHERE task_id=?")
+            .bind(task_id.to_string()).fetch_one(&db).await.unwrap();
+        assert!(reason.contains("reviewed integration"));
+    }
+
+    #[tokio::test]
+    async fn rereview_after_upstream_move_reuses_same_cycle_and_execution() {
+        let db = memory_db().await;
+        let (task_id, execution_id) = seed_merge_pending(&db, "candidate").await;
+        sqlx::query("UPDATE tasks SET review_cycle=7 WHERE id=?").bind(task_id.to_string()).execute(&db).await.unwrap();
+        let state = state_with(db.clone());
+        let transition = rereview_after_upstream_move(&state, task_id, "upstream changed effective integration").await.unwrap();
+        assert_eq!(transition.state, "review");
+        let row = sqlx::query("SELECT state,review_cycle,review_feedback FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&db).await.unwrap();
+        assert_eq!(row.try_get::<String, _>("state").unwrap(), "review");
+        assert_eq!(row.try_get::<i64, _>("review_cycle").unwrap(), 7);
+        assert!(row.try_get::<String, _>("review_feedback").unwrap().contains("upstream changed"));
+        let latest_execution: String = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+            .bind(task_id.to_string()).fetch_one(&db).await.unwrap();
+        assert_eq!(latest_execution, execution_id);
+        assert_eq!(gate_kind(&db, task_id).await, None);
+    }
+
+    #[tokio::test]
+    async fn merge_conflict_gate_uses_existing_event_row_for_evidence() {
+        let db = memory_db().await;
+        let (task_id, _) = seed_merge_pending(&db, "candidate").await;
+        let state = state_with(db.clone());
+        let evidence = r#"{"candidate_sha":"candidate","candidate_base_sha":"base","upstream_sha":"new-head","default_branch":"main","files":[],"truncated":false}"#;
+        retry_task_with_gate_evidence(&state, task_id, Some("conflict"), Some("merge_conflict"), Some(evidence)).await.unwrap();
+        let row = sqlx::query("SELECT kind,evidence FROM main_gate_events WHERE task_id=?")
+            .bind(task_id.to_string()).fetch_one(&db).await.unwrap();
+        assert_eq!(row.try_get::<String, _>("kind").unwrap(), "merge_conflict");
+        assert_eq!(row.try_get::<Option<String>, _>("evidence").unwrap().as_deref(), Some(evidence));
     }
 
     #[tokio::test]

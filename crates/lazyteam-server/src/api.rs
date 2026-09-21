@@ -1,4 +1,4 @@
-use std::{collections::{BTreeSet, HashMap}, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::{BTreeSet, HashMap, HashSet}, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -10,12 +10,13 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use lazyteam_core::{
-    managed_capability_tag, worker_can_run_project, worker_matches_task, AgentCapabilities, AgentConfig,
-    AgentRole, Assignment, ContributorIdentity, Execution, ExecutionResult, ExecutionState, GitAuthConfig,
-    GitAuthMode, GitCredential, Project, ReviewAssignment, ReviewCheckout as WorkerReviewCheckout, ReviewLease,
-    ReviewVerdict, ReviewVerdictKind, Tags, Task, TaskState, Worker,
-    WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT, LEGACY_DEFAULT_REVIEWER_PROMPT, LEASE_CAPABILITY_HEADER,
-    MANAGED_CAPABILITY_IDS,
+    can_claim_work, host_agent_selection_ready, managed_capability_tag,
+    tag_mismatches, worker_can_run_project, worker_matches_task, worker_tags_scope_match,
+    AgentCapabilities, AgentConfig, AgentRole, Assignment, ContributorIdentity, Execution, ExecutionResult,
+    ExecutionState, GitAuthConfig, GitAuthMode, GitCredential, Project, ReviewAssignment,
+    ReviewCheckout as WorkerReviewCheckout, ReviewLease, ReviewVerdict, ReviewVerdictKind, Tags, Task,
+    TaskState, Worker, WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT,
+    LEGACY_DEFAULT_REVIEWER_PROMPT, LEGACY_FULL_SWEEP_REVIEWER_PROMPT, LEASE_CAPABILITY_HEADER, MANAGED_CAPABILITY_IDS,
 };
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,28 @@ pub(crate) struct WorkerRef {
     name: String,
 }
 
+/// Lightweight scheduler diagnostic for a waiting task: the primary
+/// machine-readable reason plus a concise human detail. Computed read-only
+/// from the same predicates used by claim selection (dependencies,
+/// tags/project scope, sticky affinity, role/protocol, Host-selected
+/// backend availability, reviewer failure budget, slot/state), so it cannot
+/// silently drift from claim behavior. Only populated for waiting states
+/// (`queued` implementation tasks and `review` tasks); actively
+/// running/reviewing cards never carry it. Never contains credentials, raw
+/// auth state, or provider secrets: backend unavailability may name the
+/// provider/model, never keys or tokens.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub(crate) struct WaitingInfo {
+    pub(crate) reason: String,
+    pub(crate) detail: String,
+}
+
+fn waiting(reason: &str, detail: String) -> WaitingInfo {
+    let mut detail: String = detail.chars().take(280).collect();
+    if detail.trim().is_empty() { detail = reason.to_string(); }
+    WaitingInfo { reason: reason.into(), detail }
+}
+
 #[derive(Debug, Serialize)]
 struct TaskBoardItem {
     task: Task,
@@ -170,6 +193,11 @@ struct TaskBoardItem {
     /// all cycles. Historical review rows are never deleted; this only grows.
     #[serde(default)]
     lifetime_reviewer_retries: i64,
+    /// Scheduler diagnostic for waiting tasks only (`queued`/`review`).
+    /// `None` for actively running/reviewing or terminal states so cards
+    /// that are making progress are never spammed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    waiting: Option<WaitingInfo>,
 }
 
 /// Conservative review-hell signal for Home task cards.
@@ -237,6 +265,10 @@ pub(crate) struct TaskStatus {
     /// Expired `lost` leases for the latest execution.
     #[serde(default)]
     pub(crate) candidate_lost_leases: i64,
+    /// Scheduler diagnostic for waiting tasks only (`queued`/`review`).
+    /// `None` for actively running/reviewing or terminal states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting: Option<WaitingInfo>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -246,6 +278,10 @@ pub(crate) struct ReviewCheckout {
     pub(crate) review_ref: Option<String>,
     pub(crate) commit_sha: Option<String>,
     pub(crate) base_sha: Option<String>,
+    /// Host integration snapshot the reviewer actually sees.
+    pub(crate) upstream_sha: Option<String>,
+    pub(crate) integration_sha: Option<String>,
+    pub(crate) effective_diff_hash: Option<String>,
     pub(crate) pullable: bool,
 }
 
@@ -283,6 +319,8 @@ pub(crate) struct CreateTask {
     pub(crate) dependencies: Vec<Uuid>,
     #[serde(default)]
     pub(crate) priority: i32,
+    #[serde(default)]
+    pub(crate) conflict_group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,17 +751,20 @@ pub(crate) async fn create_task(State(state): State<Arc<AppState>>, Json(input):
         }
     }
     let now = Utc::now();
+    let conflict_group = lazyteam_core::normalize_conflict_group(input.conflict_group.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let task = Task {
         id: Uuid::new_v4(), project_id: input.project_id, title: input.title, description: input.description,
         expected_outcome: input.expected_outcome, acceptance_criteria: input.acceptance_criteria,
         required_tags: input.required_tags, preferred_tags: input.preferred_tags, dependencies: input.dependencies,
-        review_feedback: String::new(), priority: input.priority, state: TaskState::Queued, review_cycle: 0, created_at: now, updated_at: now,
+        review_feedback: String::new(), priority: input.priority, state: TaskState::Queued, review_cycle: 0,
+        conflict_group, created_at: now, updated_at: now,
     };
-    sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,acceptance_criteria,required_tags,preferred_tags,dependencies,review_feedback,priority,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,acceptance_criteria,required_tags,preferred_tags,dependencies,review_feedback,priority,state,conflict_group,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(task.id.to_string()).bind(task.project_id.to_string()).bind(&task.title).bind(&task.description)
         .bind(&task.expected_outcome).bind(json(&task.acceptance_criteria)?).bind(json(&task.required_tags)?)
         .bind(json(&task.preferred_tags)?).bind(json(&task.dependencies)?).bind(&task.review_feedback).bind(task.priority).bind("queued")
-        .bind(ts(task.created_at)).bind(ts(task.updated_at)).execute(&state.db).await.map_err(db_error)?;
+        .bind(&task.conflict_group).bind(ts(task.created_at)).bind(ts(task.updated_at)).execute(&state.db).await.map_err(db_error)?;
     Ok(Json(task))
 }
 
@@ -773,7 +814,8 @@ pub(crate) async fn task_status(State(state): State<Arc<AppState>>, Path(id): Pa
     } else {
         (0, 0, 0, 0, 0)
     };
-    Ok(Json(TaskStatus { task, latest_execution, current_cycle_reviewer_retries: current_cycle_reviewer_retries.max(0), lifetime_reviewer_retries: lifetime_reviewer_retries.max(0), completed_reviews: completed_reviews.max(0), review_runtime_failures: review_runtime_failures.max(0), review_lost_leases: review_lost_leases.max(0), candidate_completed_reviews: candidate_completed_reviews.max(0), candidate_completed_approvals: candidate_completed_approvals.max(0), candidate_completed_retries: candidate_completed_retries.max(0), candidate_runtime_failures: candidate_runtime_failures.max(0), candidate_lost_leases: candidate_lost_leases.max(0) }))
+    let waiting = waiting_for_task(&state.db, &task).await?;
+    Ok(Json(TaskStatus { task, latest_execution, current_cycle_reviewer_retries: current_cycle_reviewer_retries.max(0), lifetime_reviewer_retries: lifetime_reviewer_retries.max(0), completed_reviews: completed_reviews.max(0), review_runtime_failures: review_runtime_failures.max(0), review_lost_leases: review_lost_leases.max(0), candidate_completed_reviews: candidate_completed_reviews.max(0), candidate_completed_approvals: candidate_completed_approvals.max(0), candidate_completed_retries: candidate_completed_retries.max(0), candidate_runtime_failures: candidate_runtime_failures.max(0), candidate_lost_leases: candidate_lost_leases.max(0), waiting }))
 }
 
 pub(crate) async fn delete_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
@@ -838,12 +880,16 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
     let worker_row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(execution.worker_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let worker = worker_from_row(&worker_row)?;
     let result = execution.result.as_ref();
+    let integration = result.and_then(|value| value.integration.as_ref());
     let checkout = ReviewCheckout {
         repo_url: crate::git_broker::task_repo_url(&state, execution.id)?,
         default_branch: project.default_branch.clone(),
         review_ref: result.and_then(|value| value.review_ref.clone()),
         commit_sha: result.and_then(|value| value.commit_sha.clone()),
         base_sha: result.and_then(|value| value.base_sha.clone()),
+        upstream_sha: integration.map(|value| value.upstream_sha.clone()),
+        integration_sha: integration.and_then(|value| value.integration_sha.clone()),
+        effective_diff_hash: integration.and_then(|value| value.effective_diff_hash.clone()),
         pullable: false,
     };
     Ok(Json(ReviewEvidence { project, task, execution, worker, checkout }))
@@ -852,7 +898,13 @@ pub(crate) async fn review_evidence(Path(id): Path<Uuid>, State(state): State<Ar
 async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoardItem>> {
     let rows = sqlx::query("SELECT t.*, e.worker_id AS board_worker_id, w.name AS board_worker_name, e.result AS board_result, r.reviewer_worker_id AS board_reviewer_id, rw.name AS board_reviewer_name, r.state AS board_review_state, COALESCE((SELECT MAX(e2.attempt) FROM executions e2 WHERE e2.task_id=t.id),0) AS board_attempt, (SELECT COUNT(*) FROM reviews r2 WHERE r2.task_id=t.id AND r2.state='completed') AS board_review_rounds, (SELECT COUNT(*) FROM reviews r2f WHERE r2f.task_id=t.id AND r2f.state='failed') AS board_review_failures, (SELECT COUNT(*) FROM reviews r2l WHERE r2l.task_id=t.id AND r2l.state='lost') AS board_review_lost, (SELECT COUNT(*) FROM reviews r3 WHERE r3.task_id=t.id AND r3.state='completed' AND (r3.verdict LIKE '%\"verdict\":\"retry\"%' OR r3.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_lifetime_retries, (SELECT COUNT(*) FROM reviews r4 WHERE r4.task_id=t.id AND r4.review_cycle=t.review_cycle AND r4.state='completed' AND (r4.verdict LIKE '%\"verdict\":\"retry\"%' OR r4.verdict LIKE '%\"verdict\": \"retry\"%')) AS board_current_retries FROM tasks t LEFT JOIN executions e ON e.id=(SELECT e2.id FROM executions e2 WHERE e2.task_id=t.id ORDER BY e2.attempt DESC LIMIT 1) LEFT JOIN workers w ON w.id=e.worker_id LEFT JOIN reviews r ON r.id=(SELECT r2.id FROM reviews r2 WHERE r2.task_id=t.id ORDER BY r2.created_at DESC LIMIT 1) LEFT JOIN workers rw ON rw.id=r.reviewer_worker_id WHERE t.state!='cancelled' ORDER BY t.priority DESC, t.created_at ASC")
         .fetch_all(&state.db).await.map_err(db_error)?;
-    rows.iter().map(|row| {
+    let mut items = Vec::with_capacity(rows.len());
+    // One shared diagnostic context for the whole board: a single fleet
+    // scan, project load, and settings read no matter how many waiting
+    // tasks are rendered. Waiting itself is computed only for queued/review
+    // rows; all other states skip it without extra queries.
+    let diag_ctx = load_diag_context(&state.db).await?;
+    for row in &rows {
         let task = task_from_row(row)?;
         let worker_id: Option<String> = row.try_get("board_worker_id").map_err(internal)?;
         let worker_name: Option<String> = row.try_get("board_worker_name").map_err(internal)?;
@@ -891,8 +943,14 @@ async fn task_board(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TaskBoa
         let current_cycle_reviewer_retries: i64 = row.try_get("board_current_retries").map_err(internal)?;
         let current_cycle_reviewer_retries = current_cycle_reviewer_retries.max(0);
         let lifetime_reviewer_retries = lifetime_reviewer_retries.max(current_cycle_reviewer_retries);
-        Ok(TaskBoardItem { task, worker, reviewer, result, attempt: attempt.max(0) as u32, review_rounds: review_rounds.max(0), review_runtime_failures: review_runtime_failures.max(0), review_lost_leases: review_lost_leases.max(0), reviewer_retries: current_cycle_reviewer_retries, current_cycle_reviewer_retries, lifetime_reviewer_retries })
-    }).collect::<Result<Vec<_>, ApiError>>().map(Json)
+        // Waiting diagnostics only for waiting states; actively
+        // running/reviewing cards stay unspammed. Read-only, same
+        // predicates as claim selection, inline in the existing board
+        // refresh (no extra polling).
+        let waiting = waiting_for_task_with_ctx(&state.db, &diag_ctx, &task).await?;
+        items.push(TaskBoardItem { task, worker, reviewer, result, attempt: attempt.max(0) as u32, review_rounds: review_rounds.max(0), review_runtime_failures: review_runtime_failures.max(0), review_lost_leases: review_lost_leases.max(0), reviewer_retries: current_cycle_reviewer_retries, current_cycle_reviewer_retries, lifetime_reviewer_retries, waiting });
+    }
+    Ok(Json(items))
 }
 
 async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<RegisterWorker>) -> Result<Response, ApiError> {
@@ -1389,9 +1447,9 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? AND state='completed' ORDER BY attempt DESC LIMIT 1")
             .bind(task.id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
         let Some(execution_row) = execution_row else { continue };
-        let execution = execution_from_row(&execution_row)?;
+        let mut execution = execution_from_row(&execution_row)?;
         if execution.worker_id == worker.id { continue; }
-        let Some(result) = execution.result.as_ref() else { continue };
+        let Some(mut result) = execution.result.clone() else { continue };
         let (Some(review_ref), Some(commit_sha)) = (result.review_ref.clone(), result.commit_sha.clone()) else { continue };
 
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
@@ -1412,6 +1470,49 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
                 .bind(feedback).bind(ts(Utc::now())).bind(task.id.to_string()).execute(&state.db).await.map_err(db_error)?;
             continue;
         }
+
+        // Runtime-only reviewer reclaims must keep the exact clean snapshot
+        // from the failed/lost lease instead of silently changing the review
+        // target when upstream moves. A fresh candidate/quality retry has no
+        // such pinned failed/lost snapshot and is reconciled against current
+        // upstream below.
+        let prior_runtime_pins = sqlx::query("SELECT upstream_sha,integration_sha,effective_diff_hash FROM reviews WHERE task_id=? AND execution_id=? AND state IN ('failed','lost') AND upstream_sha IS NOT NULL AND integration_sha IS NOT NULL AND effective_diff_hash IS NOT NULL ORDER BY created_at DESC LIMIT 1")
+            .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
+        let reusable = prior_runtime_pins.and_then(|row| {
+            let upstream_sha: Option<String> = row.try_get("upstream_sha").ok()?;
+            let integration_sha: Option<String> = row.try_get("integration_sha").ok()?;
+            let effective_diff_hash: Option<String> = row.try_get("effective_diff_hash").ok()?;
+            let saved = result.integration.clone()?;
+            (saved.conflict.is_none()
+                && upstream_sha.as_deref() == Some(saved.upstream_sha.as_str())
+                && integration_sha.as_deref() == saved.integration_sha.as_deref()
+                && effective_diff_hash.as_deref() == saved.effective_diff_hash.as_deref()).then_some(saved)
+        });
+        // Reconcile every fresh review target against current upstream before
+        // a reviewer spends a turn. A Git conflict is implementation work,
+        // not a reviewer-quality retry, so no review row is created here.
+        let integration = match reusable {
+            Some(snapshot) => snapshot,
+            None => crate::git_broker::prepare_integration_snapshot(&state, &project, execution.id, &result).await?,
+        };
+        if let Some(conflict) = integration.conflict.as_ref() {
+            result.integration = Some(integration.clone());
+            execution.result = Some(result.clone());
+            sqlx::query("UPDATE executions SET result=? WHERE id=? AND state='completed'")
+                .bind(json(&result)?).bind(execution.id.to_string()).execute(&state.db).await.map_err(db_error)?;
+            let feedback = format!(
+                "{}
+
+This is an upstream integration retry, not a new implementation or reviewer rejection. Preserve current upstream changes, preserve the original task intent, resolve only the integration conflict, then validate the task again. Current upstream HEAD is {}.",
+                crate::git_broker::conflict_summary(conflict), conflict.upstream_sha
+            );
+            sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
+                .bind(feedback).bind(execution.worker_id.to_string()).bind(ts(Utc::now())).bind(task.id.to_string())
+                .execute(&state.db).await.map_err(db_error)?;
+            continue;
+        }
+        let integration_sha = integration.integration_sha.clone().ok_or((StatusCode::CONFLICT, "clean integration snapshot has no integrated commit".into()))?;
+        let effective_diff_hash = integration.effective_diff_hash.clone().ok_or((StatusCode::CONFLICT, "clean integration snapshot has no effective diff hash".into()))?;
 
         let implementation_row = sqlx::query("SELECT * FROM workers WHERE id=?")
             .bind(execution.worker_id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
@@ -1446,10 +1547,18 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         // worker metadata.
         let review_cycle: i64 = sqlx::query_scalar("SELECT review_cycle FROM tasks WHERE id=?")
             .bind(task.id.to_string()).fetch_one(&mut *tx).await.map_err(db_error)?;
-        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+        // Only the claimant that won the active-review check may publish the
+        // clean snapshot into the execution envelope. Losing concurrent
+        // claimants cannot overwrite the review's pinned integration.
+        result.integration = Some(integration.clone());
+        execution.result = Some(result.clone());
+        sqlx::query("UPDATE executions SET result=? WHERE id=? AND state='completed'")
+            .bind(json(&result)?).bind(execution.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle,upstream_sha,integration_sha,effective_diff_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(review.id.to_string()).bind(task.id.to_string()).bind(execution.id.to_string()).bind(worker.id.to_string())
             .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash)
-            .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone()).bind(review_cycle).execute(&mut *tx).await.map_err(db_conflict)?;
+            .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone()).bind(review_cycle)
+            .bind(&integration.upstream_sha).bind(&integration_sha).bind(&effective_diff_hash).execute(&mut *tx).await.map_err(db_conflict)?;
         sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
             .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
@@ -1464,6 +1573,8 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
             review_ref,
             commit_sha,
             base_sha: result.base_sha.clone(),
+            upstream_sha: Some(integration.upstream_sha.clone()),
+            integration_sha: Some(integration_sha),
         };
         return Ok(Json(ReviewAssignment {
             review,
@@ -1754,6 +1865,337 @@ async fn dependencies_satisfied(db: &SqlitePool, task: &Task) -> Result<bool, Ap
     Ok(true)
 }
 
+/// Pending (not `done`) dependencies in task order, via batched indexed
+/// lookups. Exact over the full dependency list — never capped at a display
+/// window — so the waiting detail stays accurate no matter how far down
+/// the unresolved dependency sits. Read-only.
+async fn pending_dependencies(db: &SqlitePool, task: &Task) -> Result<Vec<Uuid>, ApiError> {
+    let mut done: HashSet<String> = HashSet::new();
+    for chunk in task.dependencies.chunks(500) {
+        if chunk.is_empty() { continue; }
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id FROM tasks WHERE project_id=? AND state='done' AND id IN ({placeholders})");
+        let mut query = sqlx::query(&sql).bind(task.project_id.to_string());
+        for dep in chunk { query = query.bind(dep.to_string()); }
+        let rows = query.fetch_all(db).await.map_err(db_error)?;
+        for row in rows { done.insert(row.try_get("id").map_err(internal)?); }
+    }
+    Ok(task.dependencies.iter().filter(|dep| !done.contains(&dep.to_string())).copied().collect())
+}
+
+fn short_id(id: &str) -> String { id.chars().take(8).collect() }
+
+/// Diagnostic worker universe, equivalent to the claimant universe.
+///
+/// Only rows that can actually satisfy `require_worker` are included:
+/// retired workers and rows with no `credential_hash` (never-enrolled or
+/// retired workers whose credential was cleared) are excluded, since the
+/// claim endpoints reject them before any scheduler predicate runs. The
+/// full fleet is loaded in deterministic `id` order with no `LIMIT`, so a
+/// large fleet can never silently omit a free eligible worker and produce
+/// a false `no_eligible_worker` / `no_free_slot` / backend reason. Fleets
+/// are small (one row per worker); this is a single indexed scan per
+/// board/status/history request, shared across all waiting tasks in it.
+async fn load_diagnostic_workers(db: &SqlitePool) -> Result<Vec<Worker>, ApiError> {
+    let rows = sqlx::query("SELECT * FROM workers WHERE retired_at IS NULL AND credential_hash IS NOT NULL ORDER BY id")
+        .fetch_all(db).await.map_err(db_error)?;
+    rows.iter().map(worker_from_row).collect::<Result<Vec<_>, _>>()
+}
+
+/// Preloaded per-request diagnostic context. The worker fleet, project map,
+/// and reviewer failure limit are each read once per board/status/history
+/// request and shared across every waiting task in it, so per-task work
+/// stays a bounded handful of indexed lookups (dependency states, sticky
+/// id, review counts) instead of a fresh fleet scan per row.
+pub(crate) struct DiagContext {
+    workers: Vec<Worker>,
+    projects: HashMap<Uuid, Project>,
+    review_failure_limit: i64,
+}
+
+pub(crate) async fn load_diag_context(db: &SqlitePool) -> Result<DiagContext, ApiError> {
+    let workers = load_diagnostic_workers(db).await?;
+    let project_rows = sqlx::query("SELECT * FROM projects").fetch_all(db).await.map_err(db_error)?;
+    let mut projects = HashMap::new();
+    for row in &project_rows {
+        let project = project_from_row(row)?;
+        projects.insert(project.id, project);
+    }
+    let review_failure_limit: i64 = sqlx::query_scalar("SELECT review_failure_limit FROM host_settings WHERE id=1")
+        .fetch_optional(db).await.map_err(db_error)?.flatten().unwrap_or(DEFAULT_REVIEW_FAILURE_LIMIT);
+    Ok(DiagContext { workers, projects, review_failure_limit })
+}
+
+fn backend_unavailable_detail(worker: &Worker) -> String {
+    match (&worker.agent.provider, &worker.agent.model) {
+        (Some(provider), Some(model)) => format!(
+            "worker {} Host provider '{provider}' model '{model}' unavailable in Pi catalog",
+            worker.name),
+        _ => format!("worker {} has no Host provider/model selection", worker.name),
+    }
+}
+
+/// Primary waiting reason for a `queued` implementation task, derived from
+/// the same predicates as `claim_task`: dependencies, sticky reservation,
+/// role/protocol, tags/project scope (`worker_tags_scope_match` /
+/// `tag_mismatches`), Host backend availability (`can_claim_work`), and
+/// slot/state (`worker_matches_task`). Read-only: never clears a stale
+/// sticky reservation the way the claim path does.
+async fn queued_waiting_info(
+    db: &SqlitePool,
+    ctx: &DiagContext,
+    task: &Task,
+    project: &Project,
+    sticky_worker_id: Option<&str>,
+) -> Result<Option<WaitingInfo>, ApiError> {
+    if !dependencies_satisfied(db, task).await? {
+        let pending = pending_dependencies(db, task).await?;
+        let detail = match pending.len() {
+            // Dep completed between the predicate and the detail lookup;
+            // stay concise rather than emitting an empty sample.
+            0 => "waiting on dependencies".into(),
+            1 => format!("waiting on dependency {}", short_id(&pending[0].to_string())),
+            n => format!("waiting on {n} dependencies (e.g. {})", short_id(&pending[0].to_string())),
+        };
+        return Ok(Some(waiting("blocked_dependencies", detail)));
+    }
+    if let Some(sticky) = sticky_worker_id {
+        // Mirror `claim_task` exactly: another worker is refused when the
+        // sticky reservation predicate holds, with no additional gates.
+        // (Read-only: unlike the claim path, this never clears a stale
+        // reservation.)
+        if sticky_worker_reservation_active(db, sticky, project, task).await? {
+            let name: Option<String> = sqlx::query_scalar("SELECT name FROM workers WHERE id=?")
+                .bind(sticky).fetch_optional(db).await.map_err(db_error)?;
+            let detail = match name {
+                Some(name) => format!("reserved for worker {name} by recent retry affinity"),
+                None => "reserved for previous worker by recent retry affinity".into(),
+            };
+            return Ok(Some(waiting("sticky_reserved", detail)));
+        }
+    }
+    let workers = &ctx.workers;
+    let live: Vec<&Worker> = workers.iter()
+        .filter(|w| w.role == AgentRole::Worker && w.protocol_version >= PROTOCOL_VERSION
+            && matches!(w.state, WorkerState::Idle | WorkerState::Busy))
+        .collect();
+    if live.is_empty() {
+        return Ok(Some(waiting("no_eligible_worker",
+            "no worker with role worker, current protocol, and idle/busy state".into())));
+    }
+    let scoped: Vec<&Worker> = live.iter()
+        .filter(|w| worker_tags_scope_match(w, project, task))
+        .copied()
+        .collect();
+    if scoped.is_empty() {
+        let mut scope_excluded = 0;
+        let mut tag_excluded = 0;
+        for worker in &live {
+            if !worker_can_run_project(worker, project) { scope_excluded += 1; }
+            else { tag_excluded += 1; }
+        }
+        let mut sample = String::new();
+        for worker in live.iter() {
+            if !worker_tags_scope_match(worker, project, task) {
+                let mismatches = tag_mismatches(worker, project, task);
+                if let Some((key, wanted)) = mismatches.first() {
+                    sample = format!("e.g. worker {} needs {key}={wanted}", worker.name);
+                    break;
+                }
+                if !worker_can_run_project(worker, project) {
+                    sample = format!("e.g. worker {} not scoped to project {}", worker.name, project.slug);
+                    break;
+                }
+            }
+        }
+        let mut detail = format!("{scope_excluded} excluded by project scope, {tag_excluded} by required tags");
+        if !sample.is_empty() { detail = format!("{detail}; {sample}"); }
+        return Ok(Some(waiting("no_eligible_worker", detail)));
+    }
+    let backend_ready: Vec<&Worker> = scoped.iter()
+        .filter(|w| can_claim_work(&w.agent, &w.agent_capabilities))
+        .copied()
+        .collect();
+    if backend_ready.is_empty() {
+        let mut unselected = 0;
+        for worker in &scoped {
+            if !host_agent_selection_ready(&worker.agent) { unselected += 1; }
+        }
+        let unavailable = scoped.len() - unselected;
+        let mut detail = if unselected > 0 && unavailable > 0 {
+            format!("{unselected} without Host provider/model selection, {unavailable} with selection unavailable in Pi catalog")
+        } else if unselected > 0 {
+            format!("{unselected} eligible workers without Host provider/model selection")
+        } else {
+            format!("{} eligible workers with Host selection unavailable in Pi catalog", unavailable.max(1))
+        };
+        if let Some(first) = scoped.first() {
+            // Names the provider/model only; never keys, tokens, or auth state.
+            if host_agent_selection_ready(&first.agent) {
+                if let (Some(provider), Some(model)) = (&first.agent.provider, &first.agent.model) {
+                    detail = format!("{detail}; e.g. provider '{provider}' model '{model}'");
+                }
+            }
+        }
+        return Ok(Some(waiting("backend_unavailable", detail)));
+    }
+    let free: Vec<&Worker> = backend_ready.iter()
+        .filter(|w| w.running_slots < w.slots && worker_matches_task(w, project, task))
+        .copied()
+        .collect();
+    if free.is_empty() {
+        return Ok(Some(waiting("no_free_slot",
+            format!("{} eligible workers with backend ready, all at capacity", backend_ready.len()))));
+    }
+    Ok(Some(waiting("awaiting_claim",
+        format!("eligible worker {} has a free slot; waiting for claim poll", free[0].name))))
+}
+
+/// Primary waiting reason for a `review` task, mirroring the exact check
+/// order of `claim_review`: reviewer affinity reservation (same predicate,
+/// nil claimant), candidate readiness, reviewer scope/self-review exclusion,
+/// active lease, reviewer runtime-failure budget
+/// (`review_runtime_failures_exhausted`), then Host backend availability and
+/// reviewer slot capacity. Read-only.
+#[allow(clippy::too_many_arguments)]
+async fn review_waiting_info(
+    db: &SqlitePool,
+    ctx: &DiagContext,
+    task: &Task,
+    project: &Project,
+) -> Result<Option<WaitingInfo>, ApiError> {
+    let review_failure_limit = ctx.review_failure_limit;
+    // Reservation first, exactly as `claim_review` refuses a non-preferred
+    // claimant before looking at the candidate, lease, or failure budget.
+    // No additional gates: a live preferred reviewer reserves the task even
+    // when full or backend-unready, and even at the failure limit.
+    let reserved = review_reserved_for_live_preferred_reviewer(db, task, project, Uuid::nil()).await?;
+    if reserved {
+        let preferred_id: Option<String> = sqlx::query_scalar(
+            "SELECT reviewer_worker_id FROM reviews WHERE task_id=? ORDER BY created_at DESC LIMIT 1")
+            .bind(task.id.to_string()).fetch_optional(db).await.map_err(db_error)?;
+        let name: Option<String> = match preferred_id {
+            Some(id) => sqlx::query_scalar("SELECT name FROM workers WHERE id=?")
+                .bind(id).fetch_optional(db).await.map_err(db_error)?,
+            None => None,
+        };
+        let detail = match name {
+            Some(name) => format!("reserved for reviewer {name} by recent review affinity"),
+            None => "reserved for previous reviewer by recent review affinity".into(),
+        };
+        return Ok(Some(waiting("reviewer_reserved", detail)));
+    }
+    let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? AND state='completed' ORDER BY attempt DESC LIMIT 1")
+        .bind(task.id.to_string()).fetch_optional(db).await.map_err(db_error)?;
+    let Some(execution_row) = execution_row else {
+        return Ok(Some(waiting("candidate_not_ready", "no completed implementation candidate to review".into())));
+    };
+    let execution = execution_from_row(&execution_row)?;
+    let has_candidate = execution.result.as_ref().is_some_and(|result|
+        result.review_ref.is_some() && result.commit_sha.is_some());
+    if !has_candidate {
+        return Ok(Some(waiting("candidate_not_ready", "latest implementation has no reviewable candidate".into())));
+    }
+    // Scope and self-review exclusion precede the lease and failure-budget
+    // checks, exactly as `claim_review` skips out-of-scope and self-review
+    // claimants before consulting them: when no reviewer remains eligible,
+    // the reason is eligibility even when a lease is active or the budget
+    // is exhausted (e.g. the implementation worker reassigned to reviewer
+    // is refused for self-review, never for the budget).
+    let workers = &ctx.workers;
+    let live: Vec<&Worker> = workers.iter()
+        .filter(|w| w.role == AgentRole::Reviewer && w.protocol_version >= PROTOCOL_VERSION
+            && matches!(w.state, WorkerState::Idle | WorkerState::Busy))
+        .collect();
+    if live.is_empty() {
+        return Ok(Some(waiting("no_eligible_reviewer",
+            "no reviewer with current protocol and idle/busy state".into())));
+    }
+    let scoped: Vec<&Worker> = live.iter()
+        .filter(|w| worker_can_run_project(w, project) && w.id != execution.worker_id)
+        .copied()
+        .collect();
+    if scoped.is_empty() {
+        let self_only = live.iter().all(|w| !worker_can_run_project(w, project) || w.id == execution.worker_id);
+        let detail = if live.iter().any(|w| w.id == execution.worker_id)
+            && live.iter().filter(|w| worker_can_run_project(w, project)).count() <= 1 && self_only {
+            "only available reviewer is the implementation worker (self-review is not allowed)".into()
+        } else {
+            format!("{} reviewers excluded by project scope or self-review rule", live.len())
+        };
+        return Ok(Some(waiting("no_eligible_reviewer", detail)));
+    }
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
+        .bind(task.id.to_string()).fetch_one(db).await.map_err(db_error)?;
+    if active > 0 {
+        return Ok(Some(waiting("review_lease_active", "a reviewer lease is already active".into())));
+    }
+    let failed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='failed'")
+        .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_one(db).await.map_err(db_error)?;
+    let lost_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND execution_id=? AND state='lost'")
+        .bind(task.id.to_string()).bind(execution.id.to_string()).fetch_one(db).await.map_err(db_error)?;
+    if review_runtime_failures_exhausted(failed_count, lost_count, review_failure_limit) {
+        return Ok(Some(waiting("review_failure_limit", format!(
+            "reviewer runtime failed {} times ({failed_count} failed, {lost_count} lost); automatic reclaim stopped at limit {review_failure_limit}",
+            failed_count + lost_count))));
+    }
+    let backend_ready: Vec<&Worker> = scoped.iter()
+        .filter(|w| can_claim_work(&w.agent, &w.agent_capabilities))
+        .copied()
+        .collect();
+    if backend_ready.is_empty() {
+        let detail = backend_unavailable_detail(scoped[0]);
+        return Ok(Some(waiting("review_backend_unavailable", detail)));
+    }
+    let free = backend_ready.iter().filter(|w| w.running_slots < w.slots).count();
+    if free == 0 {
+        return Ok(Some(waiting("reviewer_no_capacity",
+            format!("{} eligible reviewers with backend ready, all at capacity", backend_ready.len()))));
+    }
+    Ok(Some(waiting("awaiting_claim",
+        format!("eligible reviewer {} has a free slot; waiting for claim poll", backend_ready[0].name))))
+}
+
+/// Dispatcher for waiting diagnostics. Returns `None` for states that are
+/// actively progressing so those cards are never spammed. Takes the shared
+/// per-request [`DiagContext`] so board requests scan the fleet, projects,
+/// and settings once no matter how many waiting tasks they render.
+pub(crate) async fn waiting_for_task_with_ctx(db: &SqlitePool, ctx: &DiagContext, task: &Task) -> Result<Option<WaitingInfo>, ApiError> {
+    match task.state {
+        TaskState::Queued => {
+            let Some(project) = ctx.projects.get(&task.project_id) else {
+                return Ok(Some(waiting("no_eligible_worker", "project is missing".into())));
+            };
+            if !project.enabled {
+                return Ok(Some(waiting("no_eligible_worker",
+                    format!("project {} is disabled", project.slug))));
+            }
+            let sticky: Option<String> = sqlx::query_scalar("SELECT sticky_worker_id FROM tasks WHERE id=?")
+                .bind(task.id.to_string()).fetch_optional(db).await.map_err(db_error)?.flatten();
+            queued_waiting_info(db, ctx, task, project, sticky.as_deref()).await
+        }
+        TaskState::Review => {
+            let Some(project) = ctx.projects.get(&task.project_id) else {
+                return Ok(Some(waiting("no_eligible_reviewer", "project is missing".into())));
+            };
+            if !project.enabled {
+                return Ok(Some(waiting("no_eligible_reviewer",
+                    format!("project {} is disabled", project.slug))));
+            }
+            review_waiting_info(db, ctx, task, project).await
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Single-task convenience wrapper that loads a fresh [`DiagContext`].
+/// Board requests should prefer [`waiting_for_task_with_ctx`] with one
+/// shared context per request.
+pub(crate) async fn waiting_for_task(db: &SqlitePool, task: &Task) -> Result<Option<WaitingInfo>, ApiError> {
+    let ctx = load_diag_context(db).await?;
+    waiting_for_task_with_ctx(db, &ctx, task).await
+}
+
 async fn is_latest_execution(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, task_id: &str, execution_id: Uuid) -> Result<bool, ApiError> {
     let latest: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
         .bind(task_id).fetch_optional(&mut **tx).await.map_err(db_error)?;
@@ -1852,6 +2294,9 @@ fn git_auth_mode_str(mode: &GitAuthMode) -> &'static str {
 fn git_auth_mode(value: &str) -> Result<GitAuthMode, ApiError> {
     match value {
         "host" => Ok(GitAuthMode::Host),
+        // Legacy migration default wrote `worker` for Host-mode projects;
+        // treat it as Host so read-only diagnostics never fail on old rows.
+        "worker" => Ok(GitAuthMode::Host),
         "ssh_key" => Ok(GitAuthMode::SshKey),
         "https_basic" => Ok(GitAuthMode::HttpsBasic),
         _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid Git auth mode {value}"))),
@@ -2095,7 +2540,10 @@ fn resolved_initial_prompt(role: &AgentRole, initial_prompt: String) -> String {
             AgentRole::Reviewer => DEFAULT_REVIEWER_PROMPT.into(),
         };
     }
-    if matches!(role, AgentRole::Reviewer) && initial_prompt == LEGACY_DEFAULT_REVIEWER_PROMPT {
+    if matches!(role, AgentRole::Reviewer)
+        && (initial_prompt == LEGACY_DEFAULT_REVIEWER_PROMPT
+            || initial_prompt == LEGACY_FULL_SWEEP_REVIEWER_PROMPT)
+    {
         return DEFAULT_REVIEWER_PROMPT.into();
     }
     initial_prompt
@@ -2109,7 +2557,7 @@ fn agent_role(value: String) -> Result<AgentRole, ApiError> {
     match value.as_str() { "worker" => Ok(AgentRole::Worker), "reviewer" => Ok(AgentRole::Reviewer), _ => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("invalid agent role {value}"))) }
 }
 
-fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
+pub(crate) fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
     let state: String = row.try_get("state").map_err(internal)?;
     // review_cycle was added by migration 0018; default to 0 for rows that
     // predate the column so old history keeps counting as cycle 0.
@@ -2120,6 +2568,7 @@ fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApiError> {
         preferred_tags: dejson(row.try_get("preferred_tags").map_err(internal)?)?, dependencies: dejson(row.try_get("dependencies").map_err(internal)?)?, review_feedback: row.try_get("review_feedback").map_err(internal)?, priority: row.try_get("priority").map_err(internal)?,
         state: match state.as_str() { "draft"=>TaskState::Draft,"assigned"=>TaskState::Assigned,"running"=>TaskState::Running,"review"=>TaskState::Review,"merge_pending"=>TaskState::MergePending,"done"=>TaskState::Done,"blocked"=>TaskState::Blocked,"failed"=>TaskState::Failed,"cancelled"=>TaskState::Cancelled,_=>TaskState::Queued },
         review_cycle: review_cycle.max(0),
+        conflict_group: row.try_get::<Option<String>, _>("conflict_group").unwrap_or(None),
         created_at: datetime(row.try_get("created_at").map_err(internal)?)?, updated_at: datetime(row.try_get("updated_at").map_err(internal)?)? })
 }
 
@@ -2180,6 +2629,7 @@ mod tests {
     #[test]
     fn legacy_default_reviewer_prompt_upgrades_without_touching_custom_prompt() {
         assert_eq!(resolved_initial_prompt(&AgentRole::Reviewer, LEGACY_DEFAULT_REVIEWER_PROMPT.into()), DEFAULT_REVIEWER_PROMPT);
+        assert_eq!(resolved_initial_prompt(&AgentRole::Reviewer, LEGACY_FULL_SWEEP_REVIEWER_PROMPT.into()), DEFAULT_REVIEWER_PROMPT);
         assert_eq!(resolved_initial_prompt(&AgentRole::Reviewer, "custom".into()), "custom");
         assert_eq!(resolved_initial_prompt(&AgentRole::Worker, String::new()), DEFAULT_WORKER_PROMPT);
     }
@@ -2212,11 +2662,68 @@ mod tests {
         assert_eq!(reloaded.review_failure_limit, 4);
     }
 
+    #[tokio::test]
+    async fn conflict_group_create_read_round_trip_and_validation() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(project_id.to_string()).bind("p").bind("P").bind("https://example.invalid/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = Arc::new(AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: std::env::temp_dir(),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+        });
+        let input = CreateTask {
+            project_id,
+            title: "grouped".into(),
+            description: String::new(),
+            expected_outcome: String::new(),
+            acceptance_criteria: vec![],
+            required_tags: Default::default(),
+            preferred_tags: Default::default(),
+            dependencies: vec![],
+            priority: 0,
+            conflict_group: Some("  Server-API  ".into()),
+        };
+        let Json(created) = create_task(State(state.clone()), Json(input)).await.unwrap();
+        assert_eq!(created.conflict_group.as_deref(), Some("server-api"));
+        let Json(tasks) = list_tasks(State(state.clone())).await.unwrap();
+        assert_eq!(tasks.iter().find(|t| t.id == created.id).unwrap().conflict_group.as_deref(), Some("server-api"));
+
+        let invalid = CreateTask {
+            project_id,
+            title: "bad".into(),
+            description: String::new(),
+            expected_outcome: String::new(),
+            acceptance_criteria: vec![],
+            required_tags: Default::default(),
+            preferred_tags: Default::default(),
+            dependencies: vec![],
+            priority: 0,
+            conflict_group: Some("has space".into()),
+        };
+        let error = create_task(State(state), Json(invalid)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn reviewer_prompt_requires_complete_sweep_before_retry() {
         assert!(DEFAULT_REVIEWER_PROMPT.contains("Do not stop after finding the first defect"));
         assert!(DEFAULT_REVIEWER_PROMPT.contains("every acceptance criterion"));
         assert!(DEFAULT_REVIEWER_PROMPT.contains("all discovered blockers"));
+        assert!(DEFAULT_REVIEWER_PROMPT.contains("submit_review"));
+        assert!(!DEFAULT_REVIEWER_PROMPT.contains("final response must be exactly one JSON"));
     }
 
     fn selected_agent() -> AgentConfig {
@@ -2365,6 +2872,7 @@ mod tests {
                 priority: 0,
                 state: TaskState::Review,
                 review_cycle: 2,
+                conflict_group: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -2378,6 +2886,7 @@ mod tests {
             reviewer_retries: 1,
             current_cycle_reviewer_retries: 1,
             lifetime_reviewer_retries: 4,
+            waiting: None,
         };
         let value = serde_json::to_value(&item).unwrap();
         assert_eq!(value["attempt"], 3);
@@ -2750,13 +3259,14 @@ mod tests {
             .bind(&task_id).bind(&project_id).bind("claim loop").bind("").bind("").bind("review").bind("").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
         let execution_id = Uuid::new_v4().to_string();
-        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc123","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc123","base_sha":"base","review_ref":"refs/task/candidate","integration":{"candidate_sha":"abc123","candidate_base_sha":"base","upstream_sha":"upstream-pinned","integration_sha":"integration-pinned","effective_diff_hash":"diff-hash","conflict":null}}).to_string();
         sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
             .bind(&execution_id).bind(&task_id).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
             .execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict,upstream_sha,integration_sha,effective_diff_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(reviewer_id.to_string())
             .bind("failed").bind(&now).bind(&now).bind(r#"{"error":"runner crashed"}"#)
+            .bind("upstream-pinned").bind("integration-pinned").bind("diff-hash")
             .execute(&db).await.unwrap();
         let state = Arc::new(AppState { db, public_url: Some("https://example.com".into()), oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
         let headers = || {
@@ -2915,5 +3425,437 @@ mod tests {
         assert_eq!(status.candidate_completed_retries, 0);
         assert_eq!(status.candidate_runtime_failures, 1);
         assert_eq!(status.candidate_lost_leases, 1);
+    }
+
+    async fn waiting_test_db() -> SqlitePool {
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        db
+    }
+
+    fn waiting_state(db: SqlitePool) -> Arc<AppState> {
+        Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() })
+    }
+
+    async fn seed_backend_ready_worker(db: &SqlitePool, id: &str, name: &str, role: &str, now: &str, cred: Option<&str>) {
+        seed_backend_ready_worker_scoped(db, id, name, role, now, cred, r#"["*"]"#).await;
+    }
+
+    async fn seed_backend_ready_worker_scoped(db: &SqlitePool, id: &str, name: &str, role: &str, now: &str, cred: Option<&str>, allowed_projects: &str) {
+        let hash = cred.map(hash_secret);
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash,agent_provider,agent_model,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(id).bind(name).bind(role).bind("idle").bind("linux").bind("x86_64")
+            .bind(PROTOCOL_VERSION as i64).bind("test").bind(now).bind(now).bind(allowed_projects).bind(hash)
+            .bind("prov").bind("mod")
+            .bind(r#"{"models":[{"provider":"prov","id":"mod"}]}"#)
+            .execute(db).await.unwrap();
+    }
+
+    /// Credentialed worker with no Host provider/model selection and an
+    /// empty Pi catalog: live by the server predicates but never
+    /// backend-ready. Used to prove reservation reasons follow the exact
+    /// claim predicate rather than backend readiness.
+    async fn seed_worker_no_backend(db: &SqlitePool, id: &str, name: &str, role: &str, now: &str, cred: &str) {
+        let hash = hash_secret(cred);
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(id).bind(name).bind(role).bind("idle").bind("linux").bind("x86_64")
+            .bind(PROTOCOL_VERSION as i64).bind("test").bind(now).bind(now).bind(r#"["*"]"#).bind(hash)
+            .execute(db).await.unwrap();
+    }
+
+    fn worker_headers(cred: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-lazyteam-worker-credential", cred.parse().unwrap());
+        headers
+    }
+
+    async fn waiting_reason(db: &SqlitePool, task_id: Uuid) -> (String, String) {
+        let row = sqlx::query("SELECT * FROM tasks WHERE id=?").bind(task_id.to_string()).fetch_one(db).await.unwrap();
+        let task = task_from_row(&row).unwrap();
+        waiting_for_task(db, &task).await.unwrap().map(|w| (w.reason, w.detail)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn waiting_dependency_matches_claim_refusal() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let dep_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let cred = "dep-cred";
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id.to_string(), "w", "worker", &now, Some(cred)).await;
+        for (id, state) in [(&dep_id.to_string(), "blocked"), (&task_id.to_string(), "queued")] {
+            let deps = if id == &task_id.to_string() { serde_json::to_string(&vec![dep_id]).unwrap() } else { "[]".into() };
+            sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,dependencies,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(&project_id).bind("t").bind("").bind("").bind(state).bind(deps).bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+        }
+        let state = waiting_state(db.clone());
+        let response = claim_task(Path(worker_id), State(state.clone()), worker_headers(cred)).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, detail) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "blocked_dependencies");
+        assert!(detail.contains("dependency") || detail.contains("waiting"), "detail: {detail}");
+        let Json(status) = task_status(State(state.clone()), Path(task_id)).await.unwrap();
+        assert_eq!(status.waiting.as_ref().map(|w| w.reason.as_str()), Some("blocked_dependencies"));
+        assert!(!status.waiting.as_ref().unwrap().detail.contains("ltw_") && !status.waiting.as_ref().unwrap().detail.contains("token"));
+        // The same reason is exposed in the task-board payload Home renders.
+        let board = task_board(State(state.clone())).await.unwrap().0;
+        let item = board.iter().find(|item| item.task.id == task_id).expect("task on board");
+        assert_eq!(item.waiting.as_ref().map(|w| w.reason.as_str()), Some("blocked_dependencies"));
+    }
+
+    #[tokio::test]
+    async fn waiting_tag_scope_matches_claim_refusal() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let cred = "tag-cred";
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id.to_string(), "w", "worker", &now, Some(cred)).await;
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,required_tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued")
+            .bind(r#"{"gpu":"true"}"#).bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_task(Path(worker_id), State(state.clone()), worker_headers(cred)).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, detail) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "no_eligible_worker");
+        assert!(detail.contains("gpu"), "detail: {detail}");
+    }
+
+    #[tokio::test]
+    async fn waiting_project_scope_matches_claim_refusal() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let cred = "scope-cred";
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        // Worker matches every tag but is scoped to another project, so the
+        // project-scope predicate (shared with claim selection) refuses it.
+        seed_backend_ready_worker_scoped(&db, &worker_id.to_string(), "w", "worker", &now, Some(cred), r#"["other"]"#).await;
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_task(Path(worker_id), State(state.clone()), worker_headers(cred)).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, detail) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "no_eligible_worker");
+        assert!(detail.contains("project scope"), "detail: {detail}");
+        let board = task_board(State(state.clone())).await.unwrap().0;
+        let item = board.iter().find(|item| item.task.id == task_id).expect("task on board");
+        assert_eq!(item.waiting.as_ref().map(|w| w.reason.as_str()), Some("no_eligible_worker"));
+    }
+
+    #[tokio::test]
+    async fn waiting_sticky_affinity_matches_claim_refusal() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let sticky_id = Uuid::new_v4();
+        let claimant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &sticky_id.to_string(), "sticky", "worker", &now, Some("sticky-cred")).await;
+        seed_backend_ready_worker(&db, &claimant_id.to_string(), "claimant", "worker", &now, Some("claim-cred")).await;
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,sticky_worker_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued")
+            .bind(sticky_id.to_string()).bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_task(Path(claimant_id), State(state), worker_headers("claim-cred")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, detail) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "sticky_reserved");
+        assert!(detail.contains("sticky"), "detail: {detail}");
+    }
+
+    #[tokio::test]
+    async fn waiting_no_slot_matches_claim_refusal() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let cred = "slot-cred";
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id.to_string(), "w", "worker", &now, Some(cred)).await;
+        sqlx::query("UPDATE workers SET running_slots=1,slots=1,state='busy' WHERE id=?")
+            .bind(worker_id.to_string()).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_task(Path(worker_id), State(state), worker_headers(cred)).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, _) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "no_free_slot");
+    }
+
+    #[tokio::test]
+    async fn waiting_self_review_beats_failure_limit() {
+        // The only reviewer is the implementation worker (reassigned to the
+        // reviewer role) and the failure budget is exhausted. `claim_review`
+        // rejects them for self-review before consulting the budget, so
+        // diagnostics must report eligibility, never the budget.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let history_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id.to_string(), "w", "reviewer", &now, Some("w-cred")).await;
+        seed_backend_ready_worker(&db, &history_id, "old", "reviewer", &now, Some("old-cred")).await;
+        // The history owner is stopped, so it is neither a live preferred
+        // reviewer nor a live pool member: the only live reviewer is the
+        // implementation worker itself.
+        sqlx::query("UPDATE workers SET last_heartbeat_at=?,state='draining' WHERE id=?")
+            .bind("2000-01-01T00:00:00+00:00").bind(&history_id).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(task_id.to_string()).bind(worker_id.to_string()).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
+            .execute(&db).await.unwrap();
+        for i in 0..2 {
+            sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(&history_id)
+                .bind("failed").bind(&now).bind(&now).bind(format!(r#"{{"error":"boom {i}"}}"#))
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(&history_id)
+            .bind("lost").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_review(Path(worker_id), State(state), worker_headers("w-cred")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, detail) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "no_eligible_reviewer");
+        assert!(detail.contains("self-review"), "detail: {detail}");
+    }
+
+    #[tokio::test]
+    async fn waiting_dependency_detail_is_exact_past_display_window() {
+        // 51 done dependencies followed by one blocked dependency: the
+        // unresolved dep sits past the old 50-item window, yet the detail
+        // must still name it with an exact count.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let cred = "dep-cred";
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id.to_string(), "w", "worker", &now, Some(cred)).await;
+        let mut deps = Vec::new();
+        for (id, state) in (0..51).map(|_| (Uuid::new_v4(), "done")).chain(std::iter::once((Uuid::new_v4(), "blocked"))) {
+            sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(id.to_string()).bind(&project_id).bind("d").bind("").bind("").bind(state).bind(&now).bind(&now)
+                .execute(&db).await.unwrap();
+            deps.push(id);
+        }
+        let blocked = deps.last().unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,dependencies,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued")
+            .bind(serde_json::to_string(&deps).unwrap()).bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let (reason, detail) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "blocked_dependencies");
+        let sample: String = blocked.to_string().chars().take(8).collect();
+        assert_eq!(detail, format!("waiting on dependency {sample}"));
+    }
+
+    #[tokio::test]
+    async fn waiting_reviewer_cooldown_matches_claim_refusal() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4().to_string();
+        let reviewer_id = Uuid::new_v4();
+        // Prior runtime history belongs to a stale-heartbeat reviewer, so no
+        // live preferred reviewer reserves the task and the failure budget
+        // is the reason the claimant is refused.
+        let history_id = Uuid::new_v4().to_string();
+        let cred = "reviewer-cred";
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id, "impl", "worker", &now, None).await;
+        seed_backend_ready_worker(&db, &reviewer_id.to_string(), "rev", "reviewer", &now, Some(cred)).await;
+        seed_backend_ready_worker(&db, &history_id, "old", "reviewer", &now, Some("old-cred")).await;
+        sqlx::query("UPDATE workers SET last_heartbeat_at=? WHERE id=?")
+            .bind("2000-01-01T00:00:00+00:00").bind(&history_id).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(task_id.to_string()).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
+            .execute(&db).await.unwrap();
+        for i in 0..2 {
+            sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(&history_id)
+                .bind("failed").bind(&now).bind(&now).bind(format!(r#"{{"error":"boom {i}"}}"#))
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(&history_id)
+            .bind("lost").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let (reason, detail) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "review_failure_limit");
+        assert!(detail.contains("limit 3"), "detail: {detail}");
+        let state = waiting_state(db.clone());
+        // The same cooldown reason is exposed in the task-board payload.
+        let board = task_board(State(state.clone())).await.unwrap().0;
+        let item = board.iter().find(|item| item.task.id == task_id).expect("task on board");
+        assert_eq!(item.waiting.as_ref().map(|w| w.reason.as_str()), Some("review_failure_limit"));
+        let response = claim_review(Path(reviewer_id), State(state), worker_headers(cred)).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn waiting_sticky_beats_backend_unavailable_for_preferred() {
+        // The sticky worker is live by the exact server reservation
+        // predicate but has no Host backend, so the pool alone would say
+        // `backend_unavailable`. `claim_task` still refuses other workers
+        // for the sticky reservation, and diagnostics must agree.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let sticky_id = Uuid::new_v4();
+        let claimant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_worker_no_backend(&db, &sticky_id.to_string(), "sticky", "worker", &now, "sticky-cred").await;
+        seed_backend_ready_worker(&db, &claimant_id.to_string(), "claimant", "worker", &now, Some("claim-cred")).await;
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,sticky_worker_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("queued")
+            .bind(sticky_id.to_string()).bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_task(Path(claimant_id), State(state), worker_headers("claim-cred")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let (reason, _) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "sticky_reserved");
+    }
+
+    #[tokio::test]
+    async fn waiting_reviewer_reservation_beats_full_slots() {
+        // The preferred reviewer is live by the exact reservation predicate
+        // but holds no free slot. `claim_review` refuses other reviewers
+        // for the reservation before capacity is ever considered.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4().to_string();
+        let preferred_id = Uuid::new_v4();
+        let claimant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id, "impl", "worker", &now, None).await;
+        seed_backend_ready_worker(&db, &preferred_id.to_string(), "preferred", "reviewer", &now, Some("pref-cred")).await;
+        seed_backend_ready_worker(&db, &claimant_id.to_string(), "claimant", "reviewer", &now, Some("claim-cred")).await;
+        sqlx::query("UPDATE workers SET running_slots=1,slots=1,state='busy' WHERE id=?")
+            .bind(preferred_id.to_string()).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(task_id.to_string()).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(preferred_id.to_string())
+            .bind("completed").bind(&now).bind(&now).bind(r#"{"verdict":"retry","reason":"fix it","validation":[]}"#)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_review(Path(claimant_id), State(state), worker_headers("claim-cred")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&db).await.unwrap();
+        assert_eq!(task_state, "review");
+        let (reason, _) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "reviewer_reserved");
+    }
+
+    #[tokio::test]
+    async fn waiting_reviewer_reservation_beats_failure_limit() {
+        // Failure budget is exhausted AND a preferred reviewer is live.
+        // `claim_review` checks the reservation first, so another reviewer
+        // is refused for affinity without tripping the failure-limit block;
+        // diagnostics must report the same primary reason.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4().to_string();
+        let preferred_id = Uuid::new_v4();
+        let claimant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&project_id).bind("p").bind("P").bind("https://example/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        seed_backend_ready_worker(&db, &worker_id, "impl", "worker", &now, None).await;
+        seed_backend_ready_worker(&db, &preferred_id.to_string(), "preferred", "reviewer", &now, Some("pref-cred")).await;
+        seed_backend_ready_worker(&db, &claimant_id.to_string(), "claimant", "reviewer", &now, Some("claim-cred")).await;
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(&project_id).bind("t").bind("").bind("").bind("review").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let execution_id = Uuid::new_v4().to_string();
+        let result_json = serde_json::json!({"status":"completed","summary":"x","commit_sha":"abc","base_sha":"base","review_ref":"refs/task/candidate"}).to_string();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,result) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&execution_id).bind(task_id.to_string()).bind(&worker_id).bind(1_i64).bind("completed").bind(&now).bind(&now).bind(&result_json)
+            .execute(&db).await.unwrap();
+        for i in 0..2 {
+            sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,verdict) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(preferred_id.to_string())
+                .bind("failed").bind(&now).bind(&now).bind(format!(r#"{{"error":"boom {i}"}}"#))
+                .execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(task_id.to_string()).bind(&execution_id).bind(preferred_id.to_string())
+            .bind("lost").bind(&now).bind(&now)
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let response = claim_review(Path(claimant_id), State(state), worker_headers("claim-cred")).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&db).await.unwrap();
+        assert_eq!(task_state, "review");
+        let (reason, _) = waiting_reason(&db, task_id).await;
+        assert_eq!(reason, "reviewer_reserved");
     }
 }
