@@ -621,6 +621,11 @@ fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
     {
         prepare_container_mountpoint(rootfs, source)?;
     }
+    // Toolchains such as rustc/cargo resolve their own executable through
+    // /proc/self/exe. The Ubuntu rootfs is a plain filesystem tree, so chroot
+    // alone would otherwise leave /proc empty. Mount a fresh procfs inside the
+    // agent's private mount namespace; it disappears with the sandbox process.
+    fs::create_dir_all(rootfs.join("proc")).context("create agent proc mountpoint")?;
 
     // Freeze the image before layering any child mounts. util-linux uses the
     // new mount API on this RK3588 kernel because legacy bind-remount can be rejected.
@@ -636,6 +641,21 @@ fn enter_agent_container(spec: &SandboxSpec) -> anyhow::Result<()> {
         } != 0 {
             bail!("make agent rootfs read-only failed: mount_setattr={new_api_error}; legacy={}", std::io::Error::last_os_error());
         }
+    }
+
+    let proc_source = CString::new("proc")?;
+    let proc_target = CString::new(rootfs.join("proc").as_os_str().as_bytes())?;
+    let proc_type = CString::new("proc")?;
+    if unsafe {
+        libc::mount(
+            proc_source.as_ptr(),
+            proc_target.as_ptr(),
+            proc_type.as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+            ptr::null(),
+        )
+    } != 0 {
+        bail!("mount agent procfs failed: {}", std::io::Error::last_os_error());
     }
 
     for source in &spec.container_read_only {
