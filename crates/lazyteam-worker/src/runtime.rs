@@ -1084,10 +1084,17 @@ const terminalPrompt = {terminal_prompt};
 const params = {{
   type: "object",
   additionalProperties: true,
+  required: ["verdict", "reason"],
   properties: {{
-    verdict: {{ description: "Required: approve or retry" }},
-    reason: {{ description: "Required non-empty review reason" }},
-    validation: {{ description: "Required array of validation evidence strings" }},
+    verdict: {{ type: "string", enum: ["approve", "retry"], description: "approve or retry" }},
+    reason: {{ type: "string", minLength: 1, description: "Non-empty review reason" }},
+    validation: {{
+      description: "Optional validation evidence. Prefer an array of strings; one string is also accepted.",
+      anyOf: [
+        {{ type: "array", items: {{ type: "string" }}, maxItems: 32 }},
+        {{ type: "string" }},
+      ],
+    }},
   }},
 }};
 
@@ -1712,6 +1719,9 @@ mod tests {
         let source = pi_reviewer_mcp_bridge_source("http://127.0.0.1:12345/mcp/cap").unwrap();
         assert!(!source.contains("import "), "temporary reviewer extension must not depend on node module resolution");
         assert!(source.contains("name: \"submit_review\""));
+        assert!(source.contains("required: [\"verdict\", \"reason\"]"));
+        assert!(source.contains("enum: [\"approve\", \"retry\"]"));
+        assert!(source.contains("Optional validation evidence"));
         assert!(source.contains("method: \"tools/call\""));
         assert!(source.contains("pi.on(\"session_start\""));
         assert!(source.contains("pi.setActiveTools"));

@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering},
     },
 };
 
@@ -32,7 +32,9 @@ const MAX_VALIDATION_CHARS: usize = 2_000;
 struct SlotState {
     review_id: Uuid,
     execution_id: Uuid,
+    submit_calls: AtomicU16,
     invalid_submits: AtomicU8,
+    last_invalid: Mutex<Option<String>>,
     verdict: Mutex<Option<ReviewVerdict>>,
     failure: Mutex<Option<String>>,
     terminal: AtomicBool,
@@ -44,7 +46,9 @@ impl SlotState {
         Self {
             review_id,
             execution_id,
+            submit_calls: AtomicU16::new(0),
             invalid_submits: AtomicU8::new(0),
+            last_invalid: Mutex::new(None),
             verdict: Mutex::new(None),
             failure: Mutex::new(None),
             terminal: AtomicBool::new(false),
@@ -53,6 +57,7 @@ impl SlotState {
     }
 
     fn invalid(&self, reason: &str) -> CallToolResult {
+        *self.last_invalid.lock().expect("review slot last-invalid lock poisoned") = Some(reason.chars().take(160).collect());
         if self.terminal.load(Ordering::Acquire) {
             return CallToolResult::error(vec![ContentBlock::text(
                 "This review slot is already closed; submit_review cannot be called again.",
@@ -82,10 +87,6 @@ impl SlotState {
         let Some(arguments) = arguments else {
             return self.invalid("arguments object is required");
         };
-        let allowed = ["verdict", "reason", "validation"];
-        if let Some(extra) = arguments.keys().find(|key| !allowed.contains(&key.as_str())) {
-            return self.invalid(&format!("unexpected field `{extra}`"));
-        }
         let verdict = match arguments.get("verdict").and_then(Value::as_str) {
             Some("approve") => ReviewVerdictKind::Approve,
             Some("retry") => ReviewVerdictKind::Retry,
@@ -113,8 +114,10 @@ impl SlotState {
                 output
             }
             Some(Value::Array(_)) => return self.invalid("validation contains too many entries"),
-            Some(_) => return self.invalid("validation must be an array of strings"),
-            None => return self.invalid("validation array is required"),
+            Some(Value::String(text)) if text.chars().count() <= MAX_VALIDATION_CHARS => vec![text.to_string()],
+            Some(Value::String(_)) => return self.invalid("validation entry is too long"),
+            Some(_) => return self.invalid("validation must be a string or an array of strings"),
+            None => Vec::new(),
         };
 
         let verdict = ReviewVerdict { verdict, reason, validation };
@@ -211,6 +214,7 @@ impl ServerHandler for ReviewerMcp {
                 "The owning review slot has ended; this MCP capability is expired.",
             )]).into());
         };
+        slot.submit_calls.fetch_add(1, Ordering::AcqRel);
         Ok(slot.submit(request.arguments).into())
     }
 }
@@ -261,8 +265,20 @@ impl ReviewSlot {
     }
 
     pub fn endpoint(&self) -> &str { &self.endpoint }
+    pub fn diagnostics(&self) -> String {
+        let calls = self.state.submit_calls.load(Ordering::Acquire);
+        let invalid = self.state.invalid_submits.load(Ordering::Acquire);
+        let accepted = self.state.verdict.lock().expect("review slot verdict lock poisoned").is_some();
+        let last_invalid = self.state.last_invalid.lock().expect("review slot last-invalid lock poisoned").clone();
+        format!(
+            "submit_calls={calls} invalid_calls={invalid} accepted={accepted} last_invalid={}",
+            last_invalid.as_deref().unwrap_or("none")
+        )
+    }
     #[cfg(test)]
     pub fn invalid_submits(&self) -> u8 { self.state.invalid_submits.load(Ordering::Acquire) }
+    #[cfg(test)]
+    pub fn submit_calls(&self) -> u16 { self.state.submit_calls.load(Ordering::Acquire) }
     pub async fn wait(&self) -> anyhow::Result<ReviewVerdict> { self.state.wait().await }
     pub fn cancel(&self, reason: impl Into<String>) { self.state.cancel(reason); }
 }
@@ -376,6 +392,33 @@ mod tests {
         let verdict = slot.wait().await.unwrap();
         assert_eq!(verdict.verdict, ReviewVerdictKind::Approve);
         assert_eq!(verdict.reason, "verified");
+        assert_eq!(slot.submit_calls(), 2);
+        assert!(slot.diagnostics().contains("submit_calls=2 invalid_calls=1 accepted=true"));
+    }
+
+    #[tokio::test]
+    async fn common_dumb_validation_shapes_are_normalized() {
+        let string_slot = ReviewSlot::start(Uuid::new_v4(), Uuid::new_v4()).await.unwrap();
+        let string_response = mcp_call(string_slot.endpoint(), json!({
+            "verdict":"approve",
+            "reason":"verified",
+            "validation":"cargo test -p lazyteam-worker",
+            "extra_note":"ignored protocol noise"
+        })).await;
+        assert_ne!(string_response.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+        let string_verdict = string_slot.wait().await.unwrap();
+        assert_eq!(string_verdict.validation, vec!["cargo test -p lazyteam-worker"]);
+        assert_eq!(string_slot.invalid_submits(), 0);
+
+        let missing_slot = ReviewSlot::start(Uuid::new_v4(), Uuid::new_v4()).await.unwrap();
+        let missing_response = mcp_call(missing_slot.endpoint(), json!({
+            "verdict":"retry",
+            "reason":"one blocker remains"
+        })).await;
+        assert_ne!(missing_response.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+        let missing_verdict = missing_slot.wait().await.unwrap();
+        assert!(missing_verdict.validation.is_empty());
+        assert_eq!(missing_slot.invalid_submits(), 0);
     }
 
     #[tokio::test]

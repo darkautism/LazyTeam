@@ -997,14 +997,16 @@ async fn execute_review_assignment(
     }.await;
     renew.abort();
 
+    let diagnostics = slot.diagnostics();
     let body = match outcome {
         Ok(verdict) => {
-            info!(%review_id, verdict = ?verdict.verdict, "reviewer produced verdict; reporting review finish");
+            info!(%review_id, verdict = ?verdict.verdict, diagnostics = %diagnostics, "reviewer produced verdict; reporting review finish");
             json!({"status":"completed","verdict":verdict})
         }
         Err(error) => {
+            let error = format!("{error}; reviewer_mcp={diagnostics}");
             warn!(%review_id, %error, "reviewer failed before verdict; reporting failed review");
-            json!({"status":"failed","error":error.to_string()})
+            json!({"status":"failed","error":error})
         }
     };
     let response = lease_auth(
