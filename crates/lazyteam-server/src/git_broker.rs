@@ -1298,16 +1298,41 @@ impl HostGitAuth {
                     tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await?;
                 }
                 let path = dir.join(format!("{}.key", Uuid::new_v4()));
+                // Browser textareas and environment-derived secrets may carry CRLF
+                // line endings or omit the final newline. OpenSSH/libcrypto is much
+                // less forgiving than Git here, so store a canonical text key.
+                let mut private_key = private_key.replace("\r\n", "\n").replace('\r', "\n");
+                if !private_key.ends_with('\n') {
+                    private_key.push('\n');
+                }
                 tokio::fs::write(&path, private_key).await?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
                 }
+
+                // Keep host verification strict after first contact, but do not
+                // require operators to pre-seed the container's ~/.ssh/known_hosts.
+                // Project Git runs in a Host-owned persistent git_root, so TOFU can
+                // be recorded once and any later host-key change still fails.
+                let known_hosts = state.git_root.join("known_hosts");
+                if !tokio::fs::try_exists(&known_hosts).await? {
+                    tokio::fs::write(&known_hosts, b"").await?;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    tokio::fs::set_permissions(&known_hosts, std::fs::Permissions::from_mode(0o600)).await?;
+                }
+
                 let quoted = shell_quote(&path)?;
+                let known_hosts_quoted = shell_quote(&known_hosts)?;
                 auth.env.push((
                     "GIT_SSH_COMMAND".into(),
-                    format!("ssh -i {quoted} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes"),
+                    format!(
+                        "ssh -i {quoted} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={known_hosts_quoted}"
+                    ),
                 ));
                 auth.key_path = Some(path);
             }
@@ -1383,6 +1408,52 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ssh_key_auth_uses_persistent_tofu_known_hosts_and_normalizes_key_text() {
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let root = std::env::temp_dir().join(format!("lazyteam-ssh-auth-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        let state = Arc::new(crate::AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: root.clone(),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+            oauth_login_states: Default::default(),
+        });
+
+        let auth = HostGitAuth::prepare(
+            &state,
+            &GitCredential::SshKey {
+                private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\r\ntest\r\n-----END OPENSSH PRIVATE KEY-----".into(),
+            },
+        ).await.unwrap();
+
+        let ssh = auth.env.iter()
+            .find_map(|(key, value)| (key == "GIT_SSH_COMMAND").then_some(value.as_str()))
+            .expect("SSH credential must configure GIT_SSH_COMMAND");
+        assert!(ssh.contains("-o IdentitiesOnly=yes"));
+        assert!(ssh.contains("-o BatchMode=yes"));
+        assert!(ssh.contains("-o StrictHostKeyChecking=accept-new"));
+        assert!(ssh.contains("-o UserKnownHostsFile="));
+        assert!(!ssh.contains("StrictHostKeyChecking=yes"));
+
+        let key_path = auth.key_path.as_ref().expect("temporary private key path");
+        let stored = tokio::fs::read_to_string(key_path).await.unwrap();
+        assert_eq!(
+            stored,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n"
+        );
+        assert!(tokio::fs::try_exists(root.join("known_hosts")).await.unwrap());
+
+        auth.cleanup().await;
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
 
     /// Retry continuity: a task with an earlier completed candidate whose
     /// later attempt failed, manually republished via `retry_task`, must
