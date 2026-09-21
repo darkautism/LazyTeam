@@ -251,6 +251,119 @@ pub enum TaskState {
     Cancelled,
 }
 
+/// Redact credential-shaped values from OAuth diagnostics before they cross
+/// the worker→Host boundary.
+///
+/// Pi's token parsers can embed the raw token-response JSON in an error when
+/// required fields are missing, so arbitrary upstream `error.message` text
+/// must never be forwarded verbatim: a partial response may contain live
+/// `access_token`/`refresh_token` values. This redacts JSON string values for
+/// known credential keys (case-insensitive) plus `code=` query-param values
+/// (single-use authorization codes echoed in redirect URLs), replacing each
+/// with `[REDACTED]` while preserving all surrounding text. Applied by the
+/// worker before reporting and re-applied by the Host before storing, so
+/// neither Host state, UI responses, logs, nor task data can carry tokens.
+/// Device `user_code` values are deliberately untouched: the user must read
+/// and type them to complete device-code sign-in.
+pub fn redact_oauth_secret_text(text: &str) -> String {
+    const CREDENTIAL_KEYS: &[&str] = &[
+        "access_token", "refresh_token", "id_token", "authorization_code", "code_verifier",
+        "client_secret", "api_key", "apikey", "access", "refresh",
+    ];
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'"' {
+            if let Some((key, key_end)) = read_json_string(bytes, i)
+                && CREDENTIAL_KEYS.contains(&key.to_ascii_lowercase().as_str())
+            {
+                let mut j = skip_ascii_ws(bytes, key_end);
+                if j < len && bytes[j] == b':' {
+                    j = skip_ascii_ws(bytes, j + 1);
+                    if j < len && bytes[j] == b'"' {
+                        if let Some((_, value_end)) = read_json_string(bytes, j) {
+                            out.push_str(&text[i..j]);
+                            out.push_str("\"[REDACTED]\"");
+                            i = value_end;
+                            continue;
+                        }
+                        out.push_str(&text[i..j]);
+                        out.push_str("\"[REDACTED]");
+                        i = len;
+                        continue;
+                    }
+                }
+            }
+        }
+        if matches_query_code_param(bytes, i) {
+            let value_start = i + 5;
+            let mut value_end = value_start;
+            while value_end < len && !matches!(bytes[value_end], b'&' | b'"' | b'\'' | b'<' | b'>' | b' ' | b'\t' | b'\n' | b'\r') {
+                value_end += 1;
+            }
+            out.push_str(&text[i..value_start]);
+            out.push_str("[REDACTED]");
+            i = value_end;
+            continue;
+        }
+        // `out` is built from `&text[a..b]` slices, so `i` always sits on a
+        // UTF-8 boundary here: every skip above advances past ASCII bytes or
+        // whole `"..."` string spans only.
+        let ch = text[i..].chars().next().expect("byte index is a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn skip_ascii_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// Read a JSON `"..."` string starting at `bytes[start] == b'"'`.
+/// Returns the unescaped-free raw content and the index one past the closing
+/// quote, or `None` when unterminated. Escape-aware so an embedded `\"`
+/// cannot fake the end of a credential value.
+fn read_json_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut content = String::new();
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => {
+                content.push(bytes[i + 1] as char);
+                i += 2;
+            }
+            b'"' => return Some((content, i + 1)),
+            _ => {
+                content.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// True when `bytes[i..]` starts a `code=` query parameter: the name is
+/// `code` (any ASCII case) and the previous byte starts a value context
+/// (`?`, `&`, quote, or whitespace) so prose like `"encode=x"` is ignored.
+fn matches_query_code_param(bytes: &[u8], i: usize) -> bool {
+    if i + 5 > bytes.len() {
+        return false;
+    }
+    if !bytes[i..i + 4].eq_ignore_ascii_case(b"code") || bytes[i + 4] != b'=' {
+        return false;
+    }
+    if i == 0 {
+        return true;
+    }
+    matches!(bytes[i - 1], b'?' | b'&' | b'"' | b'\'' | b' ' | b'\t' | b'\n' | b'\r' | b'(')
+}
+
 pub const MAX_CONFLICT_GROUP_LEN: usize = 64;
 
 pub fn normalize_conflict_group(raw: Option<&str>) -> Result<Option<String>, String> {
@@ -702,5 +815,37 @@ mod tests {
         assert!(worker_matches_task(&w, &project, &task));
         project.required_worker_tags.insert("site".into(), "lab".into());
         assert!(!worker_matches_task(&w, &project, &task));
+    }
+
+    #[test]
+    fn oauth_diagnostics_redact_embedded_token_responses() {
+        // Pi's token parser embeds the raw token-response JSON in the error
+        // when required fields are missing; a partial response may carry
+        // live tokens that must never cross the worker→Host boundary.
+        let raw = r#"OpenAI Codex token exchange response missing fields: {"access_token":"synth-access-9f2","refresh_token":"synth-refresh-4b7","expires_in":3600}"#;
+        let clean = redact_oauth_secret_text(raw);
+        assert!(!clean.contains("synth-access-9f2"), "{clean}");
+        assert!(!clean.contains("synth-refresh-4b7"), "{clean}");
+        assert!(clean.contains("\"access_token\":\"[REDACTED]\""), "{clean}");
+        assert!(clean.contains("\"refresh_token\":\"[REDACTED]\""), "{clean}");
+        assert!(clean.contains("\"expires_in\":3600"), "{clean}");
+        assert!(clean.contains("missing fields"), "{clean}");
+    }
+
+    #[test]
+    fn oauth_diagnostics_redact_codes_and_verifiers_case_insensitively() {
+        let raw = "exchange failed for http://localhost:1455/auth/callback?code=SYNTH-CODE-1&state=xyz; body {\"REFRESH_TOKEN\":\"synth-r\", \"Code_Verifier\":\"synth-verifier-3\"}";
+        let clean = redact_oauth_secret_text(raw);
+        assert!(!clean.contains("synth-r\""), "{clean}");
+        assert!(!clean.contains("SYNTH-CODE-1"), "{clean}");
+        assert!(!clean.contains("synth-verifier-3"), "{clean}");
+        assert!(clean.contains("code=[REDACTED]&state=xyz"), "{clean}");
+        assert!(clean.contains("[REDACTED]"), "{clean}");
+        // Device user codes stay readable: the user must type them.
+        let device = "Enter code: ABCD-1234 at the verification page";
+        assert_eq!(redact_oauth_secret_text(device), device);
+        // Prose without credential shapes passes through untouched.
+        let prose = "Login cancelled by user; encode=x";
+        assert_eq!(redact_oauth_secret_text(prose), prose);
     }
 }

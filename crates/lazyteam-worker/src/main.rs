@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, t
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
-use lazyteam_core::{can_claim_work, host_agent_selection_ready, AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict, LEASE_CAPABILITY_HEADER};
+use lazyteam_core::{can_claim_work, host_agent_selection_ready, redact_oauth_secret_text, AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict, LEASE_CAPABILITY_HEADER};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -94,7 +94,7 @@ struct AgentAuthDelivery {
 #[derive(Debug, Deserialize)]
 struct AgentOAuthClaim { id: Uuid, provider: String }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AgentOAuthEventReport {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")] message: Option<String>,
@@ -879,10 +879,27 @@ async fn report_oauth_event(
     request_id: Uuid,
     event: &AgentOAuthEventReport,
 ) -> anyhow::Result<()> {
+    // Single choke point for every worker→Host OAuth report. Pi's upstream
+    // errors can embed raw token-response JSON (its parsers include the
+    // response body when fields are missing), so the diagnostic is redacted
+    // for credential-shaped values here; the Host re-applies the same
+    // redaction before storing. Raw helper text never crosses the boundary.
+    let mut sanitized = AgentOAuthEventReport {
+        kind: event.kind.clone(),
+        message: None,
+        verification_uri: event.verification_uri.clone(),
+        user_code: event.user_code.clone(),
+        authorization_url: event.authorization_url.clone(),
+        paste_prompt: event.paste_prompt.clone(),
+        paste_placeholder: event.paste_placeholder.clone(),
+    };
+    if let Some(message) = event.message.as_deref() {
+        sanitized.message = Some(redact_oauth_secret_text(message));
+    }
     let response = worker_auth(
         client.post(format!("{server}/api/workers/{worker_id}/oauth-login/{request_id}/event")),
         credential,
-    ).json(event).send().await?;
+    ).json(&sanitized).send().await?;
     ensure_success(response).await?;
     Ok(())
 }
@@ -892,9 +909,9 @@ async fn report_oauth_event(
 /// Only lengths are logged: the pasted single-use code is auth material
 /// that must never appear in logs, prompts, or Host durable state.
 async fn poll_oauth_callback_input(
-    client: &Client,
-    server: &str,
-    credential: &str,
+    client: Client,
+    server: String,
+    credential: String,
     worker_id: Uuid,
     request_id: Uuid,
     timeout: Duration,
@@ -904,7 +921,7 @@ async fn poll_oauth_callback_input(
         if Instant::now() >= deadline { return None; }
         match worker_auth(
             client.get(format!("{server}/api/workers/{worker_id}/oauth-login/{request_id}/input")),
-            credential,
+            &credential,
         ).send().await {
             Ok(response) if response.status() == StatusCode::OK => {
                 match response.json::<AgentOAuthInputDelivery>().await {
@@ -921,6 +938,220 @@ async fn poll_oauth_callback_input(
         }
         sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Paste waiter injected into the Pi OAuth helper script (plain JS, single
+/// braces). Kept as a named constant so unit tests can assert the abort
+/// wiring without spawning Node: Pi aborts the concurrent `manual_code`
+/// prompt when its worker-local localhost callback wins, and the waiter must
+/// honor `signal`, close the readline interface, and reject so Pi proceeds
+/// with the callback code instead of hanging the helper forever.
+const OAUTH_READ_PASTED_LINE_JS: &str = r#"function readPastedLine(signal) {
+  return new Promise((resolve,reject)=>{
+    const rl=createInterface({input:process.stdin});
+    let settled=false;
+    const settle=(fn,value)=>{ if (settled) return; settled=true; try{rl.close();}catch{} fn(value); };
+    if (signal) {
+      if (signal.aborted) { settle(reject,new Error("Login cancelled")); return; }
+      signal.addEventListener("abort",()=>settle(reject,new Error("Login cancelled")),{once:true});
+    }
+    rl.on("line",(line)=>settle(resolve,line));
+    rl.on("close",()=>settle(reject,new Error("OAuth paste channel closed")));
+  });
+}"#;
+
+/// Outcome of driving one Pi OAuth helper process to its terminal wire line.
+struct OAuthDriverOutcome {
+    completed: bool,
+    failed_reported: bool,
+}
+
+/// Drive the Pi OAuth helper wire protocol: `select!` over helper stdout and
+/// at most one pending Host-relayed paste poll.
+///
+/// A locally-won localhost callback (`complete` line) or a cancellation
+/// (`failed` line) therefore never strands the driver inside the paste poll:
+/// the pending poll task is aborted and the loop exits promptly. The pending
+/// poll is likewise aborted on helper-stdout EOF and when a second prompt
+/// replaces the first. Paste-poll timeout closes helper stdin (releasing
+/// Pi's `manual_code` prompt, which then fails through Pi's own cancel path)
+/// after reporting; stdin write failures are tolerated because the helper
+/// may already have moved on via its local callback. Pasted values are only
+/// ever written to helper stdin; only their lengths reach logs.
+async fn drive_oauth_wire_loop<R, W, F, Fut, S>(
+    reader: R,
+    mut stdin: W,
+    report: F,
+    start_poll: S,
+) -> OAuthDriverOutcome
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    F: Fn(AgentOAuthEventReport) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    S: Fn() -> tokio::task::JoinHandle<Option<String>>,
+{
+    enum Step {
+        Line(Option<String>),
+        Input(Option<String>),
+    }
+    let mut lines = BufReader::new(reader).lines();
+    let mut pending: Option<tokio::task::JoinHandle<Option<String>>> = None;
+    let mut completed = false;
+    let mut failed_reported = false;
+    loop {
+        let step = {
+            let poll_wait = async {
+                match pending.as_mut() {
+                    Some(handle) => handle.await.ok().flatten(),
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                line = lines.next_line() => Step::Line(line.unwrap_or(None)),
+                input = poll_wait => Step::Input(input),
+            }
+        };
+        match step {
+            Step::Line(None) => break,
+            Step::Line(Some(line)) => {
+                let Ok(wire) = serde_json::from_str::<PiOAuthWireEvent>(&line) else {
+                    tracing::debug!(raw = %line, "ignoring non-json Pi OAuth helper output");
+                    continue;
+                };
+                match wire.kind.as_str() {
+                    "selected" => {
+                        report(AgentOAuthEventReport {
+                            kind: "info".into(),
+                            message: Some(format!("Pi login method '{}' started on the worker; waiting for the authorization URL.", wire.selection.as_deref().unwrap_or("unknown"))),
+                            verification_uri: None,
+                            user_code: None,
+                            authorization_url: None,
+                            paste_prompt: None,
+                            paste_placeholder: None,
+                        }).await;
+                    }
+                    "prompt" => {
+                        // A second prompt replaces the first: abort the stale
+                        // poll before starting a fresh one.
+                        if let Some(handle) = pending.take() {
+                            handle.abort();
+                        }
+                        // Pi's `manual_code` prompt: its localhost callback
+                        // cannot be reached from a remote browser, so the Host
+                        // UI must collect the pasted final redirect URL/code
+                        // and relay it here.
+                        let prompt = wire.prompt.as_ref();
+                        report(AgentOAuthEventReport {
+                            kind: "awaiting_input".into(),
+                            message: prompt.and_then(|p| p.get("message").and_then(serde_json::Value::as_str)).map(str::to_string),
+                            verification_uri: None,
+                            user_code: None,
+                            authorization_url: None,
+                            paste_prompt: prompt.and_then(|p| p.get("message").and_then(serde_json::Value::as_str)).map(str::to_string),
+                            paste_placeholder: prompt.and_then(|p| p.get("placeholder").and_then(serde_json::Value::as_str)).map(str::to_string),
+                        }).await;
+                        pending = Some(start_poll());
+                    }
+                    "event" => {
+                        let Some(event) = wire.event.as_ref() else { continue; };
+                        let reported = match event.get("type").and_then(serde_json::Value::as_str) {
+                            Some("device_code") => AgentOAuthEventReport {
+                                kind: "device_code".into(),
+                                message: Some("Waiting for authorization: open the verification page and enter the device code.".into()),
+                                verification_uri: event.get("verificationUri").and_then(serde_json::Value::as_str).map(str::to_string),
+                                user_code: event.get("userCode").and_then(serde_json::Value::as_str).map(str::to_string),
+                                authorization_url: None,
+                                paste_prompt: None,
+                                paste_placeholder: None,
+                            },
+                            Some("progress") | Some("info") => AgentOAuthEventReport {
+                                kind: event.get("type").and_then(serde_json::Value::as_str).unwrap_or("info").to_string(),
+                                message: event.get("message").and_then(serde_json::Value::as_str).map(str::to_string),
+                                verification_uri: None,
+                                user_code: None,
+                                authorization_url: None,
+                                paste_prompt: None,
+                                paste_placeholder: None,
+                            },
+                            Some("auth_url") => AgentOAuthEventReport {
+                                kind: "auth_url".into(),
+                                message: event.get("instructions").and_then(serde_json::Value::as_str).map(str::to_string),
+                                verification_uri: None,
+                                user_code: None,
+                                authorization_url: event.get("url").and_then(serde_json::Value::as_str).map(str::to_string),
+                                paste_prompt: None,
+                                paste_placeholder: None,
+                            },
+                            _ => continue,
+                        };
+                        report(reported).await;
+                    }
+                    "complete" => {
+                        completed = true;
+                        report(AgentOAuthEventReport {
+                            kind: "complete".into(),
+                            message: Some("Pi stored the OAuth credential in this worker's isolated auth store.".into()),
+                            verification_uri: None,
+                            user_code: None,
+                            authorization_url: None,
+                            paste_prompt: None,
+                            paste_placeholder: None,
+                        }).await;
+                        break;
+                    }
+                    "failed" => {
+                        failed_reported = true;
+                        report(AgentOAuthEventReport { kind: "failed".into(), message: wire.message, verification_uri: None, user_code: None, authorization_url: None, paste_prompt: None, paste_placeholder: None }).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Step::Input(input) => {
+                pending = None;
+                match input {
+                    Some(pasted) => {
+                        if let Err(error) = write_oauth_paste(&mut stdin, &pasted).await {
+                            warn!(%error, paste_chars = pasted.chars().count(), "failed to forward relayed OAuth paste to Pi helper");
+                        }
+                    }
+                    None => {
+                        report(AgentOAuthEventReport {
+                            kind: "failed".into(),
+                            message: Some("Timed out waiting for the pasted redirect URL/code; no input arrived from the Host.".into()),
+                            verification_uri: None,
+                            user_code: None,
+                            authorization_url: None,
+                            paste_prompt: None,
+                            paste_placeholder: None,
+                        }).await;
+                        failed_reported = true;
+                        // Release Pi's `manual_code` prompt so the helper
+                        // terminates through Pi's own cancel path instead of
+                        // hanging on a readline that will never resolve.
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stdin).await;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(handle) = pending.take() {
+        handle.abort();
+    }
+    OAuthDriverOutcome { completed, failed_reported }
+}
+
+/// Forward one Host-relayed paste line to the helper's stdin (its
+/// `readPastedLine` resolves one prompt per line).
+async fn write_oauth_paste(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+    pasted: &str,
+) -> anyhow::Result<()> {
+    stdin.write_all(pasted.as_bytes()).await.context("forward relayed OAuth paste to Pi helper")?;
+    stdin.write_all(b"\n").await.context("forward relayed OAuth paste to Pi helper")?;
+    stdin.flush().await.context("forward relayed OAuth paste to Pi helper")?;
+    Ok(())
 }
 
 async fn execute_oauth_login(
@@ -945,13 +1176,12 @@ const rt=await ModelRuntime.create({{
   allowModelNetwork:false,
   refreshOnCreate:false
 }});
-function readPastedLine() {{
-  return new Promise((resolve,reject)=>{{
-    const rl=createInterface({{input:process.stdin}});
-    rl.on("line",(line)=>{{rl.close();resolve(line);}});
-    rl.on("close",()=>reject(new Error("OAuth paste channel closed")));
-  }});
-}}
+// Pi aborts the concurrent `manual_code` prompt when its worker-local
+// localhost callback wins the race, so the paste waiter must respect
+// `prompt.signal`: on abort the readline interface is closed and the waiter
+// rejects, letting Pi proceed with the callback code instead of hanging the
+// helper (and Rust, which waits for stdout EOF) forever.
+{read_pasted}
 const interaction={{
   prompt: async (prompt) => {{
     if (prompt.type === "select") {{
@@ -968,7 +1198,7 @@ const interaction={{
     }}
     if (prompt.type === "manual_code" || prompt.type === "text" || prompt.type === "secret") {{
       console.log(JSON.stringify({{kind:"prompt",prompt:{{type:prompt.type,message:prompt.message||"",placeholder:prompt.placeholder||""}}}}));
-      const pasted=await readPastedLine();
+      const pasted=await readPastedLine(prompt.signal);
       if (!pasted.trim()) throw new Error("Login cancelled");
       return pasted.trim();
     }}
@@ -983,125 +1213,52 @@ try {{
   console.log(JSON.stringify({{kind:"failed",message:error instanceof Error?error.message:String(error)}}));
   process.exitCode=1;
 }}
-"#);
+"#, read_pasted = OAUTH_READ_PASTED_LINE_JS);
 
     let mut command = runtime.sandbox.command("node", runtime.sandbox.probe_workspace(), None)?;
     command.arg("--input-type=module").arg("--eval").arg(script);
     command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = command.spawn().context("start Pi OAuth helper")?;
     let stdout = child.stdout.take().context("Pi OAuth helper stdout missing")?;
-    let mut stdin = child.stdin.take().context("Pi OAuth helper stdin missing")?;
-    let mut lines = BufReader::new(stdout).lines();
-    let mut completed = false;
-    let mut failed_reported = false;
-    while let Some(line) = lines.next_line().await? {
-        let Ok(wire) = serde_json::from_str::<PiOAuthWireEvent>(&line) else {
-            tracing::debug!(raw = %line, "ignoring non-json Pi OAuth helper output");
-            continue;
-        };
-        let report = match wire.kind.as_str() {
-            "selected" => AgentOAuthEventReport {
-                kind: "info".into(),
-                message: Some(format!("Pi login method '{}' started on the worker; waiting for the authorization URL.", wire.selection.as_deref().unwrap_or("unknown"))),
-                verification_uri: None,
-                user_code: None,
-                authorization_url: None,
-                paste_prompt: None,
-                paste_placeholder: None,
-            },
-            "prompt" => {
-                // Pi's `manual_code` prompt: its localhost callback cannot be
-                // reached from a remote browser, so the Host UI must collect
-                // the pasted final redirect URL/code and relay it here.
-                let prompt = wire.prompt.as_ref();
-                let waiting = AgentOAuthEventReport {
-                    kind: "awaiting_input".into(),
-                    message: prompt.and_then(|p| p.get("message").and_then(serde_json::Value::as_str)).map(str::to_string),
-                    verification_uri: None,
-                    user_code: None,
-                    authorization_url: None,
-                    paste_prompt: prompt.and_then(|p| p.get("message").and_then(serde_json::Value::as_str)).map(str::to_string),
-                    paste_placeholder: prompt.and_then(|p| p.get("placeholder").and_then(serde_json::Value::as_str)).map(str::to_string),
-                };
-                report_oauth_event(client, server, credential, worker_id, claim.id, &waiting).await?;
-                match poll_oauth_callback_input(client, server, credential, worker_id, claim.id, Duration::from_secs(600)).await {
-                    Some(pasted) => {
-                        stdin.write_all(pasted.as_bytes()).await.context("forward relayed OAuth paste to Pi helper")?;
-                        stdin.write_all(b"\n").await.context("forward relayed OAuth paste to Pi helper")?;
-                        stdin.flush().await.context("forward relayed OAuth paste to Pi helper")?;
-                        // The helper consumes exactly one pasted line per prompt;
-                        // the server already cleared the consume-once slot.
-                        continue;
-                    }
-                    None => {
-                        let report = AgentOAuthEventReport {
-                            kind: "failed".into(),
-                            message: Some("Timed out waiting for the pasted redirect URL/code; no input arrived from the Host.".into()),
-                            verification_uri: None,
-                            user_code: None,
-                            authorization_url: None,
-                            paste_prompt: None,
-                            paste_placeholder: None,
-                        };
-                        report_oauth_event(client, server, credential, worker_id, claim.id, &report).await?;
-                        let _ = child.kill().await;
-                        anyhow::bail!("Pi OAuth login timed out waiting for Host-relayed callback input");
-                    }
-                }
+    let stdin = child.stdin.take().context("Pi OAuth helper stdin missing")?;
+    // Owned clones for the 'static poll task spawned per `manual_code` prompt.
+    let report_client = client.clone();
+    let report_server = server.to_string();
+    let report_credential = credential.to_string();
+    let poll_client = client.clone();
+    let poll_server = server.to_string();
+    let poll_credential = credential.to_string();
+    let OAuthDriverOutcome { completed, failed_reported } = drive_oauth_wire_loop(
+        stdout,
+        stdin,
+        |event: AgentOAuthEventReport| {
+            let report_client = report_client.clone();
+            let report_server = report_server.clone();
+            let report_credential = report_credential.clone();
+            async move {
+                let _ = report_oauth_event(
+                    &report_client,
+                    &report_server,
+                    &report_credential,
+                    worker_id,
+                    claim.id,
+                    &event,
+                )
+                .await;
             }
-            "event" => {
-                let Some(event) = wire.event.as_ref() else { continue; };
-                match event.get("type").and_then(serde_json::Value::as_str) {
-                    Some("device_code") => AgentOAuthEventReport {
-                        kind: "device_code".into(),
-                        message: Some("Waiting for authorization: open the verification page and enter the device code.".into()),
-                        verification_uri: event.get("verificationUri").and_then(serde_json::Value::as_str).map(str::to_string),
-                        user_code: event.get("userCode").and_then(serde_json::Value::as_str).map(str::to_string),
-                        authorization_url: None,
-                        paste_prompt: None,
-                        paste_placeholder: None,
-                    },
-                    Some("progress") | Some("info") => AgentOAuthEventReport {
-                        kind: event.get("type").and_then(serde_json::Value::as_str).unwrap_or("info").to_string(),
-                        message: event.get("message").and_then(serde_json::Value::as_str).map(str::to_string),
-                        verification_uri: None,
-                        user_code: None,
-                        authorization_url: None,
-                        paste_prompt: None,
-                        paste_placeholder: None,
-                    },
-                    Some("auth_url") => AgentOAuthEventReport {
-                        kind: "auth_url".into(),
-                        message: event.get("instructions").and_then(serde_json::Value::as_str).map(str::to_string),
-                        verification_uri: None,
-                        user_code: None,
-                        authorization_url: event.get("url").and_then(serde_json::Value::as_str).map(str::to_string),
-                        paste_prompt: None,
-                        paste_placeholder: None,
-                    },
-                    _ => continue,
-                }
-            }
-            "complete" => {
-                completed = true;
-                AgentOAuthEventReport {
-                    kind: "complete".into(),
-                    message: Some("Pi stored the OAuth credential in this worker's isolated auth store.".into()),
-                    verification_uri: None,
-                    user_code: None,
-                    authorization_url: None,
-                    paste_prompt: None,
-                    paste_placeholder: None,
-                }
-            }
-            "failed" => {
-                failed_reported = true;
-                AgentOAuthEventReport { kind: "failed".into(), message: wire.message, verification_uri: None, user_code: None, authorization_url: None, paste_prompt: None, paste_placeholder: None }
-            }
-            _ => continue,
-        };
-        report_oauth_event(client, server, credential, worker_id, claim.id, &report).await?;
-    }
+        },
+        || {
+            tokio::spawn(poll_oauth_callback_input(
+                poll_client.clone(),
+                poll_server.clone(),
+                poll_credential.clone(),
+                worker_id,
+                claim.id,
+                Duration::from_secs(600),
+            ))
+        },
+    )
+    .await;
     let status = child.wait().await.context("wait for Pi OAuth helper")?;
     if !status.success() && !failed_reported {
         let report = AgentOAuthEventReport {
@@ -2679,4 +2836,234 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
+    #[test]
+    fn oauth_paste_waiter_honors_prompt_abort_signal() {
+        // Pi aborts the concurrent `manual_code` prompt when its
+        // worker-local localhost callback wins the race. The injected
+        // waiter must observe `prompt.signal`, pre-reject when already
+        // aborted, subscribe for later aborts, and always close the
+        // readline interface so neither Node nor the Rust driver hangs.
+        assert!(OAUTH_READ_PASTED_LINE_JS.contains("readPastedLine(signal)"));
+        assert!(OAUTH_READ_PASTED_LINE_JS.contains("signal.aborted"));
+        assert!(OAUTH_READ_PASTED_LINE_JS.contains("addEventListener(\"abort\""));
+        assert!(OAUTH_READ_PASTED_LINE_JS.contains("rl.close()"));
+        assert!(OAUTH_READ_PASTED_LINE_JS.contains("Login cancelled"));
+    }
+
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct AbortFlag(Arc<AtomicBool>);
+
+    impl Drop for AbortFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Deterministic driver harness: wire lines are fed through a duplex the
+    /// test controls (no EOF races), and the Host poll resolves only when the
+    /// test sends through a oneshot. Every step is observed with timeouts, so
+    /// scheduling races cannot decide the outcome.
+    struct GatedDriver {
+        feed: tokio::io::DuplexStream,
+        stdin_view: tokio::io::DuplexStream,
+        reports: Arc<tokio::sync::Mutex<Vec<AgentOAuthEventReport>>>,
+        poll_aborted: Arc<AtomicBool>,
+        input_tx: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+        outcome: tokio::task::JoinHandle<OAuthDriverOutcome>,
+    }
+
+    impl GatedDriver {
+        fn spawn() -> Self {
+            let (feed_read, feed) = tokio::io::duplex(4096);
+            let (helper_stdin, stdin_view) = tokio::io::duplex(4096);
+            let reports = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let poll_aborted = Arc::new(AtomicBool::new(false));
+            let (input_tx, input_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+            let input_cell = Arc::new(tokio::sync::Mutex::new(Some(input_rx)));
+            let worker_reports = reports.clone();
+            let worker_aborted = poll_aborted.clone();
+            let outcome = tokio::spawn(drive_oauth_wire_loop(
+                feed_read,
+                helper_stdin,
+                move |event: AgentOAuthEventReport| {
+                    let worker_reports = worker_reports.clone();
+                    async move {
+                        worker_reports.lock().await.push(event);
+                    }
+                },
+                move || {
+                    let input_cell = input_cell.clone();
+                    let worker_aborted = worker_aborted.clone();
+                    tokio::spawn(async move {
+                        // Drop guard proves the task is reclaimed on abort.
+                        // The driver always pends on helper stdout after
+                        // spawning the poll, so the scheduler runs the poll
+                        // task (constructing the guard) before any abort that
+                        // the test can subsequently trigger.
+                        let _guard = AbortFlag(worker_aborted);
+                        match input_cell.lock().await.take() {
+                            Some(rx) => rx.await.unwrap_or(None),
+                            None => std::future::pending().await,
+                        }
+                    })
+                },
+            ));
+            Self {
+                feed,
+                stdin_view,
+                reports,
+                poll_aborted,
+                input_tx: Some(input_tx),
+                outcome,
+            }
+        }
+
+        async fn feed_line(&mut self, line: &str) {
+            use tokio::io::AsyncWriteExt;
+            let mut wire = line.as_bytes().to_vec();
+            wire.push(b'\n');
+            self.feed.write_all(&wire).await.expect("feed wire line");
+        }
+
+        async fn wait_for_reports(&self, count: usize) {
+            let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if self.reports.lock().await.len() >= count {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reports must arrive");
+        }
+
+        fn answer_poll(&mut self, value: Option<String>) {
+            self.input_tx
+                .take()
+                .expect("single manual_code prompt per login")
+                .send(value)
+                .expect("poll task must be waiting");
+        }
+
+        async fn read_stdin_bytes(&mut self, count: usize) -> Vec<u8> {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; count];
+            tokio::time::timeout(Duration::from_secs(10), self.stdin_view.read_exact(&mut buf))
+                .await
+                .expect("helper stdin bytes must arrive")
+                .expect("helper stdin must stay open");
+            buf
+        }
+
+        /// stdin FIN: the driver shut the write half down (poll timeout path).
+        async fn expect_stdin_closed(&mut self) {
+            use tokio::io::AsyncReadExt;
+            let mut one = [0u8; 1];
+            let n = tokio::time::timeout(Duration::from_secs(10), self.stdin_view.read(&mut one))
+                .await
+                .expect("stdin close must be observable");
+            assert_eq!(n.expect("stdin read must succeed"), 0, "helper stdin must be shut down");
+        }
+
+        async fn finish(self) -> (OAuthDriverOutcome, Vec<String>, Vec<AgentOAuthEventReport>, Arc<AtomicBool>) {
+            let Self { feed, outcome, reports, poll_aborted, .. } = self;
+            drop(feed);
+            let outcome = tokio::time::timeout(Duration::from_secs(15), outcome)
+                .await
+                .expect("driver must terminate")
+                .expect("driver task must not panic");
+            let guarded = reports.lock().await;
+            let kinds = guarded.iter().map(|report| report.kind.clone()).collect();
+            let messages = guarded.clone();
+            drop(guarded);
+            (outcome, kinds, messages, poll_aborted)
+        }
+    }
+
+    async fn wait_poll_aborted(poll_aborted: &Arc<AtomicBool>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !poll_aborted.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending Host poll must be aborted");
+    }
+
+    fn wire_prompt() -> String {
+        serde_json::json!({"kind": "prompt", "prompt": {"type": "manual_code", "message": "paste it", "placeholder": "http://localhost:1455/auth/callback"}}).to_string()
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_win_aborts_pending_paste_poll() {
+        // Same-machine win: the helper's localhost callback fires while the
+        // paste poll is pending, so Pi aborts `manual_code` and the helper
+        // prints `complete` without ever reading stdin. The driver must exit
+        // promptly with success and abort the stranded poll task.
+        let mut driver = GatedDriver::spawn();
+        driver.feed_line(&wire_prompt()).await;
+        driver.wait_for_reports(1).await;
+        driver.feed_line(&serde_json::json!({"kind": "complete"}).to_string()).await;
+        let (outcome, kinds, _, poll_aborted) = driver.finish().await;
+        assert!(outcome.completed);
+        assert!(!outcome.failed_reported);
+        assert_eq!(kinds, vec!["awaiting_input", "complete"]);
+        wait_poll_aborted(&poll_aborted).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_cancel_reports_failure_and_aborts_pending_poll() {
+        let mut driver = GatedDriver::spawn();
+        driver.feed_line(&wire_prompt()).await;
+        driver.wait_for_reports(1).await;
+        driver
+            .feed_line(&serde_json::json!({"kind": "failed", "message": "Login cancelled"}).to_string())
+            .await;
+        let (outcome, kinds, _, poll_aborted) = driver.finish().await;
+        assert!(!outcome.completed);
+        assert!(outcome.failed_reported);
+        assert_eq!(kinds, vec!["awaiting_input", "failed"]);
+        wait_poll_aborted(&poll_aborted).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_relayed_paste_reaches_helper_stdin() {
+        let paste = "http://localhost:1455/auth/callback?code=paste-1&state=s";
+        let mut driver = GatedDriver::spawn();
+        driver.feed_line(&wire_prompt()).await;
+        driver.wait_for_reports(1).await;
+        driver.answer_poll(Some(paste.to_string()));
+        let stdin_bytes = driver.read_stdin_bytes(paste.len() + 1).await;
+        assert_eq!(stdin_bytes, format!("{paste}\n").into_bytes());
+        let (outcome, kinds, _, _) = driver.finish().await;
+        assert!(!outcome.completed);
+        assert!(!outcome.failed_reported);
+        assert_eq!(kinds, vec!["awaiting_input"]);
+    }
+
+    #[tokio::test]
+    async fn oauth_poll_timeout_closes_helper_stdin_and_reports() {
+        // No Host input within the poll window: the driver reports failure
+        // and shuts down helper stdin so Pi's prompt rejects through its own
+        // cancel path instead of waiting forever.
+        let mut driver = GatedDriver::spawn();
+        driver.feed_line(&wire_prompt()).await;
+        driver.wait_for_reports(1).await;
+        driver.answer_poll(None);
+        driver.wait_for_reports(2).await;
+        driver.expect_stdin_closed().await;
+        let (outcome, kinds, messages, _) = driver.finish().await;
+        assert!(!outcome.completed);
+        assert!(outcome.failed_reported);
+        assert_eq!(kinds, vec!["awaiting_input", "failed"]);
+        assert!(
+            messages.iter().any(|report| report.message.as_deref().unwrap_or_default().contains("Timed out waiting")),
+            "timeout must be actionable, not a bare failure"
+        );
+    }
 }

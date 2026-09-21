@@ -17,6 +17,7 @@ use lazyteam_core::{
     ReviewCheckout as WorkerReviewCheckout, ReviewLease, ReviewVerdict, ReviewVerdictKind, Tags, Task,
     TaskState, Worker, WorkerState, DEFAULT_REVIEWER_PROMPT, DEFAULT_WORKER_PROMPT,
     LEGACY_DEFAULT_REVIEWER_PROMPT, LEGACY_FULL_SWEEP_REVIEWER_PROMPT, LEASE_CAPABILITY_HEADER, MANAGED_CAPABILITY_IDS,
+    redact_oauth_secret_text,
 };
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1277,6 +1278,18 @@ fn bounded_oauth_text(value: Option<String>, max: usize) -> Option<String> {
     value.map(|value| value.chars().take(max).collect::<String>()).filter(|value| !value.trim().is_empty())
 }
 
+/// Worker-supplied OAuth diagnostic text, safe to store and display.
+///
+/// Upstream provider errors forwarded by the worker can embed raw
+/// token-response JSON (Pi's parsers include the response body when fields
+/// are missing), so every worker-supplied message is redacted for
+/// credential-shaped values before it reaches Host state or UI responses.
+/// Static Host-authored fallback strings bypass this (they never carry
+/// upstream text), but redacting them too would be harmless.
+fn oauth_diagnostic(message: Option<String>, max: usize) -> Option<String> {
+    bounded_oauth_text(message.map(|message| redact_oauth_secret_text(&message)), max)
+}
+
 async fn start_worker_oauth_login(
     Path(id): Path<Uuid>,
     State(state): State<Arc<AppState>>,
@@ -1340,7 +1353,7 @@ async fn report_worker_oauth_login_event(
     match input.kind.as_str() {
         "device_code" => {
             login.status = "waiting_user".into();
-            login.message = bounded_oauth_text(input.message, 512).or(Some("Waiting for authorization: open the verification page and enter the device code.".into()));
+            login.message = oauth_diagnostic(input.message, 512).or(Some("Waiting for authorization: open the verification page and enter the device code.".into()));
             login.verification_uri = bounded_oauth_text(input.verification_uri, 2048);
             login.user_code = bounded_oauth_text(input.user_code, 128);
         }
@@ -1349,7 +1362,7 @@ async fn report_worker_oauth_login_event(
             // opens this URL on any machine. Pi listens on worker-local
             // localhost, so completion arrives via the paste-back relay.
             login.status = "awaiting_authorization".into();
-            login.message = bounded_oauth_text(input.message, 512).or(Some("Waiting for authorization: open the URL below in any browser.".into()));
+            login.message = oauth_diagnostic(input.message, 512).or(Some("Waiting for authorization: open the URL below in any browser.".into()));
             login.authorization_url = bounded_oauth_text(input.authorization_url.or(input.verification_uri), 4096);
         }
         "awaiting_input" => {
@@ -1357,19 +1370,19 @@ async fn report_worker_oauth_login_event(
             // redirect landed on localhost unreachable from the worker, so
             // the user must paste the final redirect URL/code via the Host.
             login.status = "awaiting_callback".into();
-            login.message = bounded_oauth_text(input.message, 512).or(Some("Waiting for callback: paste the final redirect URL or authorization code below.".into()));
+            login.message = oauth_diagnostic(input.message, 512).or(Some("Waiting for callback: paste the final redirect URL or authorization code below.".into()));
             login.paste_prompt = bounded_oauth_text(input.paste_prompt, 512);
             login.paste_placeholder = bounded_oauth_text(input.paste_placeholder, 512);
         }
-        "progress" | "info" => login.message = bounded_oauth_text(input.message, 512),
+        "progress" | "info" => login.message = oauth_diagnostic(input.message, 512),
         "complete" => {
             login.status = "complete".into();
-            login.message = bounded_oauth_text(input.message, 512).or(Some("OAuth login completed.".into()));
+            login.message = oauth_diagnostic(input.message, 512).or(Some("OAuth login completed.".into()));
             login.pending_input = None;
         }
         "failed" => {
             login.status = "failed".into();
-            login.message = bounded_oauth_text(input.message, 1024).or(Some("OAuth login failed.".into()));
+            login.message = oauth_diagnostic(input.message, 1024).or(Some("OAuth login failed.".into()));
             login.pending_input = None;
         }
         _ => return Err((StatusCode::BAD_REQUEST, "unknown OAuth login event kind".into())),
@@ -4214,5 +4227,56 @@ mod tests {
         // Unknown event kinds are rejected with an actionable error.
         let err = report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(oauth_event("bogus"))).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pi_oauth_failure_with_embedded_tokens_never_reaches_host_state() {
+        // Pi's token parsers embed the raw token-response JSON in the error
+        // when required fields are missing. A failing helper therefore
+        // reports a `failed` message containing synthetic live tokens; the
+        // Host must redact them before storing, so neither Host state nor
+        // the serialized UI response carries them.
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let worker_id = Uuid::new_v4();
+        seed_oauth_worker(&db, &worker_id, &now, "oauth-cred").await;
+        let state = waiting_state(db.clone());
+        let Json(login) = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+        ).await.unwrap();
+        let claimed = claim_worker_oauth_login(Path(worker_id), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let mut failed = oauth_event("failed");
+        failed.message = Some(
+            r#"OpenAI Codex token exchange response missing fields: {"access_token":"synth-host-access-1","refresh_token":"synth-host-refresh-2","expires_in":3600}"#.into(),
+        );
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(failed)).await.unwrap();
+        let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
+        assert_eq!(current.status, "failed");
+        let stored = current.message.clone().unwrap_or_default();
+        assert!(!stored.contains("synth-host-access-1"), "{stored}");
+        assert!(!stored.contains("synth-host-refresh-2"), "{stored}");
+        assert!(stored.contains("[REDACTED]"), "{stored}");
+        // The exact payload served to the Host UI carries no tokens either.
+        let response = worker_oauth_login_state(Path(worker_id), State(state.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let ui = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!ui.contains("synth-host-access-1"), "{ui}");
+        assert!(!ui.contains("synth-host-refresh-2"), "{ui}");
+        // Progress/info diagnostics are redacted through the same path.
+        let Json(login) = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+        ).await.unwrap();
+        let mut progress = oauth_event("progress");
+        progress.message = Some(r#"token refresh failed: {"refresh_token":"synth-host-refresh-3"}"#.into());
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(progress)).await.unwrap();
+        let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
+        let stored = current.message.clone().unwrap_or_default();
+        assert!(!stored.contains("synth-host-refresh-3"), "{stored}");
     }
 }

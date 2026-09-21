@@ -292,13 +292,21 @@ mod tests {
 
     #[test]
     fn settings_edits_survive_background_refresh() {
-        // Local draft/dirty boundary: polling refresh must not replace
-        // unsaved Review loop inputs; initial load and successful save
-        // resynchronize, while save errors preserve the draft.
+        // Local draft/dirty boundary with an edit generation: polling
+        // refresh must not replace unsaved Review loop inputs; initial load
+        // and successful save resynchronize, while save errors preserve the
+        // draft. Only a refresh/save response matching the current edit
+        // generation may write the inputs, so a stale in-flight GET cannot
+        // overwrite a just-saved value and edits typed during a save are
+        // never destroyed by that save response.
         assert!(INDEX.contains("settingsDraftDirty"));
+        assert!(INDEX.contains("settingsGen"));
         assert!(INDEX.contains("markSettingsDirty()"));
-        assert!(INDEX.contains("if(!settingsDraftDirty)"));
-        assert!(INDEX.contains("settingsDraftDirty=false"));
+        assert!(INDEX.contains("settingsGen++"));
+        assert!(INDEX.contains("const gen=settingsGen"));
+        assert!(INDEX.contains("gen!==settingsGen"));
+        assert!(INDEX.contains("writeSettingsInputs"));
+        assert!(INDEX.contains("newer changes still pending"));
         assert!(INDEX.contains("oninput=\"markSettingsDirty()\""));
     }
 
