@@ -17,6 +17,7 @@ const DEFAULT_WATCHDOG_MAX_INACTIVE_PROBES: u32 = 3;
 const DEFAULT_WATCHDOG_TOOL_STALL_SECS: u64 = 30 * 60;
 const DEFAULT_REVIEW_SOFT_TOOL_BUDGET: u64 = 12;
 const DEFAULT_REVIEW_HARD_TOOL_BUDGET: u64 = 20;
+const REVIEW_TERMINAL_PROMPT: &str = "LAZYTEAM_REVIEW_TERMINAL_ONLY: The substantive review is complete. Do not inspect files, run commands, or redo the review. Use only submit_review now, with the verdict, reason, and validation evidence you already decided.";
 
 fn bounded_duration_from_env(name: &str, default_secs: u64, min_secs: u64, max_secs: u64) -> Duration {
     let seconds = std::env::var(name)
@@ -251,7 +252,9 @@ impl Drop for TempExtension {
 
 fn pi_reviewer_mcp_bridge_source(endpoint: &str) -> anyhow::Result<String> {
     let endpoint = serde_json::to_string(endpoint)?;
+    let terminal_prompt = serde_json::to_string(REVIEW_TERMINAL_PROMPT)?;
     Ok(format!(r#"const endpoint = {endpoint};
+const terminalPrompt = {terminal_prompt};
 // Dependency-free by design: this file lives in a per-slot session directory,
 // outside Pi's package tree. Semantic validation belongs to the Rust MCP slot.
 const params = {{
@@ -265,6 +268,21 @@ const params = {{
 }};
 
 export default function lazyteamReviewerMcp(pi) {{
+  let terminalOnly = false;
+  let terminalPreviousTools = null;
+
+  function restoreTerminalTools() {{
+    if (terminalOnly && Array.isArray(terminalPreviousTools) && terminalPreviousTools.length > 0) {{
+      pi.setActiveTools(terminalPreviousTools);
+    }}
+    terminalOnly = false;
+    terminalPreviousTools = null;
+  }}
+
+  function keepTerminalOnly() {{
+    pi.setActiveTools(["submit_review"]);
+  }}
+
   pi.registerTool({{
     name: "submit_review",
     label: "Submit review",
@@ -272,6 +290,11 @@ export default function lazyteamReviewerMcp(pi) {{
     parameters: params,
     executionMode: "sequential",
     async execute(_toolCallId, input) {{
+      // Restore normal reviewer tools before the MCP request can wake the
+      // Rust slot and terminate this Pi process. Re-enter terminal-only on a
+      // rejected/failed submit so the correction turn cannot wander.
+      const terminalSubmit = terminalOnly && Array.isArray(terminalPreviousTools);
+      if (terminalSubmit) pi.setActiveTools(terminalPreviousTools);
       const body = {{
         jsonrpc: "2.0",
         id: `review-${{Date.now()}}-${{Math.random()}}`,
@@ -285,30 +308,59 @@ export default function lazyteamReviewerMcp(pi) {{
           arguments: input,
         }},
       }};
-      const response = await fetch(endpoint, {{
-        method: "POST",
-        headers: {{
-          "content-type": "application/json",
-          "accept": "application/json, text/event-stream",
-          "MCP-Protocol-Version": "2026-07-28",
-          "Mcp-Method": "tools/call",
-          "Mcp-Name": "submit_review",
-        }},
-        body: JSON.stringify(body),
-      }});
-      const result = await response.json();
-      if (!response.ok || result.error) throw new Error(result.error?.message || `review MCP HTTP ${{response.status}}`);
-      const tool = result.result || {{}};
-      const text = Array.isArray(tool.content)
-        ? tool.content.filter((item) => item?.type === "text").map((item) => item.text).join("\\n")
-        : "";
-      if (tool.isError) throw new Error(text || "submit_review rejected");
-      return {{
-        content: Array.isArray(tool.content) ? tool.content : [{{ type: "text", text: "Review verdict accepted" }}],
-        details: tool.structuredContent || {{}},
-      }};
+      try {{
+        const response = await fetch(endpoint, {{
+          method: "POST",
+          headers: {{
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2026-07-28",
+            "Mcp-Method": "tools/call",
+            "Mcp-Name": "submit_review",
+          }},
+          body: JSON.stringify(body),
+        }});
+        const result = await response.json();
+        if (!response.ok || result.error) throw new Error(result.error?.message || `review MCP HTTP ${{response.status}}`);
+        const tool = result.result || {{}};
+        const text = Array.isArray(tool.content)
+          ? tool.content.filter((item) => item?.type === "text").map((item) => item.text).join("\\n")
+          : "";
+        if (tool.isError) throw new Error(text || "submit_review rejected");
+        terminalOnly = false;
+        terminalPreviousTools = null;
+        return {{
+          content: Array.isArray(tool.content) ? tool.content : [{{ type: "text", text: "Review verdict accepted" }}],
+          details: tool.structuredContent || {{}},
+        }};
+      }} catch (error) {{
+        if (terminalSubmit) keepTerminalOnly();
+        throw error;
+      }}
     }},
   }});
+
+  // A second turn after substantive review is deliberately terminal-only.
+  // Hide repository/tooling affordances from the model instead of merely
+  // asking it not to use them; this prevents cheap reviewers from restarting
+  // inspection and burning the review tool budget after they already decided.
+  pi.on("before_agent_start", (event) => {{
+    if (event.prompt !== terminalPrompt) return;
+    terminalPreviousTools = pi.getActiveTools();
+    if (!terminalPreviousTools.includes("submit_review")) {{
+      terminalPreviousTools = [...terminalPreviousTools, "submit_review"];
+    }}
+    terminalOnly = true;
+    keepTerminalOnly();
+    return {{
+      systemPrompt: "You are submitting the terminal verdict for a review you already completed. The only available tool is submit_review. Use it now. Do not inspect the repository, run commands, or answer with prose or JSON.",
+    }};
+  }});
+
+  // If the model still refuses to call submit_review, restore the session's
+  // normal tools before the Rust harness records one runtime failure.
+  pi.on("agent_settled", () => restoreTerminalTools());
+  pi.on("session_shutdown", () => restoreTerminalTools());
 
   // Reused reviewer sessions may persist an older active-tool allowlist from
   // before submit_review existed. Repair that session-local state explicitly
@@ -574,12 +626,12 @@ impl PiRuntime {
                         reviewer_final_nudged = true;
                         tracing::warn!(
                             session = session_name,
-                            "reviewer settled without terminal verdict; issuing one same-session submit_review nudge"
+                            "reviewer settled without terminal verdict; starting one same-session terminal-only submit_review turn"
                         );
                         let request = json!({
                             "id":"review-final-nudge",
                             "type":"prompt",
-                            "message":"Your substantive code review is already complete. Do not inspect files or redo the review. Call the submit_review tool now using the verdict, reason, and validation evidence you already decided. Do not answer with prose or JSON."
+                            "message":REVIEW_TERMINAL_PROMPT
                         });
                         stdin.write_all(request.to_string().as_bytes()).await?;
                         stdin.write_all(b"\n").await?;
@@ -839,6 +891,12 @@ mod tests {
         assert!(source.contains("pi.on(\"session_start\""));
         assert!(source.contains("pi.setActiveTools"));
         assert!(source.contains("active.add(\"submit_review\")"));
+        assert!(source.contains("pi.on(\"before_agent_start\""));
+        assert!(source.contains("event.prompt !== terminalPrompt"));
+        assert!(source.contains("pi.setActiveTools([\"submit_review\"])"));
+        assert!(source.contains("pi.on(\"agent_settled\""));
+        assert!(source.contains("terminalPreviousTools"));
+        assert!(source.contains("LAZYTEAM_REVIEW_TERMINAL_ONLY"));
         assert!(source.contains("http://127.0.0.1:12345/mcp/cap"));
     }
 
