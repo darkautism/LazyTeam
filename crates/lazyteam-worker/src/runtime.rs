@@ -309,6 +309,21 @@ export default function lazyteamReviewerMcp(pi) {{
       }};
     }},
   }});
+
+  // Reused reviewer sessions may persist an older active-tool allowlist from
+  // before submit_review existed. Repair that session-local state explicitly
+  // once the extension runtime is bound.
+  pi.on("session_start", () => {{
+    if (!pi.getAllTools().some((tool) => tool.name === "submit_review")) {{
+      throw new Error("submit_review registered extension tool is unavailable");
+    }}
+    const active = new Set(pi.getActiveTools());
+    active.add("submit_review");
+    pi.setActiveTools([...active]);
+    if (!pi.getActiveTools().includes("submit_review")) {{
+      throw new Error("submit_review could not be activated for reviewer session");
+    }}
+  }});
 }}
 "#))
 }
@@ -383,6 +398,7 @@ impl PiRuntime {
 
         let mut lines = BufReader::new(stdout).lines();
         let mut requested_final = false;
+        let mut reviewer_final_nudged = false;
         let mut summary = String::new();
         let mut completed_tools = 0u64;
         let probe_interval = watchdog_probe_interval();
@@ -554,11 +570,27 @@ impl PiRuntime {
                     }
                 }
                 Some("agent_settled") if !requested_final => {
-                    requested_final = true;
-                    let request = json!({"id":"final-text","type":"get_last_assistant_text"});
-                    stdin.write_all(request.to_string().as_bytes()).await?;
-                    stdin.write_all(b"\n").await?;
-                    stdin.flush().await?;
+                    if review_budgets.is_some() && !reviewer_final_nudged {
+                        reviewer_final_nudged = true;
+                        tracing::warn!(
+                            session = session_name,
+                            "reviewer settled without terminal verdict; issuing one same-session submit_review nudge"
+                        );
+                        let request = json!({
+                            "id":"review-final-nudge",
+                            "type":"prompt",
+                            "message":"Your substantive code review is already complete. Do not inspect files or redo the review. Call the submit_review tool now using the verdict, reason, and validation evidence you already decided. Do not answer with prose or JSON."
+                        });
+                        stdin.write_all(request.to_string().as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await?;
+                    } else {
+                        requested_final = true;
+                        let request = json!({"id":"final-text","type":"get_last_assistant_text"});
+                        stdin.write_all(request.to_string().as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await?;
+                    }
                 }
                 Some("response") if event.get("id").and_then(Value::as_str) == Some("final-text") => {
                     if event.get("success").and_then(Value::as_bool) == Some(true) {
@@ -804,6 +836,9 @@ mod tests {
         assert!(!source.contains("import "), "temporary reviewer extension must not depend on node module resolution");
         assert!(source.contains("name: \"submit_review\""));
         assert!(source.contains("method: \"tools/call\""));
+        assert!(source.contains("pi.on(\"session_start\""));
+        assert!(source.contains("pi.setActiveTools"));
+        assert!(source.contains("active.add(\"submit_review\")"));
         assert!(source.contains("http://127.0.0.1:12345/mcp/cap"));
     }
 
