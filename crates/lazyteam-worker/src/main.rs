@@ -7,7 +7,7 @@ use lazyteam_core::{can_claim_work, host_agent_selection_ready, AgentCapabilitie
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::{io::{AsyncBufReadExt, BufReader}, process::Command, task::JoinSet, time::{sleep, Instant}};
+use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::Command, task::JoinSet, time::{sleep, Instant}};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -100,6 +100,9 @@ struct AgentOAuthEventReport {
     #[serde(skip_serializing_if = "Option::is_none")] message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] verification_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] user_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] authorization_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] paste_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] paste_placeholder: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,7 +110,12 @@ struct PiOAuthWireEvent {
     kind: String,
     #[serde(default)] event: Option<serde_json::Value>,
     #[serde(default)] message: Option<String>,
+    #[serde(default)] prompt: Option<serde_json::Value>,
+    #[serde(default)] selection: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+struct AgentOAuthInputDelivery { input: String }
 
 #[derive(Debug, Deserialize)]
 struct WorkerCleanup {
@@ -400,7 +408,7 @@ async fn async_main() -> anyhow::Result<()> {
                         ).await;
                         if let Err(error) = &result {
                             let report = AgentOAuthEventReport {
-                                kind: "failed".into(), message: Some(error.to_string()), verification_uri: None, user_code: None,
+                                kind: "failed".into(), message: Some(error.to_string()), verification_uri: None, user_code: None, authorization_url: None, paste_prompt: None, paste_placeholder: None,
                             };
                             let _ = report_oauth_event(
                                 &oauth_client, &oauth_server, &oauth_credential, worker_id, oauth_request, &report,
@@ -879,6 +887,42 @@ async fn report_oauth_event(
     Ok(())
 }
 
+/// Poll the Host for a relayed localhost-callback paste (the user-pasted
+/// final redirect URL or authorization code). Returns `None` on timeout.
+/// Only lengths are logged: the pasted single-use code is auth material
+/// that must never appear in logs, prompts, or Host durable state.
+async fn poll_oauth_callback_input(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    request_id: Uuid,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline { return None; }
+        match worker_auth(
+            client.get(format!("{server}/api/workers/{worker_id}/oauth-login/{request_id}/input")),
+            credential,
+        ).send().await {
+            Ok(response) if response.status() == StatusCode::OK => {
+                match response.json::<AgentOAuthInputDelivery>().await {
+                    Ok(delivery) if !delivery.input.trim().is_empty() => {
+                        info!(oauth_request = %request_id, input_chars = delivery.input.chars().count(), "received Host-relayed OAuth callback paste");
+                        return Some(delivery.input);
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "failed to parse relayed OAuth callback input"),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "OAuth callback input poll failed"),
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
 async fn execute_oauth_login(
     client: &Client,
     server: &str,
@@ -891,6 +935,7 @@ async fn execute_oauth_login(
     let import_url = serde_json::to_string(&format!("file://{}", index.display()))?;
     let provider_json = serde_json::to_string(&claim.provider)?;
     let script = format!(r#"import {{ ModelRuntime }} from {import_url};
+import {{ createInterface }} from "node:readline";
 const dir=process.env.PI_CODING_AGENT_DIR;
 const provider={provider_json};
 const rt=await ModelRuntime.create({{
@@ -900,14 +945,34 @@ const rt=await ModelRuntime.create({{
   allowModelNetwork:false,
   refreshOnCreate:false
 }});
+function readPastedLine() {{
+  return new Promise((resolve,reject)=>{{
+    const rl=createInterface({{input:process.stdin}});
+    rl.on("line",(line)=>{{rl.close();resolve(line);}});
+    rl.on("close",()=>reject(new Error("OAuth paste channel closed")));
+  }});
+}}
 const interaction={{
   prompt: async (prompt) => {{
     if (prompt.type === "select") {{
-      const option=(prompt.options||[]).find((item)=>item.id==="device_code") || (prompt.options||[])[0];
+      const options=prompt.options||[];
+      // Prefer Pi's browser login so the Host UI can surface the real
+      // authorization URL; it completes remotely via the paste-back relay.
+      // Fall back to device-code login, which is remote-friendly natively.
+      const option=options.find((item)=>/browser/i.test(item.id||"")||/browser/i.test(item.label||""))
+        || options.find((item)=>item.id==="device_code")
+        || options[0];
       if (!option) throw new Error("OAuth provider offered an empty selection prompt");
+      console.log(JSON.stringify({{kind:"selected",selection:option.id}}));
       return option.id;
     }}
-    throw new Error(`remote OAuth prompt ${{prompt.type}} is unsupported; use a device-code capable provider`);
+    if (prompt.type === "manual_code" || prompt.type === "text" || prompt.type === "secret") {{
+      console.log(JSON.stringify({{kind:"prompt",prompt:{{type:prompt.type,message:prompt.message||"",placeholder:prompt.placeholder||""}}}}));
+      const pasted=await readPastedLine();
+      if (!pasted.trim()) throw new Error("Login cancelled");
+      return pasted.trim();
+    }}
+    throw new Error(`remote OAuth prompt ${{prompt.type}} is unsupported for this provider`);
   }},
   notify: (event) => console.log(JSON.stringify({{kind:"event",event}}))
 }};
@@ -922,9 +987,10 @@ try {{
 
     let mut command = runtime.sandbox.command("node", runtime.sandbox.probe_workspace(), None)?;
     command.arg("--input-type=module").arg("--eval").arg(script);
-    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = command.spawn().context("start Pi OAuth helper")?;
     let stdout = child.stdout.take().context("Pi OAuth helper stdout missing")?;
+    let mut stdin = child.stdin.take().context("Pi OAuth helper stdin missing")?;
     let mut lines = BufReader::new(stdout).lines();
     let mut completed = false;
     let mut failed_reported = false;
@@ -934,26 +1000,84 @@ try {{
             continue;
         };
         let report = match wire.kind.as_str() {
+            "selected" => AgentOAuthEventReport {
+                kind: "info".into(),
+                message: Some(format!("Pi login method '{}' started on the worker; waiting for the authorization URL.", wire.selection.as_deref().unwrap_or("unknown"))),
+                verification_uri: None,
+                user_code: None,
+                authorization_url: None,
+                paste_prompt: None,
+                paste_placeholder: None,
+            },
+            "prompt" => {
+                // Pi's `manual_code` prompt: its localhost callback cannot be
+                // reached from a remote browser, so the Host UI must collect
+                // the pasted final redirect URL/code and relay it here.
+                let prompt = wire.prompt.as_ref();
+                let waiting = AgentOAuthEventReport {
+                    kind: "awaiting_input".into(),
+                    message: prompt.and_then(|p| p.get("message").and_then(serde_json::Value::as_str)).map(str::to_string),
+                    verification_uri: None,
+                    user_code: None,
+                    authorization_url: None,
+                    paste_prompt: prompt.and_then(|p| p.get("message").and_then(serde_json::Value::as_str)).map(str::to_string),
+                    paste_placeholder: prompt.and_then(|p| p.get("placeholder").and_then(serde_json::Value::as_str)).map(str::to_string),
+                };
+                report_oauth_event(client, server, credential, worker_id, claim.id, &waiting).await?;
+                match poll_oauth_callback_input(client, server, credential, worker_id, claim.id, Duration::from_secs(600)).await {
+                    Some(pasted) => {
+                        stdin.write_all(pasted.as_bytes()).await.context("forward relayed OAuth paste to Pi helper")?;
+                        stdin.write_all(b"\n").await.context("forward relayed OAuth paste to Pi helper")?;
+                        stdin.flush().await.context("forward relayed OAuth paste to Pi helper")?;
+                        // The helper consumes exactly one pasted line per prompt;
+                        // the server already cleared the consume-once slot.
+                        continue;
+                    }
+                    None => {
+                        let report = AgentOAuthEventReport {
+                            kind: "failed".into(),
+                            message: Some("Timed out waiting for the pasted redirect URL/code; no input arrived from the Host.".into()),
+                            verification_uri: None,
+                            user_code: None,
+                            authorization_url: None,
+                            paste_prompt: None,
+                            paste_placeholder: None,
+                        };
+                        report_oauth_event(client, server, credential, worker_id, claim.id, &report).await?;
+                        let _ = child.kill().await;
+                        anyhow::bail!("Pi OAuth login timed out waiting for Host-relayed callback input");
+                    }
+                }
+            }
             "event" => {
                 let Some(event) = wire.event.as_ref() else { continue; };
                 match event.get("type").and_then(serde_json::Value::as_str) {
                     Some("device_code") => AgentOAuthEventReport {
                         kind: "device_code".into(),
-                        message: Some("Open the verification page and enter the device code.".into()),
+                        message: Some("Waiting for authorization: open the verification page and enter the device code.".into()),
                         verification_uri: event.get("verificationUri").and_then(serde_json::Value::as_str).map(str::to_string),
                         user_code: event.get("userCode").and_then(serde_json::Value::as_str).map(str::to_string),
+                        authorization_url: None,
+                        paste_prompt: None,
+                        paste_placeholder: None,
                     },
                     Some("progress") | Some("info") => AgentOAuthEventReport {
                         kind: event.get("type").and_then(serde_json::Value::as_str).unwrap_or("info").to_string(),
                         message: event.get("message").and_then(serde_json::Value::as_str).map(str::to_string),
                         verification_uri: None,
                         user_code: None,
+                        authorization_url: None,
+                        paste_prompt: None,
+                        paste_placeholder: None,
                     },
                     Some("auth_url") => AgentOAuthEventReport {
-                        kind: "device_code".into(),
+                        kind: "auth_url".into(),
                         message: event.get("instructions").and_then(serde_json::Value::as_str).map(str::to_string),
-                        verification_uri: event.get("url").and_then(serde_json::Value::as_str).map(str::to_string),
+                        verification_uri: None,
                         user_code: None,
+                        authorization_url: event.get("url").and_then(serde_json::Value::as_str).map(str::to_string),
+                        paste_prompt: None,
+                        paste_placeholder: None,
                     },
                     _ => continue,
                 }
@@ -965,11 +1089,14 @@ try {{
                     message: Some("Pi stored the OAuth credential in this worker's isolated auth store.".into()),
                     verification_uri: None,
                     user_code: None,
+                    authorization_url: None,
+                    paste_prompt: None,
+                    paste_placeholder: None,
                 }
             }
             "failed" => {
                 failed_reported = true;
-                AgentOAuthEventReport { kind: "failed".into(), message: wire.message, verification_uri: None, user_code: None }
+                AgentOAuthEventReport { kind: "failed".into(), message: wire.message, verification_uri: None, user_code: None, authorization_url: None, paste_prompt: None, paste_placeholder: None }
             }
             _ => continue,
         };
@@ -978,7 +1105,7 @@ try {{
     let status = child.wait().await.context("wait for Pi OAuth helper")?;
     if !status.success() && !failed_reported {
         let report = AgentOAuthEventReport {
-            kind: "failed".into(), message: Some(format!("Pi OAuth helper exited with {status}")), verification_uri: None, user_code: None,
+            kind: "failed".into(), message: Some(format!("Pi OAuth helper exited with {status}")), verification_uri: None, user_code: None, authorization_url: None, paste_prompt: None, paste_placeholder: None,
         };
         let _ = report_oauth_event(client, server, credential, worker_id, claim.id, &report).await;
     }

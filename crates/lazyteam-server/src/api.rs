@@ -67,6 +67,25 @@ pub(crate) struct AgentOAuthLoginState {
     verification_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_code: Option<String>,
+    /// Real browser authorization URL reported by the worker's Pi runtime
+    /// (`auth_url` notify event). Surfaced as a copyable bar in the Host UI
+    /// so the human browser can be on any machine; the worker never assumes
+    /// Host, worker, and browser share localhost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_url: Option<String>,
+    /// Paste-back prompt Pi shows when its localhost callback cannot be
+    /// reached remotely (Pi's `manual_code` prompt: paste the final
+    /// redirect URL or authorization code). Answered via the Host relay
+    /// endpoint; the pasted value is consumed only by the worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paste_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paste_placeholder: Option<String>,
+    /// Single-use pasted redirect URL/code from the Host. In-memory only,
+    /// never serialized to UI responses, logs, or Host durable storage;
+    /// consumed once by the worker's isolated Pi auth exchange.
+    #[serde(skip_serializing)]
+    pending_input: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,7 +100,16 @@ struct AgentOAuthEventInput {
     #[serde(default)] message: Option<String>,
     #[serde(default)] verification_uri: Option<String>,
     #[serde(default)] user_code: Option<String>,
+    #[serde(default)] authorization_url: Option<String>,
+    #[serde(default)] paste_prompt: Option<String>,
+    #[serde(default)] paste_placeholder: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+struct AgentOAuthInputSubmit { input: String }
+
+#[derive(Debug, Serialize)]
+struct AgentOAuthInputDelivery { input: String }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(crate) struct HostSettings {
@@ -571,8 +599,10 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/provider-key", post(queue_worker_provider_key))
         .route("/api/workers/{id}/agent-auth", get(worker_agent_auth))
         .route("/api/workers/{id}/oauth-login", get(worker_oauth_login_state).post(start_worker_oauth_login))
+        .route("/api/workers/{id}/oauth-login/input", post(submit_worker_oauth_login_input))
         .route("/api/workers/{id}/oauth-login/claim", get(claim_worker_oauth_login))
         .route("/api/workers/{id}/oauth-login/{request_id}/event", post(report_worker_oauth_login_event))
+        .route("/api/workers/{id}/oauth-login/{request_id}/input", get(claim_worker_oauth_login_input))
         .route("/api/workers/{id}/models/refresh", post(queue_worker_model_refresh))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
@@ -1266,7 +1296,8 @@ async fn start_worker_oauth_login(
     }
     let login = AgentOAuthLoginState {
         id: Uuid::new_v4(), provider: provider.to_string(), status: "queued".into(),
-        message: Some("Waiting for the worker to start Pi OAuth.".into()), verification_uri: None, user_code: None,
+        message: Some("Waiting for the worker to start Pi OAuth. The authorization URL will appear here; open it on any machine, then paste back the redirect URL if asked.".into()), verification_uri: None, user_code: None,
+        authorization_url: None, paste_prompt: None, paste_placeholder: None, pending_input: None,
     };
     state.oauth_login_states.lock().await.insert(id, login.clone());
     Ok(Json(login))
@@ -1292,7 +1323,7 @@ async fn claim_worker_oauth_login(
     let Some(login) = logins.get_mut(&id) else { return Ok(StatusCode::NO_CONTENT.into_response()); };
     if login.status != "queued" { return Ok(StatusCode::NO_CONTENT.into_response()); }
     login.status = "running".into();
-    login.message = Some("Pi OAuth login started on worker.".into());
+    login.message = Some("Pi OAuth login started on the worker; waiting for the authorization URL.".into());
     Ok(Json(AgentOAuthClaim { id: login.id, provider: login.provider.clone() }).into_response())
 }
 
@@ -1309,22 +1340,96 @@ async fn report_worker_oauth_login_event(
     match input.kind.as_str() {
         "device_code" => {
             login.status = "waiting_user".into();
-            login.message = bounded_oauth_text(input.message, 512).or(Some("Complete the device-code sign-in.".into()));
+            login.message = bounded_oauth_text(input.message, 512).or(Some("Waiting for authorization: open the verification page and enter the device code.".into()));
             login.verification_uri = bounded_oauth_text(input.verification_uri, 2048);
             login.user_code = bounded_oauth_text(input.user_code, 128);
+        }
+        "auth_url" => {
+            // Pi's real browser flow (`auth_url` notify): the human browser
+            // opens this URL on any machine. Pi listens on worker-local
+            // localhost, so completion arrives via the paste-back relay.
+            login.status = "awaiting_authorization".into();
+            login.message = bounded_oauth_text(input.message, 512).or(Some("Waiting for authorization: open the URL below in any browser.".into()));
+            login.authorization_url = bounded_oauth_text(input.authorization_url.or(input.verification_uri), 4096);
+        }
+        "awaiting_input" => {
+            // Pi's `manual_code` prompt is active on the worker: the browser
+            // redirect landed on localhost unreachable from the worker, so
+            // the user must paste the final redirect URL/code via the Host.
+            login.status = "awaiting_callback".into();
+            login.message = bounded_oauth_text(input.message, 512).or(Some("Waiting for callback: paste the final redirect URL or authorization code below.".into()));
+            login.paste_prompt = bounded_oauth_text(input.paste_prompt, 512);
+            login.paste_placeholder = bounded_oauth_text(input.paste_placeholder, 512);
         }
         "progress" | "info" => login.message = bounded_oauth_text(input.message, 512),
         "complete" => {
             login.status = "complete".into();
             login.message = bounded_oauth_text(input.message, 512).or(Some("OAuth login completed.".into()));
+            login.pending_input = None;
         }
         "failed" => {
             login.status = "failed".into();
             login.message = bounded_oauth_text(input.message, 1024).or(Some("OAuth login failed.".into()));
+            login.pending_input = None;
         }
         _ => return Err((StatusCode::BAD_REQUEST, "unknown OAuth login event kind".into())),
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Host relay for Pi's localhost OAuth callback (remote completion bridge).
+///
+/// Pi's browser flows redirect the human browser to worker-local localhost
+/// (`http://localhost:1455/auth/callback` for openai-codex, similar loopback
+/// listeners for other providers). When the worker is on another machine the
+/// human browser cannot reach that listener, but Pi also accepts the pasted
+/// final redirect URL/authorization code via its `manual_code` prompt. The
+/// Host UI collects that paste and stores it here, in memory only; the
+/// worker polls the companion endpoint and feeds it to Pi, whose token
+/// exchange then lands only in the worker's isolated Pi auth store. The
+/// pasted single-use code is never serialized to UI responses, never logged,
+/// and never persisted to Host durable storage.
+async fn submit_worker_oauth_login_input(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<AgentOAuthInputSubmit>,
+) -> ApiResult<AgentOAuthLoginState> {
+    let pasted = input.input.trim().to_string();
+    if pasted.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "pasted redirect URL or authorization code is required".into()));
+    }
+    if pasted.chars().count() > 4096 {
+        return Err((StatusCode::BAD_REQUEST, "pasted value is too long".into()));
+    }
+    let mut logins = state.oauth_login_states.lock().await;
+    let login = logins.get_mut(&id).ok_or((StatusCode::NOT_FOUND, "OAuth login not found".into()))?;
+    if !matches!(login.status.as_str(), "awaiting_authorization" | "awaiting_callback" | "running" | "waiting_user") {
+        return Err((StatusCode::CONFLICT, format!("OAuth login is {} and is not waiting for input", login.status)));
+    }
+    login.pending_input = Some(pasted);
+    if login.status != "awaiting_callback" {
+        login.status = "awaiting_callback".into();
+    }
+    login.message = Some("Callback received; waiting for the worker to complete the Pi token exchange.".into());
+    Ok(Json(login.clone()))
+}
+
+/// Worker poll for Host-relayed OAuth callback input. Consume-once: a stored
+/// paste is returned exactly once, then cleared, so a retried poll cannot
+/// replay a single-use authorization code.
+async fn claim_worker_oauth_login_input(
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let mut logins = state.oauth_login_states.lock().await;
+    let login = logins.get_mut(&id).ok_or((StatusCode::NOT_FOUND, "OAuth login not found".into()))?;
+    if login.id != request_id { return Err((StatusCode::CONFLICT, "OAuth login request was replaced".into())); }
+    match login.pending_input.take() {
+        Some(input) => Ok(Json(AgentOAuthInputDelivery { input }).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
 }
 
 async fn queue_worker_model_refresh(
@@ -3972,5 +4077,142 @@ mod tests {
         assert_eq!(task_state, "review");
         let (reason, _) = waiting_reason(&db, task_id).await;
         assert_eq!(reason, "reviewer_reserved");
+    }
+
+    async fn seed_oauth_worker(db: &SqlitePool, id: &Uuid, now: &str, cred: &str) {
+        let catalog = serde_json::json!({
+            "model_discovery": true,
+            "providers": [
+                {"id": "openai-codex", "name": "OpenAI Codex", "configured": false, "oauth_label": "OpenAI (ChatGPT Plus/Pro)"},
+                {"id": "key-only", "name": "Key Only", "configured": false, "api_key_label": "API key"},
+                {"id": "bare", "name": "Bare", "configured": false}
+            ],
+            "models": []
+        }).to_string();
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,protocol_version,worker_version,last_heartbeat_at,created_at,allowed_projects,credential_hash,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(id.to_string()).bind("oauth-worker").bind("worker").bind("idle").bind("linux").bind("x86_64")
+            .bind(PROTOCOL_VERSION as i64).bind("test").bind(now).bind(now).bind(r#"["*"]"#).bind(hash_secret(cred)).bind(catalog)
+            .execute(db).await.unwrap();
+    }
+
+    fn oauth_event(kind: &str) -> AgentOAuthEventInput {
+        AgentOAuthEventInput {
+            kind: kind.into(),
+            message: None,
+            verification_uri: None,
+            user_code: None,
+            authorization_url: None,
+            paste_prompt: None,
+            paste_placeholder: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_auth_endpoints_are_capability_gated() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let worker_id = Uuid::new_v4();
+        seed_oauth_worker(&db, &worker_id, &now, "oauth-cred").await;
+        let state = waiting_state(db.clone());
+        // An API-key-only provider has no OAuth capability.
+        let err = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "key-only".into() }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // A provider with neither capability supports neither login.
+        let err = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "bare".into() }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // An OAuth-only provider has no API-key capability.
+        let err = queue_worker_provider_key(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentApiKeyInput { provider: "openai-codex".into(), api_key: "secret".into() }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // Unknown providers are rejected for both logins.
+        let err = queue_worker_provider_key(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentApiKeyInput { provider: "nope".into(), api_key: "secret".into() }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pi_oauth_remote_bridge_exposes_url_and_paste_completion() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let worker_id = Uuid::new_v4();
+        seed_oauth_worker(&db, &worker_id, &now, "oauth-cred").await;
+        let state = waiting_state(db.clone());
+        let Json(login) = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+        ).await.unwrap();
+        assert_eq!(login.status, "queued");
+        assert!(login.message.as_deref().unwrap_or_default().contains("authorization URL"));
+        // The worker claims the queued request; the Host must not claim completion yet.
+        let claimed = claim_worker_oauth_login(Path(worker_id), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        // Pi's real auth_url notify carries the worker's authorization URL.
+        let mut event = oauth_event("auth_url");
+        event.message = Some("A browser window should open. Complete login to finish.".into());
+        event.authorization_url = Some("https://auth.openai.com/oauth/authorize?client_id=x".into());
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(event)).await.unwrap();
+        let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
+        assert_eq!(current.status, "awaiting_authorization");
+        assert_eq!(current.authorization_url.as_deref(), Some("https://auth.openai.com/oauth/authorize?client_id=x"));
+        assert!(current.message.as_deref().unwrap_or_default().contains("browser window should open"));
+        // Pi's manual_code prompt means its worker-local localhost callback
+        // cannot be reached; the Host UI must offer the paste-back relay.
+        let mut waiting = oauth_event("awaiting_input");
+        waiting.message = Some("Complete login in your browser, or paste the authorization code / redirect URL here:".into());
+        waiting.paste_prompt = Some("Complete login in your browser, or paste the authorization code / redirect URL here:".into());
+        waiting.paste_placeholder = Some("http://localhost:1455/auth/callback".into());
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(waiting)).await.unwrap();
+        let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
+        assert_eq!(current.status, "awaiting_callback");
+        assert!(current.paste_prompt.as_deref().unwrap_or_default().contains("paste the authorization code"));
+        // The Host relay accepts the pasted localhost redirect without
+        // leaking the single-use code into the UI response.
+        let Json(updated) = submit_worker_oauth_login_input(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthInputSubmit { input: "http://localhost:1455/auth/callback?code=abc&state=xyz".into() }),
+        ).await.unwrap();
+        assert_eq!(updated.status, "awaiting_callback");
+        let raw = serde_json::to_value(&updated).unwrap();
+        assert!(raw.get("pending_input").is_none(), "pasted code must never serialize to Host UI");
+        assert!(!raw.to_string().contains("code=abc"), "pasted code must never leak into UI responses");
+        // The worker consumes the paste exactly once; replays see nothing.
+        let first = claim_worker_oauth_login_input(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+        let delivery: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(delivery.get("input").and_then(|v| v.as_str()), Some("http://localhost:1455/auth/callback?code=abc&state=xyz"));
+        let second = claim_worker_oauth_login_input(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::NO_CONTENT);
+        // A replaced login request cannot consume another request's paste.
+        let err = claim_worker_oauth_login_input(Path((worker_id, Uuid::new_v4())), State(state.clone()), worker_headers("oauth-cred")).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        // Completion keeps working and reports worker-local storage only.
+        let mut done = oauth_event("complete");
+        done.message = Some("Pi stored the OAuth credential in this worker's isolated auth store.".into());
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(done)).await.unwrap();
+        let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
+        assert_eq!(current.status, "complete");
+        let raw = serde_json::to_value(&current).unwrap().to_string();
+        assert!(!raw.contains("access"), "no OAuth tokens in Host UI state");
+        assert!(!raw.contains("refresh"), "no OAuth tokens in Host UI state");
+        // Unknown event kinds are rejected with an actionable error.
+        let err = report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(oauth_event("bogus"))).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }

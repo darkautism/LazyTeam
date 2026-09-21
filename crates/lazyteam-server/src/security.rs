@@ -265,7 +265,23 @@ fn host_allowed(host: &str, allowed: &[String]) -> bool {
     })
 }
 
+fn is_oauth_worker_path(path: &str) -> bool {
+    // Worker-claimed Pi OAuth traffic:
+    //   /api/workers/{id}/oauth-login/claim
+    //   /api/workers/{id}/oauth-login/{request_id}/event
+    //   /api/workers/{id}/oauth-login/{request_id}/input (worker polls the
+    //   Host-relayed localhost-callback paste; consume-once).
+    // The Host paste-submit endpoint (/api/workers/{id}/oauth-login/input)
+    // must stay admin-only, so it is deliberately not matched here.
+    let Some(rest) = path.strip_prefix("/api/workers/") else { return false; };
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() == 3 && parts[1] == "oauth-login" && parts[2] == "claim" { return true; }
+    if parts.len() == 4 && parts[1] == "oauth-login" && (parts[3] == "event" || parts[3] == "input") { return true; }
+    false
+}
+
 fn is_worker_runtime_path(path: &str) -> bool {
+    if is_oauth_worker_path(path) { return true; }
     (path.starts_with("/api/workers/")
         && (path.ends_with("/heartbeat")
             || path.ends_with("/claim")
@@ -520,6 +536,19 @@ mod tests {
             assert!(!is_public_ip(raw.parse().unwrap()), "{raw} must be rejected");
         }
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn pi_oauth_worker_paths_bypass_admin_but_host_relay_stays_admin() {
+        // Worker-claimed Pi OAuth traffic authenticates per-worker in the
+        // handlers: claim, event reports, and consume-once callback-input
+        // polls must not require the admin token.
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/claim"));
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/event"));
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/input"));
+        // The Host paste-submit endpoint stays admin-gated by middleware.
+        assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/input"));
+        assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login"));
     }
 
     #[test]

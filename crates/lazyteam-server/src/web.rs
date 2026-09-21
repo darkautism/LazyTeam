@@ -289,4 +289,53 @@ mod tests {
         // Insights evidence drill-down renders the same waiting diagnostic.
         assert!(INDEX.contains("h.waiting"));
     }
+
+    #[test]
+    fn settings_edits_survive_background_refresh() {
+        // Local draft/dirty boundary: polling refresh must not replace
+        // unsaved Review loop inputs; initial load and successful save
+        // resynchronize, while save errors preserve the draft.
+        assert!(INDEX.contains("settingsDraftDirty"));
+        assert!(INDEX.contains("markSettingsDirty()"));
+        assert!(INDEX.contains("if(!settingsDraftDirty)"));
+        assert!(INDEX.contains("settingsDraftDirty=false"));
+        assert!(INDEX.contains("oninput=\"markSettingsDirty()\""));
+    }
+
+    #[test]
+    fn provider_auth_controls_are_capability_driven() {
+        // No api_key_label capability means no API-key input/button or
+        // unavailable placeholder; no oauth_label means no OAuth
+        // button/progress block. Controls derive from worker-reported Pi
+        // provider capabilities only.
+        assert!(INDEX.contains("hasKey=!!p.api_key_label"));
+        assert!(INDEX.contains("hasOAuth=!!p.oauth_label"));
+        assert!(INDEX.contains("key.classList.toggle('hidden',!hasKey)"));
+        assert!(INDEX.contains("save.classList.toggle('hidden',!hasKey)"));
+        assert!(INDEX.contains("oauth.classList.toggle('hidden',!hasOAuth)"));
+        assert!(INDEX.contains("flow.classList.toggle('hidden',!hasOAuth)"));
+        assert!(!INDEX.contains("API-key login is not available for this provider"));
+        assert!(INDEX.contains("/oauth-login/input"));
+    }
+
+    #[test]
+    fn remote_oauth_url_and_paste_completion_are_surfaced() {
+        // Pi's browser OAuth redirects to worker-local localhost, so the
+        // Host UI must surface the real authorization URL in a copyable
+        // bar plus a paste-back relay for the final redirect URL/code.
+        // Progress text tracks the actual remote step, never claims that
+        // invoking Pi completed login.
+        assert!(INDEX.contains("authorization_url"));
+        assert!(INDEX.contains("worker-oauth-url"));
+        assert!(INDEX.contains("copyOAuthUrl"));
+        assert!(INDEX.contains("submitOAuthPaste"));
+        assert!(INDEX.contains("worker-oauth-paste"));
+        assert!(INDEX.contains("awaiting_callback"));
+        assert!(INDEX.contains("awaiting_authorization"));
+        assert!(INDEX.contains("oauthStatusLabel"));
+        assert!(INDEX.contains("Waiting for authorization"));
+        assert!(INDEX.contains("Waiting for callback"));
+        assert!(INDEX.contains("isolated Pi auth store"));
+        assert!(!INDEX.contains("Pi OAuth login started on worker."));
+    }
 }
