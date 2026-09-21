@@ -638,7 +638,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::path::PathBuf::from("/tmp/lazyteam-mcp-test-git"),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
         });
         LazyTeamMcp::new(state)
     }

@@ -47,12 +47,40 @@ pub(crate) struct AppState {
     pub(crate) git_root: PathBuf,
     pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, PendingAgentAuth>>>,
     pub(crate) model_refresh_requests: Arc<Mutex<HashMap<Uuid, String>>>,
+    pub(crate) oauth_login_states: Arc<Mutex<HashMap<Uuid, AgentOAuthLoginState>>>,
 }
 
 pub(crate) struct PendingAgentAuth {
     id: Uuid,
     provider: String,
     api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AgentOAuthLoginState {
+    id: Uuid,
+    provider: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentOAuthStartInput { provider: String }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentOAuthClaim { id: Uuid, provider: String }
+
+#[derive(Debug, Deserialize)]
+struct AgentOAuthEventInput {
+    kind: String,
+    #[serde(default)] message: Option<String>,
+    #[serde(default)] verification_uri: Option<String>,
+    #[serde(default)] user_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -542,6 +570,9 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/config", get(worker_runtime_config))
         .route("/api/workers/{id}/provider-key", post(queue_worker_provider_key))
         .route("/api/workers/{id}/agent-auth", get(worker_agent_auth))
+        .route("/api/workers/{id}/oauth-login", get(worker_oauth_login_state).post(start_worker_oauth_login))
+        .route("/api/workers/{id}/oauth-login/claim", get(claim_worker_oauth_login))
+        .route("/api/workers/{id}/oauth-login/{request_id}/event", post(report_worker_oauth_login_event))
         .route("/api/workers/{id}/models/refresh", post(queue_worker_model_refresh))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
@@ -1210,6 +1241,90 @@ async fn worker_agent_auth(
         }).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+fn bounded_oauth_text(value: Option<String>, max: usize) -> Option<String> {
+    value.map(|value| value.chars().take(max).collect::<String>()).filter(|value| !value.trim().is_empty())
+}
+
+async fn start_worker_oauth_login(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<AgentOAuthStartInput>,
+) -> ApiResult<AgentOAuthLoginState> {
+    let provider = input.provider.trim();
+    if provider.is_empty() { return Err((StatusCode::BAD_REQUEST, "provider is required".into())); }
+    let row = sqlx::query("SELECT * FROM workers WHERE id=?")
+        .bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
+        .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
+    let worker = worker_from_row(&row)?;
+    let candidate = worker.agent_capabilities.providers.iter()
+        .find(|candidate| candidate.id == provider)
+        .ok_or((StatusCode::BAD_REQUEST, "provider is not reported by this worker's Pi runtime".into()))?;
+    if candidate.oauth_label.is_none() {
+        return Err((StatusCode::BAD_REQUEST, "this provider does not expose OAuth authentication in Pi".into()));
+    }
+    let login = AgentOAuthLoginState {
+        id: Uuid::new_v4(), provider: provider.to_string(), status: "queued".into(),
+        message: Some("Waiting for the worker to start Pi OAuth.".into()), verification_uri: None, user_code: None,
+    };
+    state.oauth_login_states.lock().await.insert(id, login.clone());
+    Ok(Json(login))
+}
+
+async fn worker_oauth_login_state(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ApiError> {
+    match state.oauth_login_states.lock().await.get(&id).cloned() {
+        Some(login) => Ok(Json(login).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+async fn claim_worker_oauth_login(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let mut logins = state.oauth_login_states.lock().await;
+    let Some(login) = logins.get_mut(&id) else { return Ok(StatusCode::NO_CONTENT.into_response()); };
+    if login.status != "queued" { return Ok(StatusCode::NO_CONTENT.into_response()); }
+    login.status = "running".into();
+    login.message = Some("Pi OAuth login started on worker.".into());
+    Ok(Json(AgentOAuthClaim { id: login.id, provider: login.provider.clone() }).into_response())
+}
+
+async fn report_worker_oauth_login_event(
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<AgentOAuthEventInput>,
+) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let mut logins = state.oauth_login_states.lock().await;
+    let login = logins.get_mut(&id).ok_or((StatusCode::NOT_FOUND, "OAuth login not found".into()))?;
+    if login.id != request_id { return Err((StatusCode::CONFLICT, "OAuth login request was replaced".into())); }
+    match input.kind.as_str() {
+        "device_code" => {
+            login.status = "waiting_user".into();
+            login.message = bounded_oauth_text(input.message, 512).or(Some("Complete the device-code sign-in.".into()));
+            login.verification_uri = bounded_oauth_text(input.verification_uri, 2048);
+            login.user_code = bounded_oauth_text(input.user_code, 128);
+        }
+        "progress" | "info" => login.message = bounded_oauth_text(input.message, 512),
+        "complete" => {
+            login.status = "complete".into();
+            login.message = bounded_oauth_text(input.message, 512).or(Some("OAuth login completed.".into()));
+        }
+        "failed" => {
+            login.status = "failed".into();
+            login.message = bounded_oauth_text(input.message, 1024).or(Some("OAuth login failed.".into()));
+        }
+        _ => return Err((StatusCode::BAD_REQUEST, "unknown OAuth login event kind".into())),
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn queue_worker_model_refresh(
@@ -2649,7 +2764,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
         });
         let Json(saved) = update_host_settings(
             State(state.clone()),
@@ -2682,7 +2797,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
         });
         let input = CreateTask {
             project_id,
@@ -2786,7 +2901,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
         });
         let worker_id = Uuid::new_v4();
         let input = || RegisterWorker {
@@ -2960,7 +3075,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
         });
         let board = task_board(State(state)).await.unwrap().0;
         assert_eq!(board.len(), 1);
@@ -3029,7 +3144,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
         });
         let task_uuid = Uuid::parse_str(&task_id).unwrap();
         // Before republish, lifetime history exceeds the limit.
@@ -3159,7 +3274,7 @@ mod tests {
         assert!(feedback.contains("limit 3"), "feedback: {feedback}");
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=?").bind(&task_id).fetch_one(&db).await.unwrap();
         assert_eq!(total, 3);
-        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() });
         let task_uuid = Uuid::parse_str(&task_id).unwrap();
         let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
         assert_eq!(status.current_cycle_reviewer_retries, 0);
@@ -3268,7 +3383,7 @@ mod tests {
             .bind("failed").bind(&now).bind(&now).bind(r#"{"error":"runner crashed"}"#)
             .bind("upstream-pinned").bind("integration-pinned").bind("diff-hash")
             .execute(&db).await.unwrap();
-        let state = Arc::new(AppState { db, public_url: Some("https://example.com".into()), oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
+        let state = Arc::new(AppState { db, public_url: Some("https://example.com".into()), oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() });
         let headers = || {
             let mut h = HeaderMap::new();
             h.insert("x-lazyteam-worker-credential", reviewer_cred.parse().unwrap());
@@ -3343,7 +3458,7 @@ mod tests {
             .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
             .bind("lost").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
-        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() });
         let task_uuid = Uuid::parse_str(&task_id).unwrap();
         let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
         assert_eq!(status.completed_reviews, 2);
@@ -3413,7 +3528,7 @@ mod tests {
             .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&latest_execution).bind(&reviewer_id)
             .bind("lost").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
-        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() });
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() });
         let task_uuid = Uuid::parse_str(&task_id).unwrap();
         let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
         assert_eq!(status.completed_reviews, 2);
@@ -3434,7 +3549,7 @@ mod tests {
     }
 
     fn waiting_state(db: SqlitePool) -> Arc<AppState> {
-        Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default() })
+        Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() })
     }
 
     async fn seed_backend_ready_worker(db: &SqlitePool, id: &str, name: &str, role: &str, now: &str, cred: Option<&str>) {

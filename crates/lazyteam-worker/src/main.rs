@@ -5,9 +5,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
 use lazyteam_core::{can_claim_work, host_agent_selection_ready, AgentCapabilities, AgentConfig, AgentRole, Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict, LEASE_CAPABILITY_HEADER};
 use reqwest::{Client, RequestBuilder, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::{process::Command, task::JoinSet, time::{sleep, Instant}};
+use tokio::{io::{AsyncBufReadExt, BufReader}, process::Command, task::JoinSet, time::{sleep, Instant}};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -89,6 +89,24 @@ struct AgentAuthDelivery {
     id: Uuid,
     provider: String,
     api_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentOAuthClaim { id: Uuid, provider: String }
+
+#[derive(Debug, Serialize)]
+struct AgentOAuthEventReport {
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")] message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] verification_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] user_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PiOAuthWireEvent {
+    kind: String,
+    #[serde(default)] event: Option<serde_json::Value>,
+    #[serde(default)] message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +358,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
     let mut next_capability_probe = Instant::now() + Duration::from_secs(60);
     let mut active_jobs = JoinSet::<anyhow::Result<()>>::new();
+    let mut oauth_job: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
     let session_manager = SessionManager::new(&args.state_dir);
 
     loop {
@@ -348,6 +367,50 @@ async fn async_main() -> anyhow::Result<()> {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => error!(%error, "slot execution failed"),
                 Err(error) => error!(%error, "slot task panicked or was cancelled"),
+            }
+        }
+        if oauth_job.as_ref().is_some_and(|job| job.is_finished()) {
+            let job = oauth_job.take().expect("OAuth job was checked above");
+            match job.await {
+                Ok(Ok(())) => info!("Pi OAuth login completed"),
+                Ok(Err(error)) => warn!(%error, "Pi OAuth login failed"),
+                Err(error) => warn!(%error, "Pi OAuth login task panicked or was cancelled"),
+            }
+            agent_capabilities = probe_runtime.capabilities().await;
+            let _ = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await;
+            next_capability_probe = Instant::now() + Duration::from_secs(60);
+        }
+        if oauth_job.is_none() {
+            match claim_oauth_login(&client, &server, &worker_credential, worker_id).await {
+                Ok(Some(claim)) => {
+                    let oauth_client = client.clone();
+                    let oauth_server = server.clone();
+                    let oauth_credential = worker_credential.clone();
+                    let oauth_runtime = probe_runtime.clone();
+                    let oauth_request = claim.id;
+                    info!(provider = %claim.provider, oauth_request = %oauth_request, "claimed Pi OAuth login request");
+                    oauth_job = Some(tokio::spawn(async move {
+                        let result = execute_oauth_login(
+                            &oauth_client,
+                            &oauth_server,
+                            &oauth_credential,
+                            worker_id,
+                            oauth_runtime,
+                            claim,
+                        ).await;
+                        if let Err(error) = &result {
+                            let report = AgentOAuthEventReport {
+                                kind: "failed".into(), message: Some(error.to_string()), verification_uri: None, user_code: None,
+                            };
+                            let _ = report_oauth_event(
+                                &oauth_client, &oauth_server, &oauth_credential, worker_id, oauth_request, &report,
+                            ).await;
+                        }
+                        result
+                    }));
+                }
+                Ok(None) => {}
+                Err(error) => warn!(%error, "Pi OAuth login poll failed"),
             }
         }
         if let Err(error) = heartbeat(&client, &server, &worker_credential, worker_id).await {
@@ -792,6 +855,138 @@ async fn poll_agent_auth(client: &Client, server: &str, credential: &str, worker
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/agent-auth")), credential).send().await?;
     if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
     Ok(Some(ensure_success(response).await?.json().await?))
+}
+
+async fn claim_oauth_login(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<Option<AgentOAuthClaim>> {
+    let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/oauth-login/claim")), credential).send().await?;
+    if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
+    Ok(Some(ensure_success(response).await?.json().await?))
+}
+
+async fn report_oauth_event(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    request_id: Uuid,
+    event: &AgentOAuthEventReport,
+) -> anyhow::Result<()> {
+    let response = worker_auth(
+        client.post(format!("{server}/api/workers/{worker_id}/oauth-login/{request_id}/event")),
+        credential,
+    ).json(event).send().await?;
+    ensure_success(response).await?;
+    Ok(())
+}
+
+async fn execute_oauth_login(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    runtime: PiRuntime,
+    claim: AgentOAuthClaim,
+) -> anyhow::Result<()> {
+    let index = runtime.pi_module_index()?;
+    let import_url = serde_json::to_string(&format!("file://{}", index.display()))?;
+    let provider_json = serde_json::to_string(&claim.provider)?;
+    let script = format!(r#"import {{ ModelRuntime }} from {import_url};
+const dir=process.env.PI_CODING_AGENT_DIR;
+const provider={provider_json};
+const rt=await ModelRuntime.create({{
+  authPath:dir+"/auth.json",
+  modelsPath:dir+"/models.json",
+  modelsStorePath:dir+"/models-store.json",
+  allowModelNetwork:false,
+  refreshOnCreate:false
+}});
+const interaction={{
+  prompt: async (prompt) => {{
+    if (prompt.type === "select") {{
+      const option=(prompt.options||[]).find((item)=>item.id==="device_code") || (prompt.options||[])[0];
+      if (!option) throw new Error("OAuth provider offered an empty selection prompt");
+      return option.id;
+    }}
+    throw new Error(`remote OAuth prompt ${{prompt.type}} is unsupported; use a device-code capable provider`);
+  }},
+  notify: (event) => console.log(JSON.stringify({{kind:"event",event}}))
+}};
+try {{
+  await rt.login(provider,"oauth",interaction);
+  console.log(JSON.stringify({{kind:"complete"}}));
+}} catch (error) {{
+  console.log(JSON.stringify({{kind:"failed",message:error instanceof Error?error.message:String(error)}}));
+  process.exitCode=1;
+}}
+"#);
+
+    let mut command = runtime.sandbox.command("node", runtime.sandbox.probe_workspace(), None)?;
+    command.arg("--input-type=module").arg("--eval").arg(script);
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().context("start Pi OAuth helper")?;
+    let stdout = child.stdout.take().context("Pi OAuth helper stdout missing")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let mut completed = false;
+    let mut failed_reported = false;
+    while let Some(line) = lines.next_line().await? {
+        let Ok(wire) = serde_json::from_str::<PiOAuthWireEvent>(&line) else {
+            tracing::debug!(raw = %line, "ignoring non-json Pi OAuth helper output");
+            continue;
+        };
+        let report = match wire.kind.as_str() {
+            "event" => {
+                let Some(event) = wire.event.as_ref() else { continue; };
+                match event.get("type").and_then(serde_json::Value::as_str) {
+                    Some("device_code") => AgentOAuthEventReport {
+                        kind: "device_code".into(),
+                        message: Some("Open the verification page and enter the device code.".into()),
+                        verification_uri: event.get("verificationUri").and_then(serde_json::Value::as_str).map(str::to_string),
+                        user_code: event.get("userCode").and_then(serde_json::Value::as_str).map(str::to_string),
+                    },
+                    Some("progress") | Some("info") => AgentOAuthEventReport {
+                        kind: event.get("type").and_then(serde_json::Value::as_str).unwrap_or("info").to_string(),
+                        message: event.get("message").and_then(serde_json::Value::as_str).map(str::to_string),
+                        verification_uri: None,
+                        user_code: None,
+                    },
+                    Some("auth_url") => AgentOAuthEventReport {
+                        kind: "device_code".into(),
+                        message: event.get("instructions").and_then(serde_json::Value::as_str).map(str::to_string),
+                        verification_uri: event.get("url").and_then(serde_json::Value::as_str).map(str::to_string),
+                        user_code: None,
+                    },
+                    _ => continue,
+                }
+            }
+            "complete" => {
+                completed = true;
+                AgentOAuthEventReport {
+                    kind: "complete".into(),
+                    message: Some("Pi stored the OAuth credential in this worker's isolated auth store.".into()),
+                    verification_uri: None,
+                    user_code: None,
+                }
+            }
+            "failed" => {
+                failed_reported = true;
+                AgentOAuthEventReport { kind: "failed".into(), message: wire.message, verification_uri: None, user_code: None }
+            }
+            _ => continue,
+        };
+        report_oauth_event(client, server, credential, worker_id, claim.id, &report).await?;
+    }
+    let status = child.wait().await.context("wait for Pi OAuth helper")?;
+    if !status.success() && !failed_reported {
+        let report = AgentOAuthEventReport {
+            kind: "failed".into(), message: Some(format!("Pi OAuth helper exited with {status}")), verification_uri: None, user_code: None,
+        };
+        let _ = report_oauth_event(client, server, credential, worker_id, claim.id, &report).await;
+    }
+    if !completed { anyhow::bail!("Pi OAuth login did not complete successfully"); }
+    runtime.force_refresh_models(&claim.provider).await?;
+    let capabilities = runtime.capabilities().await;
+    report_capabilities(client, server, credential, worker_id, &capabilities).await?;
+    Ok(())
 }
 
 /// Build the slot runtime exclusively from the Host-owned agent selection.

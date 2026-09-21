@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
         git_credential_key,
         git_root,
         agent_auth_updates: Default::default(),
-        model_refresh_requests: Default::default(),
+        model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
     });
 
     let mcp_state = state.clone();
@@ -272,7 +272,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir().join("lazyteam-test-git"),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
         });
         let mcp_state = state.clone();
         let service = StreamableHttpService::new(

@@ -1114,6 +1114,23 @@ export default function lazyteamReviewerMcp(pi) {{
     pi.setActiveTools(["submit_review"]);
   }}
 
+  function forceSubmitReviewChoice(payload) {{
+    if (!terminalOnly || !payload || typeof payload !== "object") return payload;
+    const tools = Array.isArray(payload.tools) ? payload.tools : [];
+    const openaiChat = tools.find((tool) => tool?.function?.name === "submit_review");
+    if (openaiChat) {{
+      return {{ ...payload, tool_choice: {{ type: "function", function: {{ name: "submit_review" }} }} }};
+    }}
+    const named = tools.find((tool) => tool?.name === "submit_review");
+    if (named) {{
+      const choice = Object.prototype.hasOwnProperty.call(named, "input_schema")
+        ? {{ type: "tool", name: "submit_review" }}
+        : {{ type: "function", name: "submit_review" }};
+      return {{ ...payload, tool_choice: choice }};
+    }}
+    return payload;
+  }}
+
   pi.registerTool({{
     name: "submit_review",
     label: "Submit review",
@@ -1188,8 +1205,13 @@ export default function lazyteamReviewerMcp(pi) {{
     }};
   }});
 
-  // If the model still refuses to call submit_review, restore the session's
-  // normal tools before the Rust harness records one runtime failure.
+  // Active-tools hides every other tool from the terminal turn. For provider
+  // payloads that expose an explicit tool choice, require submit_review so a
+  // weak reviewer cannot end the terminal turn with prose and zero MCP calls.
+  pi.on("before_provider_request", (event) => forceSubmitReviewChoice(event.payload));
+
+  // Providers without a forceable tool-choice shape retain the existing
+  // bounded failure behavior.
   pi.on("agent_settled", () => restoreTerminalTools());
   pi.on("session_shutdown", () => restoreTerminalTools());
 
@@ -1502,7 +1524,7 @@ impl PiRuntime {
         Ok(AgentRunResult { summary, backend_session_id: None })
     }
 
-    fn pi_module_index(&self) -> anyhow::Result<PathBuf> {
+    pub(crate) fn pi_module_index(&self) -> anyhow::Result<PathBuf> {
         let binary = if Path::new(&self.binary).components().count() > 1 {
             PathBuf::from(&self.binary)
         } else {
@@ -1729,6 +1751,9 @@ mod tests {
         assert!(source.contains("pi.on(\"before_agent_start\""));
         assert!(source.contains("event.prompt !== terminalPrompt"));
         assert!(source.contains("pi.setActiveTools([\"submit_review\"])"));
+        assert!(source.contains("pi.on(\"before_provider_request\""));
+        assert!(source.contains("tool_choice"));
+        assert!(source.contains("function: { name: \"submit_review\" }"));
         assert!(source.contains("pi.on(\"agent_settled\""));
         assert!(source.contains("terminalPreviousTools"));
         assert!(source.contains("LAZYTEAM_REVIEW_TERMINAL_ONLY"));

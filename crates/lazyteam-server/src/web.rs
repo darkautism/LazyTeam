@@ -130,6 +130,9 @@ mod tests {
         assert!(INDEX.contains("worker-agent-status"));
         assert!(INDEX.contains("worker-config-prompt"));
         assert!(INDEX.contains("worker-provider-auth"));
+        assert!(INDEX.contains("worker-provider-oauth"));
+        assert!(INDEX.contains("startProviderOAuth"));
+        assert!(INDEX.contains("/oauth-login"));
         assert!(INDEX.contains("renderProviderAuth"));
         assert!(INDEX.contains("worker-model-refresh"));
         assert!(INDEX.contains("refreshProviderModels"));
