@@ -165,17 +165,24 @@ struct ReviewerMcp {
 
 impl ReviewerMcp {
     fn tool() -> Tool {
-        // Keep transport-level schema permissive so every harness forwards an
-        // attempted submission to this Rust-owned slot. Semantic validation
-        // below is authoritative and therefore the same 5-attempt budget is
-        // enforced for Pi, OpenCode, and future MCP clients alike.
+        // Publish the common argument shapes explicitly so weaker models can
+        // construct the call correctly. Rust validation remains authoritative;
+        // harmless extra fields are ignored and validation may be one string or
+        // an array so formatting noise does not consume the lease retry budget.
         let schema = json!({
             "type": "object",
             "additionalProperties": true,
+            "required": ["verdict", "reason"],
             "properties": {
-                "verdict": {"description": "Required: approve or retry"},
-                "reason": {"description": "Required non-empty review reason"},
-                "validation": {"description": "Required array of validation evidence strings"}
+                "verdict": {"type": "string", "enum": ["approve", "retry"], "description": "approve or retry"},
+                "reason": {"type": "string", "minLength": 1, "maxLength": MAX_REASON_CHARS, "description": "Non-empty review reason"},
+                "validation": {
+                    "description": "Optional validation evidence. Prefer an array of strings; one string is also accepted.",
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string", "maxLength": MAX_VALIDATION_CHARS}, "maxItems": MAX_VALIDATION_ITEMS},
+                        {"type": "string", "maxLength": MAX_VALIDATION_CHARS}
+                    ]
+                }
             }
         });
         Tool::new(
