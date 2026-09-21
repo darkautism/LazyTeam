@@ -292,19 +292,26 @@ mod tests {
 
     #[test]
     fn settings_edits_survive_background_refresh() {
-        // Local draft/dirty boundary with an edit generation: polling
-        // refresh must not replace unsaved Review loop inputs; initial load
-        // and successful save resynchronize, while save errors preserve the
-        // draft. Only a refresh/save response matching the current edit
-        // generation may write the inputs, so a stale in-flight GET cannot
-        // overwrite a just-saved value and edits typed during a save are
-        // never destroyed by that save response.
+        // Local draft/dirty boundary with an edit generation plus a
+        // refresh/save epoch: polling refresh must not replace unsaved
+        // Review loop inputs; initial load and successful save
+        // resynchronize, while save errors preserve the draft. A refresh
+        // writes inputs only when its sequence is still the latest, its
+        // edit generation is current, and no draft is dirty. Save bumps
+        // the epoch both when it starts and when it completes, so a
+        // refresh started before the PATCH and one started during it are
+        // both invalidated even if the edit generation still matches and
+        // dirty was just cleared; edits typed during a save are never
+        // destroyed by that save response.
         assert!(INDEX.contains("settingsDraftDirty"));
         assert!(INDEX.contains("settingsGen"));
+        assert!(INDEX.contains("settingsRefreshSeq"));
         assert!(INDEX.contains("markSettingsDirty()"));
         assert!(INDEX.contains("settingsGen++"));
         assert!(INDEX.contains("const gen=settingsGen"));
+        assert!(INDEX.contains("seq=++settingsRefreshSeq"));
         assert!(INDEX.contains("gen!==settingsGen"));
+        assert!(INDEX.contains("seq!==settingsRefreshSeq"));
         assert!(INDEX.contains("writeSettingsInputs"));
         assert!(INDEX.contains("newer changes still pending"));
         assert!(INDEX.contains("oninput=\"markSettingsDirty()\""));
@@ -331,10 +338,21 @@ mod tests {
         // Pi's browser OAuth redirects to worker-local localhost, so the
         // Host UI must surface the real authorization URL in a copyable
         // bar plus a paste-back relay for the final redirect URL/code.
+        // Sign in pre-opens a blank tab inside the click gesture (popup
+        // blockers allow it) and navigates that tab once to the reported
+        // authorization_url; the visible URL/Open control stays as
+        // fallback. After signing in, the user is told to copy the final
+        // unreachable-localhost address-bar URL back here, as in pi-web.
         // Progress text tracks the actual remote step, never claims that
         // invoking Pi completed login.
         assert!(INDEX.contains("authorization_url"));
         assert!(INDEX.contains("worker-oauth-url"));
+        assert!(INDEX.contains("window.open('about:blank','_blank')"));
+        assert!(INDEX.contains("oauthAuthTab"));
+        assert!(INDEX.contains("oauthAuthTabNavigated"));
+        assert!(INDEX.contains("navigateOAuthTab"));
+        assert!(INDEX.contains("oauthAuthTab.location.href="));
+        assert!(INDEX.contains("unreachable localhost page"));
         assert!(INDEX.contains("copyOAuthUrl"));
         assert!(INDEX.contains("submitOAuthPaste"));
         assert!(INDEX.contains("worker-oauth-paste"));

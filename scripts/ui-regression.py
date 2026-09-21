@@ -163,7 +163,31 @@ def main():
     expect("STATIC_PROVIDERS" not in ui and "STATIC_MODELS" not in ui,
            "UI must not contain mock/static provider or model catalogs")
 
-    # 13. Backend review scheduling/runtime files must be untouched by UI work
+    # 13. OAuth sign-in must pre-open a tab in the click gesture and navigate
+    #     it to the worker-reported authorization URL (pi-web behavior).
+    expect("window.open('about:blank','_blank')" in ui,
+           "Sign in must pre-open a blank tab synchronously to avoid popup blocking")
+    expect("oauthAuthTabNavigated" in ui and "navigateOAuthTab" in ui,
+           "sign-in tab must navigate exactly once when authorization_url arrives")
+    expect("oauthAuthTab.location.href=" in ui,
+           "sign-in tab must navigate to the reported authorization URL")
+    expect("unreachable localhost page" in ui,
+           "paste-back guidance must tell the user to copy the final localhost address-bar URL")
+
+    # 14. Settings polling uses an edit generation plus a refresh/save epoch:
+    #     only the latest refresh whose generation is current and whose draft
+    #     is clean may write the inputs; Save invalidates in-flight
+    #     refreshes both when it starts and when it completes, so a refresh
+    #     started before or during the PATCH can never overwrite just-saved
+    #     values with a stale GET.
+    expect("settingsGen" in ui and "settingsRefreshSeq" in ui,
+           "settings polling must track an edit generation and a refresh/save epoch")
+    expect("seq=++settingsRefreshSeq" in ui and "seq!==settingsRefreshSeq" in ui,
+           "only the latest eligible refresh may write the settings inputs")
+    expect("gen!==settingsGen" in ui and "writeSettingsInputs" in ui,
+           "stale refresh/save responses must not overwrite newer drafts")
+
+    # 15. Backend review scheduling/runtime files must be untouched by UI work
     #     (guarded by task contract; informational only here).
     print("Management UI regression test passed")
 
