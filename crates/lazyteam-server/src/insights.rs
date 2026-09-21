@@ -140,6 +140,10 @@ pub(crate) struct InsightsResponse {
     /// Task `created_at` -> gate completion `created_at` for completions
     /// recorded in window.
     pub(crate) task_completion: DurationSummary,
+    /// Task `created_at` -> first execution `created_at` (first claim), for
+    /// claims recorded in window. Tasks with no execution yet are excluded,
+    /// not counted as zero wait.
+    pub(crate) queue_wait: DurationSummary,
     /// Executions with `created_at` in window ("started in window").
     pub(crate) executions_total: i64,
     pub(crate) executions_completed: CountRate,
@@ -454,6 +458,35 @@ async fn insights(
         }
     }
     let execution_duration = duration_summary(exec_durations);
+
+    // ---- Queue wait: task creation to first claim. ----
+    // First claim is the earliest execution `created_at` per task. Mirrors
+    // execution_duration's windowing: filtered by the claim event timestamp,
+    // not by task creation time, so a task created before the window but
+    // claimed inside it is still counted. Tasks with no execution yet are
+    // excluded, not counted as zero wait.
+    let mut queue_wait_samples: Vec<f64> = Vec::new();
+    if table_exists(db, "executions").await && table_exists(db, "tasks").await {
+        let base = "SELECT t.created_at AS task_created,MIN(e.created_at) AS claimed_at FROM tasks t JOIN executions e ON e.task_id=t.id GROUP BY t.id";
+        let sql = match &cutoff_str {
+            Some(_) => format!("SELECT * FROM ({base}) WHERE claimed_at>=?"),
+            None => base.to_string(),
+        };
+        let mut query = sqlx::query(&sql);
+        if cutoff_str.is_some() {
+            query = query.bind(cutoff_str.clone().unwrap_or_default());
+        }
+        if let Ok(rows) = query.fetch_all(db).await {
+            for row in rows {
+                let task_created: String = row.try_get("task_created").unwrap_or_default();
+                let claimed_at: String = row.try_get("claimed_at").unwrap_or_default();
+                if let (Some(a), Some(b)) = (parse_time(&task_created), parse_time(&claimed_at)) {
+                    queue_wait_samples.push((b - a).num_seconds().max(0) as f64);
+                }
+            }
+        }
+    }
+    let queue_wait = duration_summary(queue_wait_samples);
 
     // Latest execution per task over all history (for current-cycle retries).
     let mut latest_execution: HashMap<String, String> = HashMap::new();
@@ -960,6 +993,7 @@ async fn insights(
         tasks_created,
         tasks_done,
         task_completion,
+        queue_wait,
         executions_total: total,
         executions_completed: count_rate(completed, total),
         executions_failed: count_rate(failed, total),
