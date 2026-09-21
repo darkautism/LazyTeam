@@ -14,7 +14,7 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 lazyteam-core = { path = "../lazyteam-core" }
-oauth = { git = "https://github.com/darkautism/oauth.git", rev = "07c7f8a8cc2e0e1fdf343355590b60990d502657" }
+oauth = { git = "https://github.com/darkautism/oauth.git", rev = "0b8921604bccd49f0de2ecf9454fd774540747bc" }
 rand.workspace = true
 reqwest.workspace = true
 rmcp = { version = "3.4", features = ["server", "transport-streamable-http-server"] }

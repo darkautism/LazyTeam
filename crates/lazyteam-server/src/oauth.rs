@@ -30,7 +30,7 @@ pub async fn state(
     database_path: impl AsRef<Path>,
 ) -> Result<Arc<OAuthState>, ::oauth::StorageError> {
     Ok(Arc::new(
-        OAuthState::open_migrating_legacy(
+        OAuthState::open(
             database_path,
             OAuthConfig {
                 service_name: "LazyTeam".into(),
@@ -42,7 +42,6 @@ pub async fn state(
                 redirect_policy: RedirectPolicy::PublicMcp,
                 client_id_metadata_document_supported: true,
             },
-            &app.db,
         )
         .await?
         .with_external_client_resolver(Arc::new(LazyTeamClientResolver)),
