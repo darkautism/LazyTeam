@@ -928,3 +928,197 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 fn conflict(message: impl Into<String>) -> ApiError {
     (axum::http::StatusCode::CONFLICT, message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{claim_review_for_worker, claim_task_for_worker, ensure_internal_work_actor};
+    use chrono::Utc;
+    use lazyteam_core::{AgentRole, ReviewVerdictKind};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    fn git_ok(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    async fn e2e_state() -> (Arc<AppState>, Uuid, PathBuf) {
+        let root = std::env::temp_dir().join(format!("lazyteam-interactive-sandbox-e2e-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        let upstream = root.join("upstream.git");
+        let git_root = root.join("host-git");
+        tokio::fs::create_dir_all(&source).await.unwrap();
+        tokio::fs::create_dir_all(&git_root).await.unwrap();
+
+        git_ok(&source, &["init", "-q", "-b", "main"]);
+        git_ok(&source, &["config", "user.name", "Test"]);
+        git_ok(&source, &["config", "user.email", "test@example.invalid"]);
+        tokio::fs::write(source.join("README.md"), "hello from base\n").await.unwrap();
+        git_ok(&source, &["add", "README.md"]);
+        git_ok(&source, &["commit", "-q", "-m", "base"]);
+        let clone = std::process::Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(&source)
+            .arg(&upstream)
+            .output()
+            .unwrap();
+        assert!(clone.status.success(), "bare clone failed: {}", String::from_utf8_lossy(&clone.stderr));
+
+        let db = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let state = Arc::new(AppState {
+            db,
+            public_url: Some("http://localhost:8787".into()),
+            oauth_password: None,
+            git_credential_key: None,
+            git_root,
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+            oauth_login_states: Default::default(),
+            interactive_sandboxes: Default::default(),
+        });
+
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,git_auth_mode,contributor_name,contributor_email,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .bind(project_id.to_string())
+            .bind("sandbox-e2e")
+            .bind("Sandbox E2E")
+            .bind(upstream.to_string_lossy().to_string())
+            .bind("main")
+            .bind("host")
+            .bind("LazyTeam Test")
+            .bind("lazyteam-test@example.invalid")
+            .bind(&now)
+            .bind(&now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string())
+            .bind(project_id.to_string())
+            .bind("Edit README through sandbox")
+            .bind("Use the interactive sandbox")
+            .bind("README changes")
+            .bind("queued")
+            .bind(&now)
+            .bind(&now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        (state, task_id, root)
+    }
+
+    #[tokio::test]
+    async fn interactive_sandbox_runs_implementation_and_review_end_to_end() {
+        let (state, task_id, root) = e2e_state().await;
+        let worker = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();
+        let assignment = claim_task_for_worker(&state, worker, Some(task_id))
+            .await.unwrap().expect("implementation claim");
+        let execution_id = assignment.execution.id;
+
+        let sandbox_id = state.interactive_sandboxes
+            .attach_implementation(state.clone(), &assignment).await.unwrap();
+        assert!(state.interactive_sandboxes.contains(sandbox_id).await);
+        assert_eq!(
+            state.interactive_sandboxes.read(&state, sandbox_id, "README.md", None, None).await.unwrap(),
+            "hello from base"
+        );
+
+        state.interactive_sandboxes.edit(
+            &state,
+            sandbox_id,
+            "README.md",
+            &[("hello from base".into(), "hello from sandbox".into())],
+        ).await.unwrap();
+
+        let bash = state.interactive_sandboxes
+            .bash(&state, sandbox_id, Some("git diff -- README.md".into()), None)
+            .await.unwrap();
+        assert_eq!(bash.status, "exited");
+        assert_eq!(bash.exit_code, Some(0));
+        assert!(bash.output.contains("hello from sandbox"));
+
+        state.interactive_sandboxes.finish_implementation(
+            &state,
+            sandbox_id,
+            "changed README".into(),
+            vec!["git diff inspected".into()],
+            vec![],
+            vec![],
+        ).await.unwrap();
+        assert!(!state.interactive_sandboxes.contains(sandbox_id).await);
+
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(task_state, "review");
+
+        let result_json: String = sqlx::query_scalar("SELECT result FROM executions WHERE id=?")
+            .bind(execution_id.to_string()).fetch_one(&state.db).await.unwrap();
+        let result: ExecutionResult = serde_json::from_str(&result_json).unwrap();
+        let candidate = result.commit_sha.clone().expect("candidate SHA");
+        let review_ref = result.review_ref.clone().expect("review ref");
+        assert_eq!(
+            git_stdout(&task_repo_path(&state, execution_id), &["rev-parse", "--verify", &format!("refs/heads/{review_ref}")]),
+            candidate
+        );
+
+        let reviewer = ensure_internal_work_actor(&state, AgentRole::Reviewer).await.unwrap();
+        let review_assignment = claim_review_for_worker(&state, reviewer, Some(task_id))
+            .await.unwrap().expect("review claim");
+        let review_sandbox = state.interactive_sandboxes
+            .attach_review(state.clone(), &review_assignment).await.unwrap();
+        assert_eq!(
+            state.interactive_sandboxes.read(&state, review_sandbox, "README.md", None, None).await.unwrap(),
+            "hello from sandbox"
+        );
+
+        let review_diff = state.interactive_sandboxes
+            .bash(&state, review_sandbox, Some("git diff lazyteam-base..HEAD -- README.md".into()), None)
+            .await.unwrap();
+        assert_eq!(review_diff.exit_code, Some(0));
+        assert!(review_diff.output.contains("hello from sandbox"));
+
+        state.interactive_sandboxes.finish_review(
+            &state,
+            review_sandbox,
+            ReviewVerdict {
+                verdict: ReviewVerdictKind::Approve,
+                reason: "sandbox review passed".into(),
+                validation: vec!["pinned README diff inspected".into()],
+            },
+        ).await.unwrap();
+
+        let final_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(final_state, "merge_pending");
+        assert!(!state.interactive_sandboxes.contains(review_sandbox).await);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+}
