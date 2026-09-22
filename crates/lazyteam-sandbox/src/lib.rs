@@ -485,7 +485,21 @@ pub fn maybe_handle_entrypoint() -> Option<anyhow::Result<()>> {
 
 #[cfg(target_os = "linux")]
 fn sandbox_signal_probe() -> anyhow::Result<()> {
+    let own_pid = unsafe { libc::getpid() };
+    let own_tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+    if unsafe { libc::syscall(libc::SYS_tgkill, own_pid, own_tid, 0) } != 0 {
+        bail!("tgkill(2) self-thread probe was blocked: {}", std::io::Error::last_os_error());
+    }
+
     let parent = unsafe { libc::getppid() };
+    if unsafe { libc::syscall(libc::SYS_tgkill, parent, parent, 0) } == 0 {
+        bail!("tgkill(2) unexpectedly reached parent pid {parent}");
+    }
+    let tgkill_error = std::io::Error::last_os_error();
+    if tgkill_error.raw_os_error() != Some(libc::EPERM) {
+        bail!("tgkill(2) parent probe returned {tgkill_error}, expected EPERM from seccomp");
+    }
+
     if unsafe { libc::kill(parent, 0) } == 0 {
         bail!("kill(2) unexpectedly reached parent pid {parent}");
     }
@@ -1067,7 +1081,10 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn install_seccomp_denylist() -> anyhow::Result<()> {
-    use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+    use seccompiler::{
+        apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+        SeccompCondition, SeccompFilter, SeccompRule,
+    };
     use std::{collections::BTreeMap, convert::TryInto};
 
     let denied = [
@@ -1082,15 +1099,33 @@ fn install_seccomp_denylist() -> anyhow::Result<()> {
         libc::SYS_process_vm_writev,
         libc::SYS_kill,
         libc::SYS_tkill,
-        libc::SYS_tgkill,
         libc::SYS_rt_sigqueueinfo,
         libc::SYS_rt_tgsigqueueinfo,
         libc::SYS_pidfd_send_signal,
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
     ];
-    let rules: BTreeMap<i64, Vec<SeccompRule>> =
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
         denied.into_iter().map(|syscall| (syscall, vec![])).collect();
+
+    // Bun/JSC uses tgkill(tgid=self, tid=worker, SIGPWR) to suspend its own
+    // threads even for trivial commands such as `opencode --version`. Blocking
+    // tgkill unconditionally makes Bun crash before the agent starts. Keep
+    // cross-process signalling blocked while allowing the sandbox root process
+    // to signal threads in its own thread group. Descendants inherit this
+    // filter and may only target the sandbox root tgid, never sibling/Host
+    // processes.
+    let sandbox_tgid = unsafe { libc::getpid() } as u64;
+    rules.insert(
+        libc::SYS_tgkill,
+        vec![SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            sandbox_tgid,
+        )?])?],
+    );
+
     let filter: BpfProgram = SeccompFilter::new(
         rules,
         SeccompAction::Allow,
