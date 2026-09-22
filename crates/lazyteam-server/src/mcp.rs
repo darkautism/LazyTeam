@@ -4,22 +4,20 @@ use axum::{extract::{Path, State}, Json};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerConfig},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use lazyteam_core::{AgentRole, ExecutionResult, ReviewVerdict, ReviewVerdictKind, LEASE_CAPABILITY_HEADER};
+use lazyteam_core::{AgentRole, ReviewVerdict, ReviewVerdictKind};
 
 use crate::{
     api::{
         claim_review_for_worker, claim_task_for_worker, ensure_internal_work_actor,
-        finish_execution_for_capability, finish_review_for_capability,
         release_execution_for_capability, release_review_for_capability,
-        renew_execution_for_capability, renew_review_for_capability,
-        work_lease_kind, WorkLeaseKind,
     },
+    interactive_sandbox::SandboxRole,
     create_project, create_task, delete_task, list_projects, list_tasks, list_workers, review, review_evidence, task_status, AppState,
     CreateProject, CreateTask,
 };
@@ -100,29 +98,56 @@ pub struct WorkPickParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkLeaseParams {
-    pub lease_id: String,
-    pub lease_capability: String,
+pub struct SandboxIdParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadParams {
+    pub sandbox_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WriteParams {
+    pub sandbox_id: String,
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReplaceEdit {
+    #[serde(rename = "oldText")]
+    pub old_text: String,
+    #[serde(rename = "newText")]
+    pub new_text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EditParams {
+    pub sandbox_id: String,
+    pub path: String,
+    pub edits: Vec<ReplaceEdit>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BashParams {
+    pub sandbox_id: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WorkFinishParams {
-    pub lease_id: String,
-    pub lease_capability: String,
-    #[serde(default)]
-    pub status: Option<String>,
+    pub sandbox_id: String,
     #[serde(default)]
     pub summary: Option<String>,
-    #[serde(default)]
-    pub commit_sha: Option<String>,
-    #[serde(default)]
-    pub base_sha: Option<String>,
-    #[serde(default)]
-    pub review_ref: Option<String>,
-    #[serde(default)]
-    pub workspace_clean: Option<bool>,
-    #[serde(default)]
-    pub changed_files: Vec<String>,
     #[serde(default)]
     pub validation: Vec<String>,
     #[serde(default)]
@@ -140,17 +165,14 @@ struct WorkPickOutput {
     picked: bool,
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    lease_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lease_capability: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lease_until: Option<String>,
+    sandbox_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct WorkActionOutput {
+    sandbox_id: String,
     lease_id: String,
     lease_type: String,
     state: String,
@@ -312,7 +334,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "work_pick",
         title = "Pick work",
-        description = "Claim implementation or review work and return its authoritative lease plus complete pinned working context. Broker repository access uses the returned lease_capability as the x-lazyteam-lease-capability HTTP header. With task_id, claim exactly that task or return a conflict; without task_id, use the normal LazyTeam scheduler ordering.",
+        description = "Claim implementation or review work. LazyTeam prepares and attaches an isolated coding sandbox, keeps the authoritative lease alive internally, and returns sandbox_id plus the task context. Use read/write/edit/bash with sandbox_id, then work_finish or work_release.",
         annotations(title = "Pick work", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn work_pick(&self, Parameters(input): Parameters<WorkPickParams>) -> Result<rmcp::Json<WorkPickOutput>, McpError> {
@@ -325,29 +347,22 @@ impl LazyTeamMcp {
                     if task_id.is_some() {
                         return Err(McpError::internal_error("task is not claimable for implementation", Some(serde_json::json!({"http_status": 409}))));
                     }
-                    return Ok(rmcp::Json(WorkPickOutput { picked: false, role: "implementation".into(), lease_id: None, lease_capability: None, lease_until: None, context: None }));
+                    return Ok(rmcp::Json(WorkPickOutput { picked: false, role: "implementation".into(), sandbox_id: None, context: None }));
                 };
-                let lease_id = assignment.execution.id.to_string();
-                let lease_until = assignment.execution.lease_until.to_rfc3339();
-                let capability = assignment.lease_capability.clone();
-                let repo_url = assignment.project.repo_url.clone();
-                let default_branch = assignment.project.default_branch.clone();
-                let review_ref = format!("lazyteam/task-{}", assignment.task.id.simple());
+                let sandbox_id = match self.state.interactive_sandboxes.attach_implementation(self.state.clone(), &assignment).await {
+                    Ok(sandbox_id) => sandbox_id,
+                    Err(error) => {
+                        let _ = release_execution_for_capability(&self.state, assignment.execution.id, &assignment.lease_capability, None).await;
+                        return Err(api_to_mcp(error));
+                    }
+                };
                 let context = serde_json::json!({
                     "project": assignment.project,
                     "task": assignment.task,
                     "execution": assignment.execution,
-                    "checkout": {
-                        "repo_url": repo_url,
-                        "default_branch": default_branch,
-                        "review_ref": review_ref,
-                    },
-                    "repo_access": {
-                        "header_name": LEASE_CAPABILITY_HEADER,
-                        "header_value_source": "lease_capability",
-                    },
+                    "instructions": "Use read/write/edit/bash with sandbox_id. Git publication and lease renewal are Host-owned.",
                 });
-                Ok(rmcp::Json(WorkPickOutput { picked: true, role: "implementation".into(), lease_id: Some(lease_id), lease_capability: Some(capability), lease_until: Some(lease_until), context: Some(context) }))
+                Ok(rmcp::Json(WorkPickOutput { picked: true, role: "implementation".into(), sandbox_id: Some(sandbox_id.to_string()), context: Some(context) }))
             }
             WorkRole::Review => {
                 let actor = ensure_internal_work_actor(&self.state, AgentRole::Reviewer).await.map_err(api_to_mcp)?;
@@ -356,11 +371,15 @@ impl LazyTeamMcp {
                     if task_id.is_some() {
                         return Err(McpError::internal_error("task is not claimable for review", Some(serde_json::json!({"http_status": 409}))));
                     }
-                    return Ok(rmcp::Json(WorkPickOutput { picked: false, role: "review".into(), lease_id: None, lease_capability: None, lease_until: None, context: None }));
+                    return Ok(rmcp::Json(WorkPickOutput { picked: false, role: "review".into(), sandbox_id: None, context: None }));
                 };
-                let lease_id = assignment.review.id.to_string();
-                let lease_until = assignment.review.lease_until.to_rfc3339();
-                let capability = assignment.lease_capability.clone();
+                let sandbox_id = match self.state.interactive_sandboxes.attach_review(self.state.clone(), &assignment).await {
+                    Ok(sandbox_id) => sandbox_id,
+                    Err(error) => {
+                        let _ = release_review_for_capability(&self.state, assignment.review.id, &assignment.lease_capability, None).await;
+                        return Err(api_to_mcp(error));
+                    }
+                };
                 let effective_diff_hash = assignment.execution.result.as_ref()
                     .and_then(|result| result.integration.as_ref())
                     .and_then(|integration| integration.effective_diff_hash.clone());
@@ -374,73 +393,104 @@ impl LazyTeamMcp {
                     "checkout": assignment.checkout,
                     "effective_diff_hash": effective_diff_hash,
                     "review_cycle": review_cycle,
-                    "repo_access": {
-                        "header_name": LEASE_CAPABILITY_HEADER,
-                        "header_value_source": "lease_capability",
-                    },
+                    "instructions": "Inspect the pinned integration using read/write/edit/bash with sandbox_id. Sandbox edits are disposable review notes and never change the candidate.",
                 });
-                Ok(rmcp::Json(WorkPickOutput { picked: true, role: "review".into(), lease_id: Some(lease_id), lease_capability: Some(capability), lease_until: Some(lease_until), context: Some(context) }))
+                Ok(rmcp::Json(WorkPickOutput { picked: true, role: "review".into(), sandbox_id: Some(sandbox_id.to_string()), context: Some(context) }))
             }
         }
     }
 
     #[tool(
-        name = "work_renew",
-        title = "Renew work lease",
-        description = "Extend an active implementation or review lease. The server derives the lease type and owner from the lease id; callers provide only the opaque lease capability.",
-        annotations(title = "Renew work lease", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+        name = "read",
+        title = "Read file",
+        description = "Read a UTF-8 text file inside the attached LazyTeam sandbox. Relative paths resolve from the sandbox workspace. Output is bounded to 2000 lines or 50KB; use offset/limit to continue large files. Every successful access validates and renews the authoritative work lease.",
+        annotations(title = "Read file", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn work_renew(&self, Parameters(input): Parameters<WorkLeaseParams>) -> Result<rmcp::Json<WorkActionOutput>, McpError> {
-        let lease_id = parse_lease_id(&input.lease_id)?;
-        let lease_type = match work_lease_kind(&self.state, lease_id).await.map_err(api_to_mcp)? {
-            WorkLeaseKind::Implementation => {
-                renew_execution_for_capability(&self.state, lease_id, &input.lease_capability, None).await.map_err(api_to_mcp)?;
-                "implementation"
-            }
-            WorkLeaseKind::Review => {
-                renew_review_for_capability(&self.state, lease_id, &input.lease_capability, None).await.map_err(api_to_mcp)?;
-                "review"
-            }
-        };
-        Ok(rmcp::Json(WorkActionOutput { lease_id: lease_id.to_string(), lease_type: lease_type.into(), state: "renewed".into() }))
+    async fn read(&self, Parameters(input): Parameters<ReadParams>) -> Result<CallToolResult, McpError> {
+        let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
+        let text = self.state.interactive_sandboxes
+            .read(&self.state, sandbox_id, &input.path, input.offset, input.limit)
+            .await
+            .map_err(api_to_mcp)?;
+        Ok(text_result(text))
+    }
+
+    #[tool(
+        name = "write",
+        title = "Write file",
+        description = "Write a file inside the attached LazyTeam sandbox. Relative paths resolve from the sandbox workspace; parent directories are created automatically. The sandbox cannot access Host Git credentials or files outside its allowlist.",
+        annotations(title = "Write file", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn write(&self, Parameters(input): Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
+        let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
+        self.state.interactive_sandboxes
+            .write(&self.state, sandbox_id, &input.path, &input.content)
+            .await
+            .map_err(api_to_mcp)?;
+        Ok(text_result(format!("Successfully wrote to {}", input.path)))
+    }
+
+    #[tool(
+        name = "edit",
+        title = "Edit file",
+        description = "Make precise exact-text replacements inside the attached LazyTeam sandbox. Each edits[].oldText must match exactly once in the original file and edits may not overlap.",
+        annotations(title = "Edit file", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn edit(&self, Parameters(input): Parameters<EditParams>) -> Result<CallToolResult, McpError> {
+        let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
+        let edits = input.edits.iter()
+            .map(|edit| (edit.old_text.clone(), edit.new_text.clone()))
+            .collect::<Vec<_>>();
+        self.state.interactive_sandboxes
+            .edit(&self.state, sandbox_id, &input.path, &edits)
+            .await
+            .map_err(api_to_mcp)?;
+        Ok(text_result(format!("Successfully applied {} edit(s) to {}", input.edits.len(), input.path)))
+    }
+
+    #[tool(
+        name = "bash",
+        title = "Run shell command",
+        description = "Run a non-interactive bash command inside the attached LazyTeam sandbox, or attach to a PID returned by an earlier call. Synchronous wait is capped at 10 seconds; longer commands continue in the sandbox and return a PID. Pipes and redirection are supported; interactive TTY programs are not.",
+        annotations(title = "Run shell command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn bash(&self, Parameters(input): Parameters<BashParams>) -> Result<CallToolResult, McpError> {
+        let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
+        let result = self.state.interactive_sandboxes
+            .bash(&self.state, sandbox_id, input.command, input.pid)
+            .await
+            .map_err(api_to_mcp)?;
+        let text = serde_json::to_string_pretty(&result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(text_result(text))
     }
 
     #[tool(
         name = "work_finish",
         title = "Finish work",
-        description = "Finish the active lease. Implementation accepts a completed/failed execution result; review accepts approve/retry plus a non-empty reason. Lease role and ownership are derived from the lease.",
+        description = "Finish the work attached to sandbox_id. For implementation, LazyTeam syncs the sandbox, creates the trusted commit and task ref, then moves the task to review. For review, provide verdict=approve|retry and a non-empty reason. Lease identity, capability, renewal, Git publication, and cleanup are Host-owned.",
         annotations(title = "Finish work", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn work_finish(&self, Parameters(input): Parameters<WorkFinishParams>) -> Result<rmcp::Json<WorkActionOutput>, McpError> {
-        let lease_id = parse_lease_id(&input.lease_id)?;
-        let lease_type = match work_lease_kind(&self.state, lease_id).await.map_err(api_to_mcp)? {
-            WorkLeaseKind::Implementation => {
-                let status = input.status.clone().unwrap_or_else(|| "completed".into());
-                if !matches!(status.as_str(), "completed" | "failed") {
-                    return Err(McpError::invalid_params("implementation status must be completed or failed", None));
+        let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
+        let role = self.state.interactive_sandboxes.role(sandbox_id).await
+            .ok_or_else(|| McpError::invalid_params("sandbox_id is not attached", None))?;
+        let (lease_id, lease_type) = match role {
+            SandboxRole::Implementation => {
+                if input.verdict.is_some() {
+                    return Err(McpError::invalid_params("implementation finish does not accept a review verdict", None));
                 }
-                if status == "completed" && (input.commit_sha.as_deref().unwrap_or_default().is_empty() || input.base_sha.as_deref().unwrap_or_default().is_empty() || input.review_ref.as_deref().unwrap_or_default().is_empty()) {
-                    return Err(McpError::invalid_params("completed implementation requires commit_sha, base_sha, and review_ref", None));
-                }
-                let result = ExecutionResult {
-                    status,
-                    summary: input.summary.clone().unwrap_or_default(),
-                    commit_sha: input.commit_sha.clone(),
-                    base_sha: input.base_sha.clone(),
-                    patch: None,
-                    patch_truncated: false,
-                    workspace_clean: input.workspace_clean,
-                    review_ref: input.review_ref.clone(),
-                    changed_files: input.changed_files.clone(),
-                    validation: input.validation.clone(),
-                    warnings: input.warnings.clone(),
-                    artifacts: input.artifacts.clone(),
-                    integration: None,
-                };
-                finish_execution_for_capability(&self.state, lease_id, &input.lease_capability, result, None).await.map_err(api_to_mcp)?;
-                "implementation"
+                let lease_id = self.state.interactive_sandboxes.finish_implementation(
+                    &self.state,
+                    sandbox_id,
+                    input.summary.clone().unwrap_or_default(),
+                    input.validation.clone(),
+                    input.warnings.clone(),
+                    input.artifacts.clone(),
+                ).await.map_err(api_to_mcp)?;
+                (lease_id, "implementation")
             }
-            WorkLeaseKind::Review => {
+            SandboxRole::Review => {
                 let verdict = input.verdict.ok_or_else(|| McpError::invalid_params("review finish requires verdict=approve|retry", None))?;
                 let reason = input.reason.clone().unwrap_or_default();
                 if reason.trim().is_empty() {
@@ -451,32 +501,29 @@ impl LazyTeamMcp {
                     reason,
                     validation: input.validation.clone(),
                 };
-                finish_review_for_capability(&self.state, lease_id, &input.lease_capability, "completed", Some(verdict), None, None).await.map_err(api_to_mcp)?;
-                "review"
+                let lease_id = self.state.interactive_sandboxes.finish_review(&self.state, sandbox_id, verdict)
+                    .await.map_err(api_to_mcp)?;
+                (lease_id, "review")
             }
         };
-        Ok(rmcp::Json(WorkActionOutput { lease_id: lease_id.to_string(), lease_type: lease_type.into(), state: "finished".into() }))
+        Ok(rmcp::Json(WorkActionOutput { sandbox_id: sandbox_id.to_string(), lease_id: lease_id.to_string(), lease_type: lease_type.into(), state: "finished".into() }))
     }
 
     #[tool(
         name = "work_release",
-        title = "Release work lease",
-        description = "Voluntarily abandon an active implementation or review lease without recording a failure. Implementation returns to queued and its execution repo is cleaned; review remains in review.",
-        annotations(title = "Release work lease", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+        title = "Release work",
+        description = "Voluntarily release the work attached to sandbox_id without recording a failure. Implementation returns to queued; review stays in review. LazyTeam invalidates the lease, stops sandbox processes, and removes the sandbox.",
+        annotations(title = "Release work", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn work_release(&self, Parameters(input): Parameters<WorkLeaseParams>) -> Result<rmcp::Json<WorkActionOutput>, McpError> {
-        let lease_id = parse_lease_id(&input.lease_id)?;
-        let lease_type = match work_lease_kind(&self.state, lease_id).await.map_err(api_to_mcp)? {
-            WorkLeaseKind::Implementation => {
-                release_execution_for_capability(&self.state, lease_id, &input.lease_capability, None).await.map_err(api_to_mcp)?;
-                "implementation"
-            }
-            WorkLeaseKind::Review => {
-                release_review_for_capability(&self.state, lease_id, &input.lease_capability, None).await.map_err(api_to_mcp)?;
-                "review"
-            }
+    async fn work_release(&self, Parameters(input): Parameters<SandboxIdParams>) -> Result<rmcp::Json<WorkActionOutput>, McpError> {
+        let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
+        let (lease_id, kind) = self.state.interactive_sandboxes.release(&self.state, sandbox_id)
+            .await.map_err(api_to_mcp)?;
+        let lease_type = match kind {
+            crate::api::WorkLeaseKind::Implementation => "implementation",
+            crate::api::WorkLeaseKind::Review => "review",
         };
-        Ok(rmcp::Json(WorkActionOutput { lease_id: lease_id.to_string(), lease_type: lease_type.into(), state: "released".into() }))
+        Ok(rmcp::Json(WorkActionOutput { sandbox_id: sandbox_id.to_string(), lease_id: lease_id.to_string(), lease_type: lease_type.into(), state: "released".into() }))
     }
 
     #[tool(
@@ -585,7 +632,8 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam has one authoritative work-ownership model. Use work_pick(role=implementation|review) to acquire an opaque lease and the complete working context; use work_renew while working, work_finish to complete that exact lease, and work_release to abandon it without recording a failure. Broker Git URLs returned by work_pick use the same lease_capability as the x-lazyteam-lease-capability HTTP header. Review work is pinned to one implementation execution plus candidate/base/upstream/integration/effective-diff context; approve moves the task to merge_pending and retry follows the configured review retry policy. No review decision is valid without a review lease. From merge_pending, the main agent may call tasks_merge; Host-only Git credentials publish only the reviewed candidate and revalidate upstream before changing durable task state. Workers never receive upstream Git credentials.".to_string(),
+                "LazyTeam has one authoritative work-ownership model. Use work_pick(role=implementation|review) to claim work and receive sandbox_id. Then use the four PC-style tools read, write, edit, and bash with that sandbox_id. LazyTeam owns lease renewal, Git credentials, trusted commit/ref publication, process cleanup, and sandbox teardown. Finish with work_finish(sandbox_id, ...), or voluntarily return work with work_release(sandbox_id) without counting a failure. Review sandboxes are pinned to the exact reviewed integration; sandbox edits during review are disposable and cannot change the candidate. An approve verdict moves the task to merge_pending; the main agent may then call tasks_merge.".to_string(),
+
             )
     }
 }
@@ -595,9 +643,13 @@ fn parse_task_id(raw: &str) -> Result<Uuid, McpError> {
         .map_err(|e| McpError::invalid_params("invalid task_id", Some(serde_json::json!({"error": e.to_string()}))))
 }
 
-fn parse_lease_id(raw: &str) -> Result<Uuid, McpError> {
+fn parse_sandbox_id(raw: &str) -> Result<Uuid, McpError> {
     Uuid::parse_str(raw)
-        .map_err(|e| McpError::invalid_params("invalid lease_id", Some(serde_json::json!({"error": e.to_string()}))))
+        .map_err(|e| McpError::invalid_params("invalid sandbox_id", Some(serde_json::json!({"error": e.to_string()}))))
+}
+
+fn text_result(text: impl Into<String>) -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(text.into())])
 }
 
 fn api_to_mcp((status, message): crate::ApiError) -> McpError {
@@ -624,7 +676,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::path::PathBuf::from("/tmp/lazyteam-mcp-test-git"),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         LazyTeamMcp::new(state)
     }
@@ -649,7 +701,7 @@ mod tests {
             "projects_list", "projects_create",
             "tasks_list", "tasks_get", "tasks_create", "tasks_delete",
             "workers_list",
-            "work_pick", "work_renew", "work_finish", "work_release",
+            "work_pick", "read", "write", "edit", "bash", "work_finish", "work_release",
             "tasks_merge",
         ];
         let mut actual = mcp.tool_router.list_all().into_iter().map(|tool| tool.name.to_string()).collect::<Vec<_>>();
@@ -660,18 +712,20 @@ mod tests {
         for legacy in ["reviews_get", "reviews_show", "reviews_grep", "reviews_diff", "reviews_decide", "tasks_retry", "tasks_confirm_merge", "workers_retire"] {
             assert!(mcp.tool_router.get(legacy).is_none(), "legacy MCP tool {legacy} must not remain registered");
         }
+        assert!(mcp.tool_router.get("work_renew").is_none(), "lease renewal must be internal");
         let pick = mcp.tool_router.get("work_pick").expect("work_pick must be registered");
         let description = pick.description.as_deref().unwrap_or_default();
-        assert!(description.contains(LEASE_CAPABILITY_HEADER), "work_pick must document broker lease header: {description}");
+        assert!(description.contains("sandbox_id"), "work_pick must advertise sandbox attachment: {description}");
     }
 
     #[tokio::test]
     async fn server_instructions_describe_single_work_lifecycle() {
         let mcp = test_mcp();
         let instructions = mcp.get_info().instructions.unwrap_or_default();
-        for name in ["work_pick", "work_renew", "work_finish", "work_release", "tasks_merge"] {
+        for name in ["work_pick", "read", "write", "edit", "bash", "work_finish", "work_release", "tasks_merge"] {
             assert!(instructions.contains(name), "server instructions must mention {name}: {instructions}");
         }
+        assert!(!instructions.contains("work_renew"));
         assert!(!instructions.contains("reviews_decide"));
         assert!(!instructions.contains("tasks_retry"));
     }

@@ -2,6 +2,7 @@
 members = [
   "crates/lazyteam-core",
   "crates/lazyteam-server",
+  "crates/lazyteam-sandbox",
   "crates/lazyteam-worker",
 ]
 resolver = "2"

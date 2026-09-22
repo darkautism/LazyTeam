@@ -21,6 +21,7 @@ mod cimd;
 mod git_broker;
 mod git_credentials;
 mod insights;
+mod interactive_sandbox;
 mod mcp;
 mod oauth;
 mod review;
@@ -64,6 +65,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(result) = lazyteam_sandbox::maybe_handle_entrypoint() {
+        return result;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -153,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
         git_credential_key,
         git_root,
         agent_auth_updates: Default::default(),
-        model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+        model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
     });
     let oauth_state = oauth::state(&state, &args.oauth_database)
         .await
@@ -277,7 +281,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir().join("lazyteam-test-git"),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         let mcp_state = state.clone();
         let service = StreamableHttpService::new(

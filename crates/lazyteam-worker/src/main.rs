@@ -13,11 +13,10 @@ use uuid::Uuid;
 
 mod review_mcp;
 mod runtime;
-mod sandbox;
 mod session;
 use review_mcp::ReviewSlot;
 use runtime::{AgentRunResult, AgentRuntime, PiRuntime};
-use sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
+use lazyteam_sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
 use session::{AgentSession, SessionLock, SessionManager, SessionRole};
 
 const WORKER_CREDENTIAL_HEADER: &str = "x-lazyteam-worker-credential";
@@ -205,11 +204,11 @@ fn main() -> anyhow::Result<()> {
     // Container workers enter their daemon user namespace before Tokio creates threads.
     // The daemon is uid 0 only inside that namespace; uid 0 maps to the configured
     // unprivileged container identity (normally 10001) outside it.
-    sandbox::maybe_enter_daemon_user_namespace()?;
+    lazyteam_sandbox::maybe_enter_daemon_user_namespace()?;
 
     // The sandbox self-exec path must run before Tokio creates worker threads.  Linux user
     // namespaces reject unshare(CLONE_NEWUSER) from a multithreaded process on some kernels.
-    if let Some(result) = sandbox::maybe_handle_entrypoint() {
+    if let Some(result) = lazyteam_sandbox::maybe_handle_entrypoint() {
         return result;
     }
     tokio::runtime::Builder::new_multi_thread()

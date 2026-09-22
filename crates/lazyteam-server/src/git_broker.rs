@@ -1187,7 +1187,7 @@ mod tests {
             git_root: root.clone(),
             agent_auth_updates: Default::default(),
             model_refresh_requests: Default::default(),
-            oauth_login_states: Default::default(),
+            oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
 
         let auth = HostGitAuth::prepare(
@@ -1267,7 +1267,7 @@ mod tests {
             git_credential_key: None,
             git_root: git_root.clone(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         let now = chrono::Utc::now().to_rfc3339();
         let project_id = Uuid::new_v4();
@@ -1434,7 +1434,7 @@ mod tests {
             git_credential_key: None,
             git_root: root.join("git"),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         let now = chrono::Utc::now().to_rfc3339();
         let project_id = Uuid::new_v4();

@@ -49,6 +49,7 @@ pub(crate) struct AppState {
     pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, PendingAgentAuth>>>,
     pub(crate) model_refresh_requests: Arc<Mutex<HashMap<Uuid, String>>>,
     pub(crate) oauth_login_states: Arc<Mutex<HashMap<Uuid, AgentOAuthLoginState>>>,
+    pub(crate) interactive_sandboxes: crate::interactive_sandbox::InteractiveSandboxManager,
 }
 
 pub(crate) struct PendingAgentAuth {
@@ -3090,7 +3091,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         let Json(saved) = update_host_settings(
             State(state.clone()),
@@ -3123,7 +3124,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         let input = CreateTask {
             project_id,
@@ -3228,7 +3229,7 @@ mod tests {
             git_root: std::env::temp_dir().join(format!("lazyteam-work-lease-test-{}", Uuid::new_v4())),
             agent_auth_updates: Default::default(),
             model_refresh_requests: Default::default(),
-            oauth_login_states: Default::default(),
+            oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         })
     }
 
@@ -3254,7 +3255,7 @@ mod tests {
             git_root: root.join("git"),
             agent_auth_updates: Default::default(),
             model_refresh_requests: Default::default(),
-            oauth_login_states: Default::default(),
+            oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         })
     }
 
@@ -3701,7 +3702,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         let worker_id = Uuid::new_v4();
         let input = || RegisterWorker {
@@ -3875,7 +3876,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         let board = task_board(State(state)).await.unwrap().0;
         assert_eq!(board.len(), 1);
@@ -3944,7 +3945,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         });
         let task_uuid = Uuid::parse_str(&task_id).unwrap();
         // Before republish, lifetime history exceeds the limit.
@@ -4074,7 +4075,7 @@ mod tests {
         assert!(feedback.contains("limit 3"), "feedback: {feedback}");
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=?").bind(&task_id).fetch_one(&db).await.unwrap();
         assert_eq!(total, 3);
-        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() });
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default() });
         let task_uuid = Uuid::parse_str(&task_id).unwrap();
         let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
         assert_eq!(status.current_cycle_reviewer_retries, 0);
@@ -4183,7 +4184,7 @@ mod tests {
             .bind("failed").bind(&now).bind(&now).bind(r#"{"error":"runner crashed"}"#)
             .bind("upstream-pinned").bind("integration-pinned").bind("diff-hash")
             .execute(&db).await.unwrap();
-        let state = Arc::new(AppState { db, public_url: Some("https://example.com".into()), oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() });
+        let state = Arc::new(AppState { db, public_url: Some("https://example.com".into()), oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default() });
         let headers = || {
             let mut h = HeaderMap::new();
             h.insert("x-lazyteam-worker-credential", reviewer_cred.parse().unwrap());
@@ -4258,7 +4259,7 @@ mod tests {
             .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&execution_id).bind(&reviewer_id)
             .bind("lost").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
-        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() });
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default() });
         let task_uuid = Uuid::parse_str(&task_id).unwrap();
         let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
         assert_eq!(status.completed_reviews, 2);
@@ -4328,7 +4329,7 @@ mod tests {
             .bind(Uuid::new_v4().to_string()).bind(&task_id).bind(&latest_execution).bind(&reviewer_id)
             .bind("lost").bind(&now).bind(&now)
             .execute(&db).await.unwrap();
-        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() });
+        let state = Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default() });
         let task_uuid = Uuid::parse_str(&task_id).unwrap();
         let Json(status) = task_status(State(state.clone()), Path(task_uuid)).await.unwrap();
         assert_eq!(status.completed_reviews, 2);
@@ -4349,7 +4350,7 @@ mod tests {
     }
 
     fn waiting_state(db: SqlitePool) -> Arc<AppState> {
-        Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default() })
+        Arc::new(AppState { db, public_url: None, oauth_password: None, git_credential_key: None, git_root: std::env::temp_dir(), agent_auth_updates: Default::default(), model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default() })
     }
 
     async fn seed_backend_ready_worker(db: &SqlitePool, id: &str, name: &str, role: &str, now: &str, cred: Option<&str>) {

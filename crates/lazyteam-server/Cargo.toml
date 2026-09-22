@@ -14,6 +14,7 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 lazyteam-core = { path = "../lazyteam-core" }
+lazyteam-sandbox = { path = "../lazyteam-sandbox" }
 oauth = { git = "https://github.com/darkautism/oauth.git", rev = "0b8921604bccd49f0de2ecf9454fd774540747bc" }
 rand.workspace = true
 reqwest.workspace = true

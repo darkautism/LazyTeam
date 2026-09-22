@@ -284,7 +284,7 @@ mod tests {
             git_credential_key: None,
             git_root: std::env::temp_dir(),
             agent_auth_updates: Default::default(),
-            model_refresh_requests: Default::default(), oauth_login_states: Default::default(),
+            model_refresh_requests: Default::default(), oauth_login_states: Default::default(), interactive_sandboxes: Default::default(),
         }
     }
 
