@@ -10,7 +10,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use lazyteam_core::{AgentRole, ExecutionResult, ReviewVerdict, ReviewVerdictKind};
+use lazyteam_core::{AgentRole, ExecutionResult, ReviewVerdict, ReviewVerdictKind, LEASE_CAPABILITY_HEADER};
 
 use crate::{
     api::{
@@ -312,7 +312,7 @@ impl LazyTeamMcp {
     #[tool(
         name = "work_pick",
         title = "Pick work",
-        description = "Claim implementation or review work and return its authoritative lease plus complete pinned working context. With task_id, claim exactly that task or return a conflict; without task_id, use the normal LazyTeam scheduler ordering.",
+        description = "Claim implementation or review work and return its authoritative lease plus complete pinned working context. Broker repository access uses the returned lease_capability as the x-lazyteam-lease-capability HTTP header. With task_id, claim exactly that task or return a conflict; without task_id, use the normal LazyTeam scheduler ordering.",
         annotations(title = "Pick work", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn work_pick(&self, Parameters(input): Parameters<WorkPickParams>) -> Result<rmcp::Json<WorkPickOutput>, McpError> {
@@ -330,10 +330,22 @@ impl LazyTeamMcp {
                 let lease_id = assignment.execution.id.to_string();
                 let lease_until = assignment.execution.lease_until.to_rfc3339();
                 let capability = assignment.lease_capability.clone();
+                let repo_url = assignment.project.repo_url.clone();
+                let default_branch = assignment.project.default_branch.clone();
+                let review_ref = format!("lazyteam/task-{}", assignment.task.id.simple());
                 let context = serde_json::json!({
                     "project": assignment.project,
                     "task": assignment.task,
                     "execution": assignment.execution,
+                    "checkout": {
+                        "repo_url": repo_url,
+                        "default_branch": default_branch,
+                        "review_ref": review_ref,
+                    },
+                    "repo_access": {
+                        "header_name": LEASE_CAPABILITY_HEADER,
+                        "header_value_source": "lease_capability",
+                    },
                 });
                 Ok(rmcp::Json(WorkPickOutput { picked: true, role: "implementation".into(), lease_id: Some(lease_id), lease_capability: Some(capability), lease_until: Some(lease_until), context: Some(context) }))
             }
@@ -362,6 +374,10 @@ impl LazyTeamMcp {
                     "checkout": assignment.checkout,
                     "effective_diff_hash": effective_diff_hash,
                     "review_cycle": review_cycle,
+                    "repo_access": {
+                        "header_name": LEASE_CAPABILITY_HEADER,
+                        "header_value_source": "lease_capability",
+                    },
                 });
                 Ok(rmcp::Json(WorkPickOutput { picked: true, role: "review".into(), lease_id: Some(lease_id), lease_capability: Some(capability), lease_until: Some(lease_until), context: Some(context) }))
             }
@@ -569,7 +585,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam has one authoritative work-ownership model. Use work_pick(role=implementation|review) to acquire an opaque lease and the complete working context; use work_renew while working, work_finish to complete that exact lease, and work_release to abandon it without recording a failure. Review work is pinned to one implementation execution plus candidate/base/upstream/integration/effective-diff context; approve moves the task to merge_pending and retry follows the configured review retry policy. No review decision is valid without a review lease. From merge_pending, the main agent may call tasks_merge; Host-only Git credentials publish only the reviewed candidate and revalidate upstream before changing durable task state. Workers never receive upstream Git credentials.".to_string(),
+                "LazyTeam has one authoritative work-ownership model. Use work_pick(role=implementation|review) to acquire an opaque lease and the complete working context; use work_renew while working, work_finish to complete that exact lease, and work_release to abandon it without recording a failure. Broker Git URLs returned by work_pick use the same lease_capability as the x-lazyteam-lease-capability HTTP header. Review work is pinned to one implementation execution plus candidate/base/upstream/integration/effective-diff context; approve moves the task to merge_pending and retry follows the configured review retry policy. No review decision is valid without a review lease. From merge_pending, the main agent may call tasks_merge; Host-only Git credentials publish only the reviewed candidate and revalidate upstream before changing durable task state. Workers never receive upstream Git credentials.".to_string(),
             )
     }
 }
@@ -644,6 +660,9 @@ mod tests {
         for legacy in ["reviews_get", "reviews_show", "reviews_grep", "reviews_diff", "reviews_decide", "tasks_retry", "tasks_confirm_merge", "workers_retire"] {
             assert!(mcp.tool_router.get(legacy).is_none(), "legacy MCP tool {legacy} must not remain registered");
         }
+        let pick = mcp.tool_router.get("work_pick").expect("work_pick must be registered");
+        let description = pick.description.as_deref().unwrap_or_default();
+        assert!(description.contains(LEASE_CAPABILITY_HEADER), "work_pick must document broker lease header: {description}");
     }
 
     #[tokio::test]
