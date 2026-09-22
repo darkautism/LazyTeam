@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use axum::{extract::{Path, State}, http::StatusCode, Json};
+use axum::{extract::{Path, State}, Json};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -10,8 +10,16 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use lazyteam_core::{AgentRole, ExecutionResult, ReviewVerdict, ReviewVerdictKind};
+
 use crate::{
-    api::delete_worker,
+    api::{
+        claim_review_for_worker, claim_task_for_worker, ensure_internal_work_actor,
+        finish_execution_for_capability, finish_review_for_capability,
+        release_execution_for_capability, release_review_for_capability,
+        renew_execution_for_capability, renew_review_for_capability,
+        work_lease_kind, WorkLeaseKind,
+    },
     create_project, create_task, delete_task, list_projects, list_tasks, list_workers, review, review_evidence, task_status, AppState,
     CreateProject, CreateTask,
 };
@@ -70,32 +78,6 @@ pub struct TaskIdParams {
     pub task_id: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct TaskRetryParams {
-    /// Task to send back to implementation.
-    pub task_id: String,
-    /// Concise rejection reason delivered to the next worker attempt. Required when
-    /// retrying from review or merge_pending (merge-gate rejection).
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ReviewRevision {
-    Candidate,
-    Base,
-}
-
-impl ReviewRevision {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Candidate => "candidate",
-            Self::Base => "base",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ReviewDecision {
@@ -103,84 +85,75 @@ pub enum ReviewDecision {
     Retry,
 }
 
-impl ReviewDecision {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Approve => "approve",
-            Self::Retry => "retry",
-        }
-    }
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkRole {
+    Implementation,
+    Review,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ReviewShowParams {
-    pub task_id: String,
-    #[serde(default = "default_review_path")]
-    pub path: String,
-    #[serde(default = "default_review_revision")]
-    pub revision: ReviewRevision,
-    #[serde(default = "default_start_line")]
-    pub start_line: usize,
-    #[serde(default = "default_review_limit")]
-    pub limit: usize,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ReviewGrepParams {
-    pub task_id: String,
-    pub pattern: String,
-    #[serde(default = "default_review_revision")]
-    pub revision: ReviewRevision,
+pub struct WorkPickParams {
+    pub role: WorkRole,
     #[serde(default)]
-    pub paths: Vec<String>,
-    #[serde(default = "default_start_line")]
-    pub start_line: usize,
-    #[serde(default = "default_review_limit")]
-    pub limit: usize,
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ReviewDiffParams {
-    pub task_id: String,
+pub struct WorkLeaseParams {
+    pub lease_id: String,
+    pub lease_capability: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkFinishParams {
+    pub lease_id: String,
+    pub lease_capability: String,
     #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default = "default_start_line")]
-    pub start_line: usize,
-    #[serde(default = "default_review_limit")]
-    pub limit: usize,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ReviewDecideParams {
-    pub task_id: String,
-    pub candidate_sha: String,
-    pub verdict: ReviewDecision,
-    pub reason: String,
-}
-
-fn default_review_revision() -> ReviewRevision { ReviewRevision::Candidate }
-fn default_review_path() -> String { ".".into() }
-fn default_start_line() -> usize { 1 }
-fn default_review_limit() -> usize { 200 }
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkerIdParams {
-    pub worker_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ConfirmMergeParams {
-    pub task_id: String,
-    pub merge_commit_sha: String,
+    pub status: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub base_sha: Option<String>,
+    #[serde(default)]
+    pub review_ref: Option<String>,
+    #[serde(default)]
+    pub workspace_clean: Option<bool>,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub validation: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub verdict: Option<ReviewDecision>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-struct ReviewDecisionOutput {
-    task_id: Uuid,
+struct WorkPickOutput {
+    picked: bool,
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_capability: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct WorkActionOutput {
+    lease_id: String,
+    lease_type: String,
     state: String,
-    candidate_sha: String,
-    verdict: String,
-    reason: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -199,12 +172,6 @@ struct TaskMergeOutput {
 struct TaskDeletedOutput {
     task_id: Uuid,
     deleted: bool,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-struct WorkerRetiredOutput {
-    worker_id: Uuid,
-    retired: bool,
 }
 
 #[tool_router]
@@ -341,92 +308,159 @@ impl LazyTeamMcp {
         Ok(rmcp::Json(task))
     }
 
+
     #[tool(
-        name = "reviews_get",
-        title = "Get review evidence",
-        description = "Get compact metadata for the latest pinned review candidate in review or merge_pending: task requirements, worker/execution summary, candidate/base SHA, review ref, changed files, validation, and warnings. The full patch is intentionally omitted; use reviews_diff for repository-backed diff content.",
-        annotations(
-            title = "Get review evidence",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
+        name = "work_pick",
+        title = "Pick work",
+        description = "Claim implementation or review work and return its authoritative lease plus complete pinned working context. With task_id, claim exactly that task or return a conflict; without task_id, use the normal LazyTeam scheduler ordering.",
+        annotations(title = "Pick work", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn reviews_get(
-        &self,
-        Parameters(input): Parameters<TaskIdParams>,
-    ) -> Result<rmcp::Json<crate::api::ReviewEvidence>, McpError> {
-        let task_id = parse_task_id(&input.task_id)?;
-        let Json(mut evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        if let Some(result) = evidence.execution.result.as_mut() {
-            result.patch = None;
+    async fn work_pick(&self, Parameters(input): Parameters<WorkPickParams>) -> Result<rmcp::Json<WorkPickOutput>, McpError> {
+        let task_id = input.task_id.as_deref().map(parse_task_id).transpose()?;
+        match input.role {
+            WorkRole::Implementation => {
+                let actor = ensure_internal_work_actor(&self.state, AgentRole::Worker).await.map_err(api_to_mcp)?;
+                let assignment = claim_task_for_worker(&self.state, actor, task_id).await.map_err(api_to_mcp)?;
+                let Some(assignment) = assignment else {
+                    if task_id.is_some() {
+                        return Err(McpError::internal_error("task is not claimable for implementation", Some(serde_json::json!({"http_status": 409}))));
+                    }
+                    return Ok(rmcp::Json(WorkPickOutput { picked: false, role: "implementation".into(), lease_id: None, lease_capability: None, lease_until: None, context: None }));
+                };
+                let lease_id = assignment.execution.id.to_string();
+                let lease_until = assignment.execution.lease_until.to_rfc3339();
+                let capability = assignment.lease_capability.clone();
+                let context = serde_json::json!({
+                    "project": assignment.project,
+                    "task": assignment.task,
+                    "execution": assignment.execution,
+                });
+                Ok(rmcp::Json(WorkPickOutput { picked: true, role: "implementation".into(), lease_id: Some(lease_id), lease_capability: Some(capability), lease_until: Some(lease_until), context: Some(context) }))
+            }
+            WorkRole::Review => {
+                let actor = ensure_internal_work_actor(&self.state, AgentRole::Reviewer).await.map_err(api_to_mcp)?;
+                let assignment = claim_review_for_worker(&self.state, actor, task_id).await.map_err(api_to_mcp)?;
+                let Some(assignment) = assignment else {
+                    if task_id.is_some() {
+                        return Err(McpError::internal_error("task is not claimable for review", Some(serde_json::json!({"http_status": 409}))));
+                    }
+                    return Ok(rmcp::Json(WorkPickOutput { picked: false, role: "review".into(), lease_id: None, lease_capability: None, lease_until: None, context: None }));
+                };
+                let lease_id = assignment.review.id.to_string();
+                let lease_until = assignment.review.lease_until.to_rfc3339();
+                let capability = assignment.lease_capability.clone();
+                let effective_diff_hash = assignment.execution.result.as_ref()
+                    .and_then(|result| result.integration.as_ref())
+                    .and_then(|integration| integration.effective_diff_hash.clone());
+                let review_cycle = assignment.task.review_cycle;
+                let context = serde_json::json!({
+                    "project": assignment.project,
+                    "task": assignment.task,
+                    "review": assignment.review,
+                    "implementation_execution": assignment.execution,
+                    "implementation_worker": assignment.implementation_worker,
+                    "checkout": assignment.checkout,
+                    "effective_diff_hash": effective_diff_hash,
+                    "review_cycle": review_cycle,
+                });
+                Ok(rmcp::Json(WorkPickOutput { picked: true, role: "review".into(), lease_id: Some(lease_id), lease_capability: Some(capability), lease_until: Some(lease_until), context: Some(context) }))
+            }
         }
-        Ok(rmcp::Json(evidence))
     }
 
     #[tool(
-        name = "reviews_show",
-        title = "Show pinned review path",
-        description = "Git-show-like read of the complete pinned candidate or base snapshot. Read a UTF-8 file or list a directory; path defaults to '.' for the repository root. Pagination uses one-based output line numbers. Arbitrary repositories, branches, SHAs, .git internals, and writes are not allowed.",
-        annotations(title = "Show pinned review path", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+        name = "work_renew",
+        title = "Renew work lease",
+        description = "Extend an active implementation or review lease. The server derives the lease type and owner from the lease id; callers provide only the opaque lease capability.",
+        annotations(title = "Renew work lease", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn reviews_show(&self, Parameters(input): Parameters<ReviewShowParams>) -> Result<rmcp::Json<crate::git_broker::ReviewTextPage>, McpError> {
-        let task_id = parse_task_id(&input.task_id)?;
-        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        let page = crate::git_broker::review_show(&self.state, &evidence, input.revision.as_str(), &input.path, input.start_line, input.limit)
-            .await.map_err(api_to_mcp)?;
-        Ok(rmcp::Json(page))
+    async fn work_renew(&self, Parameters(input): Parameters<WorkLeaseParams>) -> Result<rmcp::Json<WorkActionOutput>, McpError> {
+        let lease_id = parse_lease_id(&input.lease_id)?;
+        let lease_type = match work_lease_kind(&self.state, lease_id).await.map_err(api_to_mcp)? {
+            WorkLeaseKind::Implementation => {
+                renew_execution_for_capability(&self.state, lease_id, &input.lease_capability, None).await.map_err(api_to_mcp)?;
+                "implementation"
+            }
+            WorkLeaseKind::Review => {
+                renew_review_for_capability(&self.state, lease_id, &input.lease_capability, None).await.map_err(api_to_mcp)?;
+                "review"
+            }
+        };
+        Ok(rmcp::Json(WorkActionOutput { lease_id: lease_id.to_string(), lease_type: lease_type.into(), state: "renewed".into() }))
     }
 
     #[tool(
-        name = "reviews_grep",
-        title = "Grep pinned review repository",
-        description = "Git-grep-like fixed-string search of the complete pinned candidate or base snapshot, optionally restricted to repository-relative paths. Output is path:line:text without repeating the candidate SHA. No shell, arbitrary revision, or external repository access.",
-        annotations(title = "Grep pinned review repository", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+        name = "work_finish",
+        title = "Finish work",
+        description = "Finish the active lease. Implementation accepts a completed/failed execution result; review accepts approve/retry plus a non-empty reason. Lease role and ownership are derived from the lease.",
+        annotations(title = "Finish work", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn reviews_grep(&self, Parameters(input): Parameters<ReviewGrepParams>) -> Result<rmcp::Json<crate::git_broker::ReviewTextPage>, McpError> {
-        let task_id = parse_task_id(&input.task_id)?;
-        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        let page = crate::git_broker::review_grep(&self.state, &evidence, input.revision.as_str(), &input.pattern, &input.paths, input.start_line, input.limit)
-            .await.map_err(api_to_mcp)?;
-        Ok(rmcp::Json(page))
+    async fn work_finish(&self, Parameters(input): Parameters<WorkFinishParams>) -> Result<rmcp::Json<WorkActionOutput>, McpError> {
+        let lease_id = parse_lease_id(&input.lease_id)?;
+        let lease_type = match work_lease_kind(&self.state, lease_id).await.map_err(api_to_mcp)? {
+            WorkLeaseKind::Implementation => {
+                let status = input.status.clone().unwrap_or_else(|| "completed".into());
+                if !matches!(status.as_str(), "completed" | "failed") {
+                    return Err(McpError::invalid_params("implementation status must be completed or failed", None));
+                }
+                if status == "completed" && (input.commit_sha.as_deref().unwrap_or_default().is_empty() || input.base_sha.as_deref().unwrap_or_default().is_empty() || input.review_ref.as_deref().unwrap_or_default().is_empty()) {
+                    return Err(McpError::invalid_params("completed implementation requires commit_sha, base_sha, and review_ref", None));
+                }
+                let result = ExecutionResult {
+                    status,
+                    summary: input.summary.clone().unwrap_or_default(),
+                    commit_sha: input.commit_sha.clone(),
+                    base_sha: input.base_sha.clone(),
+                    patch: None,
+                    patch_truncated: false,
+                    workspace_clean: input.workspace_clean,
+                    review_ref: input.review_ref.clone(),
+                    changed_files: input.changed_files.clone(),
+                    validation: input.validation.clone(),
+                    warnings: input.warnings.clone(),
+                    artifacts: input.artifacts.clone(),
+                    integration: None,
+                };
+                finish_execution_for_capability(&self.state, lease_id, &input.lease_capability, result, None).await.map_err(api_to_mcp)?;
+                "implementation"
+            }
+            WorkLeaseKind::Review => {
+                let verdict = input.verdict.ok_or_else(|| McpError::invalid_params("review finish requires verdict=approve|retry", None))?;
+                let reason = input.reason.clone().unwrap_or_default();
+                if reason.trim().is_empty() {
+                    return Err(McpError::invalid_params("review finish requires a non-empty reason", None));
+                }
+                let verdict = ReviewVerdict {
+                    verdict: match verdict { ReviewDecision::Approve => ReviewVerdictKind::Approve, ReviewDecision::Retry => ReviewVerdictKind::Retry },
+                    reason,
+                    validation: input.validation.clone(),
+                };
+                finish_review_for_capability(&self.state, lease_id, &input.lease_capability, "completed", Some(verdict), None, None).await.map_err(api_to_mcp)?;
+                "review"
+            }
+        };
+        Ok(rmcp::Json(WorkActionOutput { lease_id: lease_id.to_string(), lease_type: lease_type.into(), state: "finished".into() }))
     }
 
     #[tool(
-        name = "reviews_diff",
-        title = "Diff pinned review candidate",
-        description = "Git-diff-like view of pinned base to candidate, optionally restricted to one repository-relative path. Generated from the Host task repository; pagination uses one-based output line numbers.",
-        annotations(title = "Diff pinned review candidate", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+        name = "work_release",
+        title = "Release work lease",
+        description = "Voluntarily abandon an active implementation or review lease without recording a failure. Implementation returns to queued and its execution repo is cleaned; review remains in review.",
+        annotations(title = "Release work lease", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn reviews_diff(&self, Parameters(input): Parameters<ReviewDiffParams>) -> Result<rmcp::Json<crate::git_broker::ReviewTextPage>, McpError> {
-        let task_id = parse_task_id(&input.task_id)?;
-        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        let page = crate::git_broker::review_diff(&self.state, &evidence, input.path.as_deref(), input.start_line, input.limit)
-            .await.map_err(api_to_mcp)?;
-        Ok(rmcp::Json(page))
-    }
-
-    #[tool(
-        name = "reviews_decide",
-        title = "Decide pinned review candidate",
-        description = "Record approve or retry for the exact pinned candidate SHA while the task is in review and no reviewer-worker lease is active. Approve moves to merge_pending; retry returns the task to implementation. This never merges or writes repository content.",
-        annotations(title = "Decide pinned review candidate", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
-    )]
-    async fn reviews_decide(&self, Parameters(input): Parameters<ReviewDecideParams>) -> Result<rmcp::Json<ReviewDecisionOutput>, McpError> {
-        let task_id = parse_task_id(&input.task_id)?;
-        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        crate::git_broker::verify_review_snapshot(&self.state, &evidence, &input.candidate_sha).await.map_err(api_to_mcp)?;
-        let verdict = input.verdict.as_str();
-        let transition = review::decide_task(&self.state, task_id, &input.candidate_sha, verdict, &input.reason)
-            .await.map_err(api_to_mcp)?;
-        Ok(rmcp::Json(ReviewDecisionOutput {
-            task_id: transition.task_id,
-            state: transition.state,
-            candidate_sha: input.candidate_sha,
-            verdict: verdict.to_string(),
-            reason: input.reason,
-        }))
+    async fn work_release(&self, Parameters(input): Parameters<WorkLeaseParams>) -> Result<rmcp::Json<WorkActionOutput>, McpError> {
+        let lease_id = parse_lease_id(&input.lease_id)?;
+        let lease_type = match work_lease_kind(&self.state, lease_id).await.map_err(api_to_mcp)? {
+            WorkLeaseKind::Implementation => {
+                release_execution_for_capability(&self.state, lease_id, &input.lease_capability, None).await.map_err(api_to_mcp)?;
+                "implementation"
+            }
+            WorkLeaseKind::Review => {
+                release_review_for_capability(&self.state, lease_id, &input.lease_capability, None).await.map_err(api_to_mcp)?;
+                "review"
+            }
+        };
+        Ok(rmcp::Json(WorkActionOutput { lease_id: lease_id.to_string(), lease_type: lease_type.into(), state: "released".into() }))
     }
 
     #[tool(
@@ -490,54 +524,6 @@ impl LazyTeamMcp {
     }
 
     #[tool(
-        name = "tasks_confirm_merge",
-        title = "Confirm externally merged task",
-        description = "Compatibility recovery for an approved task already merged outside tasks_merge. Verifies the upstream commit contains the exact reviewed file content before marking the task done and queuing cleanup.",
-        annotations(
-            title = "Confirm externally merged task",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn tasks_confirm_merge(
-        &self,
-        Parameters(input): Parameters<ConfirmMergeParams>,
-    ) -> Result<rmcp::Json<crate::review::TaskTransition>, McpError> {
-        let task_id = parse_task_id(&input.task_id)?;
-        let Json(evidence) = review_evidence(Path(task_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        crate::git_broker::verify_external_merge(&self.state, &evidence, &input.merge_commit_sha).await.map_err(api_to_mcp)?;
-        let transition = review::merged_task(&self.state, task_id, &input.merge_commit_sha).await.map_err(api_to_mcp)?;
-        Ok(rmcp::Json(transition))
-    }
-
-    #[tool(
-        name = "tasks_retry",
-        title = "Retry task",
-        description = "Retry according to the task's current state (draft, review, merge_pending, failed, or blocked). Review or merge-gate rejection requires a concise reason for the next attempt; inspect the current task/review state before calling.",
-        annotations(
-            title = "Retry task",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn tasks_retry(
-        &self,
-        Parameters(input): Parameters<TaskRetryParams>,
-    ) -> Result<rmcp::Json<crate::review::TaskTransition>, McpError> {
-        let task_id = parse_task_id(&input.task_id)?;
-        match review_evidence(Path(task_id), State(self.state.clone())).await {
-            Ok(_) | Err((StatusCode::CONFLICT, _)) => {}
-            Err(error) => return Err(api_to_mcp(error)),
-        }
-        let transition = review::retry_task(&self.state, task_id, input.reason.as_deref()).await.map_err(api_to_mcp)?;
-        Ok(rmcp::Json(transition))
-    }
-
-    #[tool(
         name = "tasks_delete",
         title = "Delete task",
         description = "Remove an obsolete unclaimed/review/failed task from LazyTeam views and queue cleanup on its last worker. Active, merge-pending, and completed tasks are protected.",
@@ -575,27 +561,6 @@ impl LazyTeamMcp {
         Ok(rmcp::Json(items))
     }
 
-    #[tool(
-        name = "workers_retire",
-        title = "Retire inactive worker",
-        description = "Retire an inactive LazyTeam worker from the active pool while preserving execution/review audit history. Active workers must be stopped first.",
-        annotations(
-            title = "Retire inactive worker",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn workers_retire(
-        &self,
-        Parameters(input): Parameters<WorkerIdParams>,
-    ) -> Result<rmcp::Json<WorkerRetiredOutput>, McpError> {
-        let worker_id = Uuid::parse_str(&input.worker_id)
-            .map_err(|e| McpError::invalid_params("invalid worker_id", Some(serde_json::json!({"error": e.to_string()}))))?;
-        delete_worker(Path(worker_id), State(self.state.clone())).await.map_err(api_to_mcp)?;
-        Ok(rmcp::Json(WorkerRetiredOutput { worker_id, retired: true }))
-    }
 }
 
 #[tool_handler]
@@ -604,7 +569,7 @@ impl ServerHandler for LazyTeamMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "LazyTeam controls projects, tasks, executions, reviews, Host-owned Git publishing, and a distributed AI worker pool. Workers and reviewer workers never receive upstream Git credentials; they use task-scoped repositories served by the LazyTeam Host. A completed reviewer-worker approve verdict or an exact-candidate main-agent reviews_decide approve may move a review task to merge_pending. Main-agent review can inspect the complete pinned repository with reviews_show, reviews_grep, and reviews_diff without shell access. For a merge_pending task, inspect the candidate with reviews_get, then call tasks_merge when the candidate is acceptable: the Host revalidates the pinned base/candidate, publishes upstream with Host-only credentials, marks the task done, and queues worker cleanup. When the merge_pending candidate is stale or unsafe, do not merge; call tasks_retry with a concrete reason to send it back through implementation + independent review instead of attempting an unsafe merge or inventing another recovery path. Do not merge upstream from a worker or external checkout. On tasks_retry, give a concrete reason; review and merge-gate (merge_pending) retries require a concise reason and stay pinned to the implementation worker workspace/session when applicable.".to_string(),
+                "LazyTeam has one authoritative work-ownership model. Use work_pick(role=implementation|review) to acquire an opaque lease and the complete working context; use work_renew while working, work_finish to complete that exact lease, and work_release to abandon it without recording a failure. Review work is pinned to one implementation execution plus candidate/base/upstream/integration/effective-diff context; approve moves the task to merge_pending and retry follows the configured review retry policy. No review decision is valid without a review lease. From merge_pending, the main agent may call tasks_merge; Host-only Git credentials publish only the reviewed candidate and revalidate upstream before changing durable task state. Workers never receive upstream Git credentials.".to_string(),
             )
     }
 }
@@ -612,6 +577,11 @@ impl ServerHandler for LazyTeamMcp {
 fn parse_task_id(raw: &str) -> Result<Uuid, McpError> {
     Uuid::parse_str(raw)
         .map_err(|e| McpError::invalid_params("invalid task_id", Some(serde_json::json!({"error": e.to_string()}))))
+}
+
+fn parse_lease_id(raw: &str) -> Result<Uuid, McpError> {
+    Uuid::parse_str(raw)
+        .map_err(|e| McpError::invalid_params("invalid lease_id", Some(serde_json::json!({"error": e.to_string()}))))
 }
 
 fn api_to_mcp((status, message): crate::ApiError) -> McpError {
@@ -657,77 +627,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tasks_retry_description_advertises_merge_pending_with_reason() {
+    async fn mcp_surface_is_small_and_lease_authoritative() {
         let mcp = test_mcp();
-        let tool = mcp
-            .tool_router
-            .get("tasks_retry")
-            .expect("tasks_retry tool must be registered");
-        let description = tool.description.as_deref().unwrap_or_default();
-        assert!(
-            description.contains("merge_pending"),
-            "tasks_retry description must explicitly include merge_pending: {description}"
-        );
-        let lowered = description.to_lowercase();
-        assert!(
-            lowered.contains("reason"),
-            "tasks_retry description must state a reason is required/expected: {description}"
-        );
-        assert!(
-            lowered.contains("requir") || lowered.contains("expected"),
-            "tasks_retry description must state the reason is required/expected for review or merge-gate rejection: {description}"
-        );
+        let expected = [
+            "projects_list", "projects_create",
+            "tasks_list", "tasks_get", "tasks_create", "tasks_delete",
+            "workers_list",
+            "work_pick", "work_renew", "work_finish", "work_release",
+            "tasks_merge",
+        ];
+        let mut actual = mcp.tool_router.list_all().into_iter().map(|tool| tool.name.to_string()).collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = expected.into_iter().map(str::to_string).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
+        for legacy in ["reviews_get", "reviews_show", "reviews_grep", "reviews_diff", "reviews_decide", "tasks_retry", "tasks_confirm_merge", "workers_retire"] {
+            assert!(mcp.tool_router.get(legacy).is_none(), "legacy MCP tool {legacy} must not remain registered");
+        }
     }
 
     #[tokio::test]
-    async fn server_instructions_explain_merge_gate_retry_path() {
+    async fn server_instructions_describe_single_work_lifecycle() {
         let mcp = test_mcp();
         let instructions = mcp.get_info().instructions.unwrap_or_default();
-        let lowered = instructions.to_lowercase();
-        assert!(
-            lowered.contains("merge_pending"),
-            "server instructions must mention merge_pending: {instructions}"
-        );
-        assert!(
-            lowered.contains("reviews_get") || lowered.contains("inspect"),
-            "server instructions must tell the agent to inspect the merge_pending candidate: {instructions}"
-        );
-        assert!(
-            instructions.contains("tasks_merge"),
-            "server instructions must mention tasks_merge for acceptable candidates: {instructions}"
-        );
-        assert!(
-            instructions.contains("tasks_retry"),
-            "server instructions must mention tasks_retry for rejected candidates: {instructions}"
-        );
-        assert!(
-            lowered.contains("concrete reason") || lowered.contains("concise reason"),
-            "server instructions must require a concrete/concise tasks_retry reason: {instructions}"
-        );
-    }
-
-    #[tokio::test]
-    async fn merge_pending_review_evidence_is_advertised_for_inspection() {
-        let mcp = test_mcp();
-        let tool = mcp
-            .tool_router
-            .get("reviews_get")
-            .expect("reviews_get tool must be registered");
-        let description = tool.description.as_deref().unwrap_or_default();
-        assert!(
-            description.contains("merge_pending"),
-            "reviews_get description must advertise merge_pending inspection: {description}"
-        );
-    }
-
-    #[tokio::test]
-    async fn review_tool_surface_uses_git_like_names() {
-        let mcp = test_mcp();
-        for name in ["reviews_show", "reviews_grep", "reviews_diff", "reviews_decide", "tasks_confirm_merge", "workers_retire"] {
-            assert!(mcp.tool_router.get(name).is_some(), "{name} must be registered");
+        for name in ["work_pick", "work_renew", "work_finish", "work_release", "tasks_merge"] {
+            assert!(instructions.contains(name), "server instructions must mention {name}: {instructions}");
         }
-        for old in ["reviews_read", "reviews_search", "tasks_merged", "workers_delete"] {
-            assert!(mcp.tool_router.get(old).is_none(), "obsolete MCP tool {old} must not remain registered");
-        }
+        assert!(!instructions.contains("reviews_decide"));
+        assert!(!instructions.contains("tasks_retry"));
     }
 }

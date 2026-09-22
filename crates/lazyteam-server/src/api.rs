@@ -615,8 +615,10 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/review-claim", post(claim_review))
         .route("/api/executions/{id}/renew", post(renew_execution))
         .route("/api/executions/{id}/finish", post(finish_execution))
+        .route("/api/executions/{id}/release", post(release_execution))
         .route("/api/reviews/{id}/renew", post(renew_review))
         .route("/api/reviews/{id}/finish", post(finish_review))
+        .route("/api/reviews/{id}/release", post(release_review))
 }
 
 async fn health() -> &'static str { "ok" }
@@ -1056,7 +1058,7 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
 }
 
 pub(crate) async fn list_workers(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Worker>> {
-    let rows = sqlx::query("SELECT * FROM workers WHERE retired_at IS NULL ORDER BY name").fetch_all(&state.db).await.map_err(db_error)?;
+    let rows = sqlx::query("SELECT * FROM workers WHERE retired_at IS NULL AND internal_actor=0 ORDER BY name").fetch_all(&state.db).await.map_err(db_error)?;
     rows.iter().map(worker_from_row).collect::<Result<Vec<_>,_>>().map(Json)
 }
 
@@ -1582,20 +1584,108 @@ async fn worker_cleanup_ack(Path((id, task_id, role)): Path<(Uuid, Uuid, String)
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(crate) async fn ensure_internal_work_actor(state: &AppState, role: AgentRole) -> Result<Uuid, ApiError> {
+    let (id, name, role_name) = match role {
+        AgentRole::Worker => (Uuid::from_u128(0x101), "__lazyteam_interactive_implementation", "worker"),
+        AgentRole::Reviewer => (Uuid::from_u128(0x102), "__lazyteam_interactive_review", "reviewer"),
+    };
+    let now = ts(Utc::now());
+    sqlx::query("INSERT OR IGNORE INTO workers(id,name,role,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at,internal_actor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)")
+        .bind(id.to_string()).bind(name).bind(role_name).bind("idle").bind("internal").bind("internal")
+        .bind("{}").bind("[\"*\"]").bind(1024_i64).bind(0_i64).bind(PROTOCOL_VERSION as i64).bind("internal")
+        .bind(&now).bind(&now).execute(&state.db).await.map_err(db_error)?;
+    sqlx::query("UPDATE workers SET protocol_version=?,worker_version='internal',last_heartbeat_at=?,internal_actor=1,retired_at=NULL WHERE id=?")
+        .bind(PROTOCOL_VERSION as i64).bind(&now).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
+    Ok(id)
+}
+
+async fn persist_task_claim(
+    state: &AppState,
+    task: &Task,
+    worker: &Worker,
+    execution: &Execution,
+    attempt: i64,
+    lease_capability_hash: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, ApiError> {
+    let mut tx = state.db.begin().await.map_err(db_error)?;
+    let claimed = sqlx::query("UPDATE tasks SET state='assigned',sticky_worker_id=COALESCE(sticky_worker_id,?),updated_at=? WHERE id=? AND state='queued'")
+        .bind(worker.id.to_string()).bind(ts(now)).bind(task.id.to_string()).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if claimed == 0 {
+        tx.rollback().await.map_err(db_error)?;
+        return Ok(false);
+    }
+    sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,lease_capability_hash,worker_agent_type,worker_provider,worker_model) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(execution.id.to_string()).bind(task.id.to_string()).bind(worker.id.to_string()).bind(attempt)
+        .bind("assigned").bind(ts(execution.lease_until)).bind(ts(now)).bind(lease_capability_hash)
+        .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone())
+        .execute(&mut *tx).await.map_err(db_error)?;
+    sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
+        .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(true)
+}
+
+async fn persist_review_claim(
+    state: &AppState,
+    task: &Task,
+    worker: &Worker,
+    execution: &Execution,
+    review: &ReviewLease,
+    lease_capability_hash: &str,
+    result: &ExecutionResult,
+    upstream_sha: &str,
+    integration_sha: &str,
+    effective_diff_hash: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, ApiError> {
+    let mut tx = state.db.begin().await.map_err(db_error)?;
+    let inserted = sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle,upstream_sha,integration_sha,effective_diff_hash) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM tasks WHERE id=? AND state='review') AND NOT EXISTS (SELECT 1 FROM reviews WHERE task_id=? AND state IN ('assigned','running'))")
+        .bind(review.id.to_string()).bind(task.id.to_string()).bind(execution.id.to_string()).bind(worker.id.to_string())
+        .bind("assigned").bind(ts(review.lease_until)).bind(ts(now)).bind(lease_capability_hash)
+        .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone()).bind(task.review_cycle)
+        .bind(upstream_sha).bind(integration_sha).bind(effective_diff_hash)
+        .bind(task.id.to_string()).bind(task.id.to_string())
+        .execute(&mut *tx).await.map_err(db_conflict)?.rows_affected();
+    if inserted != 1 {
+        tx.rollback().await.map_err(db_error)?;
+        return Ok(false);
+    }
+    sqlx::query("UPDATE executions SET result=? WHERE id=? AND state='completed'")
+        .bind(json(result)?).bind(execution.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+    sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
+        .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(true)
+}
+
 async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, ApiError> {
     require_worker(&state.db, id, &headers).await?;
+    match claim_task_for_worker(&state, id, None).await? {
+        Some(assignment) => Ok(Json(assignment).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+pub(crate) async fn claim_task_for_worker(state: &AppState, id: Uuid, task_id: Option<Uuid>) -> Result<Option<Assignment>, ApiError> {
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&row)?;
+    let internal_actor: i64 = row.try_get("internal_actor").unwrap_or(0);
     if worker.role != AgentRole::Worker || worker.protocol_version < PROTOCOL_VERSION {
-        return Ok(StatusCode::NO_CONTENT.into_response());
+        return Ok(None);
     }
     if worker.running_slots >= worker.slots || !matches!(worker.state, WorkerState::Idle | WorkerState::Busy) {
-        return Ok(StatusCode::NO_CONTENT.into_response());
+        return Ok(None);
     }
     let worker_id_text = worker.id.to_string();
-    let rows = sqlx::query("SELECT * FROM tasks WHERE state='queued' ORDER BY CASE WHEN sticky_worker_id=? THEN 0 WHEN sticky_worker_id IS NULL THEN 1 ELSE 2 END, priority DESC, created_at ASC LIMIT 100")
-        .bind(&worker_id_text).fetch_all(&state.db).await.map_err(db_error)?;
+    let rows = if let Some(task_id) = task_id {
+        sqlx::query("SELECT * FROM tasks WHERE id=? AND state='queued' LIMIT 1")
+            .bind(task_id.to_string()).fetch_all(&state.db).await.map_err(db_error)?
+    } else {
+        sqlx::query("SELECT * FROM tasks WHERE state='queued' ORDER BY CASE WHEN sticky_worker_id=? THEN 0 WHEN sticky_worker_id IS NULL THEN 1 ELSE 2 END, priority DESC, created_at ASC LIMIT 100")
+            .bind(&worker_id_text).fetch_all(&state.db).await.map_err(db_error)?
+    };
     for row in rows {
         let sticky_worker_id: Option<String> = row.try_get("sticky_worker_id").map_err(internal)?;
         let task = task_from_row(&row)?;
@@ -1604,16 +1694,18 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
             .fetch_optional(&state.db).await.map_err(db_error)?;
         let Some(project_row) = project_row else { continue };
         let project = project_from_row(&project_row)?;
-        if let Some(sticky_worker_id) = sticky_worker_id.as_deref().filter(|sticky| *sticky != worker_id_text) {
-            if sticky_worker_reservation_active(&state.db, sticky_worker_id, &project, &task).await? {
-                continue;
+        if internal_actor == 0 {
+            if let Some(sticky_worker_id) = sticky_worker_id.as_deref().filter(|sticky| *sticky != worker_id_text) {
+                if sticky_worker_reservation_active(&state.db, sticky_worker_id, &project, &task).await? {
+                    continue;
+                }
+                sqlx::query("UPDATE tasks SET sticky_worker_id=NULL,updated_at=? WHERE id=? AND state='queued' AND sticky_worker_id=?")
+                    .bind(ts(Utc::now())).bind(task.id.to_string()).bind(sticky_worker_id)
+                    .execute(&state.db).await.map_err(db_error)?;
             }
-            sqlx::query("UPDATE tasks SET sticky_worker_id=NULL,updated_at=? WHERE id=? AND state='queued' AND sticky_worker_id=?")
-                .bind(ts(Utc::now())).bind(task.id.to_string()).bind(sticky_worker_id)
-                .execute(&state.db).await.map_err(db_error)?;
+            if !worker_matches_task(&worker, &project, &task) { continue; }
         }
-        if !worker_matches_task(&worker, &project, &task) { continue; }
-        let git_credential = git_credential_from_row(&state, &project_row)?;
+        let git_credential = git_credential_from_row(state, &project_row)?;
 
         let now = Utc::now();
         let lease_until = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
@@ -1622,60 +1714,57 @@ async fn claim_task(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, he
         let execution = Execution { id: Uuid::new_v4(), task_id: task.id, worker_id: worker.id, attempt: attempt as u32,
             state: ExecutionState::Assigned, lease_until, started_at: None, finished_at: None, result: None };
         let (lease_capability, lease_capability_hash) = issue_lease_capability();
-        crate::git_broker::prepare_task_repo(&state, &project, task.id, execution.id, &git_credential).await?;
+        crate::git_broker::prepare_task_repo(state, &project, task.id, execution.id, &git_credential).await?;
         let mut worker_project = project.clone();
-        worker_project.repo_url = crate::git_broker::task_repo_url(&state, execution.id)?;
+        worker_project.repo_url = crate::git_broker::task_repo_url(state, execution.id)?;
         worker_project.git_auth = GitAuthConfig::default();
 
-        let mut tx = state.db.begin().await.map_err(db_error)?;
-        let claimed = sqlx::query("UPDATE tasks SET state='assigned',sticky_worker_id=COALESCE(sticky_worker_id,?),updated_at=? WHERE id=? AND state='queued'")
-            .bind(worker.id.to_string()).bind(ts(now)).bind(task.id.to_string()).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
-        if claimed == 0 {
-            tx.rollback().await.map_err(db_error)?;
-            crate::git_broker::remove_task_repo(&state, execution.id).await?;
+        if !persist_task_claim(state, &task, &worker, &execution, attempt, &lease_capability_hash, now).await? {
+            crate::git_broker::remove_task_repo(state, execution.id).await?;
             continue;
         }
-        // Snapshot the worker backend in effect at claim time so Insights
-        // breakdowns read durable per-attempt history, never mutable worker
-        // metadata. Columns are populated for rows claimed after the
-        // attempt-backend migration; older rows keep NULL ("unrecorded").
-        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,lease_capability_hash,worker_agent_type,worker_provider,worker_model) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(execution.id.to_string()).bind(task.id.to_string()).bind(worker.id.to_string()).bind(attempt)
-            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash)
-            .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone())
-            .execute(&mut *tx).await.map_err(db_error)?;
-        sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
-            .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
-        tx.commit().await.map_err(db_error)?;
         let mut assigned_task = task; assigned_task.state = TaskState::Assigned; assigned_task.updated_at = now;
-        return Ok(Json(Assignment { project: worker_project, task: assigned_task, execution, lease_capability }).into_response());
+        return Ok(Some(Assignment { project: worker_project, task: assigned_task, execution, lease_capability }));
     }
-    Ok(StatusCode::NO_CONTENT.into_response())
+    Ok(None)
 }
 
 async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, ApiError> {
     require_worker(&state.db, id, &headers).await?;
+    match claim_review_for_worker(&state, id, None).await? {
+        Some(assignment) => Ok(Json(assignment).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+pub(crate) async fn claim_review_for_worker(state: &AppState, id: Uuid, task_id: Option<Uuid>) -> Result<Option<ReviewAssignment>, ApiError> {
     let worker_row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?
         .ok_or((StatusCode::NOT_FOUND, "worker not found".into()))?;
     let worker = worker_from_row(&worker_row)?;
+    let internal_actor: i64 = worker_row.try_get("internal_actor").unwrap_or(0);
     if worker.role != AgentRole::Reviewer || worker.protocol_version < PROTOCOL_VERSION {
-        return Ok(StatusCode::NO_CONTENT.into_response());
+        return Ok(None);
     }
     if worker.running_slots >= worker.slots || !matches!(worker.state, WorkerState::Idle | WorkerState::Busy) {
-        return Ok(StatusCode::NO_CONTENT.into_response());
+        return Ok(None);
     }
 
     let settings = load_host_settings(&state.db).await?;
-    let rows = sqlx::query("SELECT * FROM tasks WHERE state='review' ORDER BY CASE WHEN (SELECT reviewer_worker_id FROM reviews r0 WHERE r0.task_id=tasks.id ORDER BY r0.created_at DESC LIMIT 1)=? THEN 0 ELSE 1 END, priority DESC, updated_at ASC LIMIT 100")
-        .bind(worker.id.to_string()).fetch_all(&state.db).await.map_err(db_error)?;
+    let rows = if let Some(task_id) = task_id {
+        sqlx::query("SELECT * FROM tasks WHERE id=? AND state='review' LIMIT 1")
+            .bind(task_id.to_string()).fetch_all(&state.db).await.map_err(db_error)?
+    } else {
+        sqlx::query("SELECT * FROM tasks WHERE state='review' ORDER BY CASE WHEN (SELECT reviewer_worker_id FROM reviews r0 WHERE r0.task_id=tasks.id ORDER BY r0.created_at DESC LIMIT 1)=? THEN 0 ELSE 1 END, priority DESC, updated_at ASC LIMIT 100")
+            .bind(worker.id.to_string()).fetch_all(&state.db).await.map_err(db_error)?
+    };
     for row in rows {
         let task = task_from_row(&row)?;
         let project_row = sqlx::query("SELECT * FROM projects WHERE id=? AND enabled=1")
             .bind(task.project_id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
         let Some(project_row) = project_row else { continue };
         let project = project_from_row(&project_row)?;
-        if !worker_can_run_project(&worker, &project) { continue; }
-        if review_reserved_for_live_preferred_reviewer(&state.db, &task, &project, worker.id).await? { continue; }
+        if internal_actor == 0 && !worker_can_run_project(&worker, &project) { continue; }
+        if internal_actor == 0 && review_reserved_for_live_preferred_reviewer(&state.db, &task, &project, worker.id).await? { continue; }
 
         let execution_row = sqlx::query("SELECT * FROM executions WHERE task_id=? AND state='completed' ORDER BY attempt DESC LIMIT 1")
             .bind(task.id.to_string()).fetch_optional(&state.db).await.map_err(db_error)?;
@@ -1726,7 +1815,7 @@ async fn claim_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, 
         // not a reviewer-quality retry, so no review row is created here.
         let integration = match reusable {
             Some(snapshot) => snapshot,
-            None => crate::git_broker::prepare_integration_snapshot(&state, &project, execution.id, &result).await?,
+            None => crate::git_broker::prepare_integration_snapshot(state, &project, execution.id, &result).await?,
         };
         if let Some(conflict) = integration.conflict.as_ref() {
             result.integration = Some(integration.clone());
@@ -1761,42 +1850,27 @@ This is an upstream integration retry, not a new implementation or reviewer reje
         };
         let (lease_capability, lease_capability_hash) = issue_lease_capability();
 
-        let mut tx = state.db.begin().await.map_err(db_error)?;
-        let still_review: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE id=? AND state='review'")
-            .bind(task.id.to_string()).fetch_one(&mut *tx).await.map_err(db_error)?;
-        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
-            .bind(task.id.to_string()).fetch_one(&mut *tx).await.map_err(db_error)?;
-        if still_review == 0 || active > 0 {
-            tx.rollback().await.map_err(db_error)?;
-            continue;
-        }
-        // Pin the review row to the task's current review cycle/epoch so the
-        // per-cycle retry limit counts only retries in this cycle. Automatic
-        // redispatch stays in the same cycle; only a manual retry_task bumps
-        // tasks.review_cycle. Historical rows keep their original cycle and
-        // remain counted in lifetime totals.
-        // Snapshot the reviewer backend at claim time alongside the cycle so
-        // Insights breakdowns read durable per-attempt history, never mutable
-        // worker metadata.
-        let review_cycle: i64 = sqlx::query_scalar("SELECT review_cycle FROM tasks WHERE id=?")
-            .bind(task.id.to_string()).fetch_one(&mut *tx).await.map_err(db_error)?;
-        // Only the claimant that won the active-review check may publish the
-        // clean snapshot into the execution envelope. Losing concurrent
-        // claimants cannot overwrite the review's pinned integration.
+        // Only the claimant that wins the atomic review insert may publish
+        // the clean integration snapshot into the execution envelope.
         result.integration = Some(integration.clone());
         execution.result = Some(result.clone());
-        sqlx::query("UPDATE executions SET result=? WHERE id=? AND state='completed'")
-            .bind(json(&result)?).bind(execution.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
-        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle,upstream_sha,integration_sha,effective_diff_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(review.id.to_string()).bind(task.id.to_string()).bind(execution.id.to_string()).bind(worker.id.to_string())
-            .bind("assigned").bind(ts(lease_until)).bind(ts(now)).bind(lease_capability_hash)
-            .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone()).bind(review_cycle)
-            .bind(&integration.upstream_sha).bind(&integration_sha).bind(&effective_diff_hash).execute(&mut *tx).await.map_err(db_conflict)?;
-        sqlx::query("UPDATE workers SET running_slots=running_slots+1,state='busy' WHERE id=?")
-            .bind(worker.id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
-        tx.commit().await.map_err(db_error)?;
+        if !persist_review_claim(
+            state,
+            &task,
+            &worker,
+            &execution,
+            &review,
+            &lease_capability_hash,
+            &result,
+            &integration.upstream_sha,
+            &integration_sha,
+            &effective_diff_hash,
+            now,
+        ).await? {
+            continue;
+        }
 
-        let review_repo_url = crate::git_broker::review_repo_url(&state, review.id)?;
+        let review_repo_url = crate::git_broker::review_repo_url(state, review.id)?;
         let mut worker_project = project.clone();
         worker_project.repo_url = review_repo_url.clone();
         worker_project.git_auth = GitAuthConfig::default();
@@ -1809,7 +1883,7 @@ This is an upstream integration retry, not a new implementation or reviewer reje
             upstream_sha: Some(integration.upstream_sha.clone()),
             integration_sha: Some(integration_sha),
         };
-        return Ok(Json(ReviewAssignment {
+        return Ok(Some(ReviewAssignment {
             review,
             project: worker_project,
             task,
@@ -1817,27 +1891,56 @@ This is an upstream integration retry, not a new implementation or reviewer reje
             implementation_worker,
             checkout,
             lease_capability,
-        }).into_response());
+        }));
     }
-    Ok(StatusCode::NO_CONTENT.into_response())
+    Ok(None)
 }
 
-async fn renew_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
-    let now = Utc::now();
-    let lease = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
-    let row = sqlx::query("SELECT reviewer_worker_id,lease_capability_hash FROM reviews WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
-        .bind(id.to_string()).bind(ts(now)).fetch_optional(&state.db).await.map_err(db_error)?
-        .ok_or((StatusCode::CONFLICT, "review is not active".into()))?;
-    let reviewer_worker_id = uuid(row.try_get("reviewer_worker_id").map_err(internal)?)?;
-    let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
-    require_worker(&state.db, reviewer_worker_id, &headers).await?;
-    require_lease_capability(&headers, &capability_hash)?;
-    sqlx::query("UPDATE reviews SET state='running',lease_until=?,started_at=COALESCE(started_at,?) WHERE id=? AND state IN ('assigned','running')")
-        .bind(ts(lease)).bind(ts(now)).bind(id.to_string()).execute(&state.db).await.map_err(db_error)?;
+async fn release_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    let capability = lease_capability_from_headers(&headers)?.to_string();
+    release_review_for_capability(&state, id, &capability, Some(&headers)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn renew_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    let capability = lease_capability_from_headers(&headers)?.to_string();
+    renew_review_for_capability(&state, id, &capability, Some(&headers)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn renew_review_for_capability(state: &AppState, id: Uuid, capability: &str, worker_headers: Option<&HeaderMap>) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let lease = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
+    let mut tx = state.db.begin().await.map_err(db_error)?;
+    let row = sqlx::query("SELECT task_id,execution_id,reviewer_worker_id,lease_capability_hash FROM reviews WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
+        .bind(id.to_string()).bind(ts(now)).fetch_optional(&mut *tx).await.map_err(db_error)?
+        .ok_or((StatusCode::CONFLICT, "review is not active".into()))?;
+    let task_id: String = row.try_get("task_id").map_err(internal)?;
+    let execution_id: String = row.try_get("execution_id").map_err(internal)?;
+    let reviewer_worker_id: String = row.try_get("reviewer_worker_id").map_err(internal)?;
+    let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
+    if let Some(headers) = worker_headers { require_worker(&state.db, uuid(reviewer_worker_id.clone())?, headers).await?; }
+    require_lease_capability_value(capability, &capability_hash)?;
+    let current_state: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+        .bind(&task_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
+    if current_state.as_deref() != Some("review") { return Err((StatusCode::CONFLICT, "task is no longer awaiting review".into())); }
+    let latest_execution: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(&task_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
+    if latest_execution.as_deref() != Some(execution_id.as_str()) { return Err((StatusCode::CONFLICT, "review targets a stale execution".into())); }
+    let changed = sqlx::query("UPDATE reviews SET state='running',lease_until=?,started_at=COALESCE(started_at,?) WHERE id=? AND state IN ('assigned','running') AND lease_capability_hash=?")
+        .bind(ts(lease)).bind(ts(now)).bind(id.to_string()).bind(&capability_hash).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if changed != 1 { return Err((StatusCode::CONFLICT, "review lease changed".into())); }
+    tx.commit().await.map_err(db_error)?;
+    Ok(())
+}
+
 async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(input): Json<FinishReview>) -> Result<StatusCode, ApiError> {
+    let capability = lease_capability_from_headers(&headers)?.to_string();
+    finish_review_for_capability(&state, id, &capability, &input.status, input.verdict, input.error, Some(&headers)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn finish_review_for_capability(state: &AppState, id: Uuid, capability: &str, status: &str, verdict: Option<ReviewVerdict>, error: Option<String>, worker_headers: Option<&HeaderMap>) -> Result<(), ApiError> {
     let settings = load_host_settings(&state.db).await?;
     let now = Utc::now();
     let mut tx = state.db.begin().await.map_err(db_error)?;
@@ -1848,8 +1951,8 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     let execution_id: String = row.try_get("execution_id").map_err(internal)?;
     let reviewer_worker_id: String = row.try_get("reviewer_worker_id").map_err(internal)?;
     let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
-    require_worker(&state.db, uuid(reviewer_worker_id.clone())?, &headers).await?;
-    require_lease_capability(&headers, &capability_hash)?;
+    if let Some(headers) = worker_headers { require_worker(&state.db, uuid(reviewer_worker_id.clone())?, headers).await?; }
+    require_lease_capability_value(capability, &capability_hash)?;
 
     let current_state: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
         .bind(&task_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
@@ -1861,10 +1964,11 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     if latest_execution.as_deref() != Some(execution_id.as_str()) {
         return Err((StatusCode::CONFLICT, "review targets a stale execution".into()));
     }
-    if input.status == "failed" {
-        let error = input.error.unwrap_or_else(|| "reviewer failed without an error message".into());
-        sqlx::query("UPDATE reviews SET state='failed',finished_at=?,verdict=?,lease_capability_hash=NULL WHERE id=?")
-            .bind(ts(now)).bind(json(&serde_json::json!({"error": error}))?).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+    if status == "failed" {
+        let error = error.unwrap_or_else(|| "reviewer failed without an error message".into());
+        let changed = sqlx::query("UPDATE reviews SET state='failed',finished_at=?,verdict=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running') AND lease_capability_hash=?")
+            .bind(ts(now)).bind(json(&serde_json::json!({"error": error}))?).bind(id.to_string()).bind(&capability_hash).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+        if changed != 1 { return Err((StatusCode::CONFLICT, "review lease changed".into())); }
         // Lost leases count as reviewer runtime/infrastructure failures for
         // the same implementation candidate: combine failed+lost rows when
         // enforcing review_failure_limit. Historical rows are preserved.
@@ -1874,24 +1978,28 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
             .bind(&task_id).bind(&execution_id).fetch_one(&mut *tx).await.map_err(db_error)?;
         if review_runtime_failures_exhausted(failed_count, lost_count, settings.review_failure_limit) {
             let feedback = review_runtime_blocked_feedback(failed_count, lost_count, settings.review_failure_limit, &format!("Last error: {error}"));
-            sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
-                .bind(feedback).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+            let task_changed = sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,updated_at=? WHERE id=? AND state='review'")
+                .bind(feedback).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+            if task_changed != 1 { return Err((StatusCode::CONFLICT, "task review ownership changed".into())); }
         } else {
-            sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
-                .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+            let task_changed = sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
+                .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+            if task_changed != 1 { return Err((StatusCode::CONFLICT, "task review ownership changed".into())); }
         }
     } else {
-        let verdict = input.verdict.ok_or((StatusCode::BAD_REQUEST, "completed review requires a verdict".into()))?;
+        let verdict = verdict.ok_or((StatusCode::BAD_REQUEST, "completed review requires a verdict".into()))?;
         let reason = verdict.reason.trim();
         if reason.is_empty() {
             return Err((StatusCode::BAD_REQUEST, "review verdict requires a reason".into()));
         }
-        sqlx::query("UPDATE reviews SET state='completed',finished_at=?,verdict=?,lease_capability_hash=NULL WHERE id=?")
-            .bind(ts(now)).bind(json(&verdict)?).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
+        let changed = sqlx::query("UPDATE reviews SET state='completed',finished_at=?,verdict=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running') AND lease_capability_hash=?")
+            .bind(ts(now)).bind(json(&verdict)?).bind(id.to_string()).bind(&capability_hash).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+        if changed != 1 { return Err((StatusCode::CONFLICT, "review lease changed".into())); }
         match verdict.verdict {
             ReviewVerdictKind::Approve => {
-                sqlx::query("UPDATE tasks SET state='merge_pending',updated_at=? WHERE id=? AND state='review'")
-                    .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+                let task_changed = sqlx::query("UPDATE tasks SET state='merge_pending',updated_at=? WHERE id=? AND state='review'")
+                    .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+                if task_changed != 1 { return Err((StatusCode::CONFLICT, "task review ownership changed".into())); }
             }
             ReviewVerdictKind::Retry => {
                 let implementation_worker_id: String = sqlx::query_scalar("SELECT worker_id FROM executions WHERE id=?")
@@ -1914,11 +2022,13 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
                     let feedback = format!(
                         "Reviewer requested implementation changes {reviewer_retries} times in the current review cycle; automatic redispatch stopped at loop limit {}. Last feedback: {reason}", settings.review_retry_limit
                     );
-                    sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
-                        .bind(feedback).bind(implementation_worker_id).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+                    let task_changed = sqlx::query("UPDATE tasks SET state='blocked',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
+                        .bind(feedback).bind(implementation_worker_id).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+                    if task_changed != 1 { return Err((StatusCode::CONFLICT, "task review ownership changed".into())); }
                 } else {
-                    sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
-                        .bind(reason).bind(implementation_worker_id).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+                    let task_changed = sqlx::query("UPDATE tasks SET state='queued',review_feedback=?,sticky_worker_id=?,updated_at=? WHERE id=? AND state='review'")
+                        .bind(reason).bind(implementation_worker_id).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+                    if task_changed != 1 { return Err((StatusCode::CONFLICT, "task review ownership changed".into())); }
                 }
             }
         }
@@ -1926,10 +2036,22 @@ async fn finish_review(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
     sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
         .bind(&reviewer_worker_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
+    Ok(())
+}
+
+async fn release_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    let capability = lease_capability_from_headers(&headers)?.to_string();
+    release_execution_for_capability(&state, id, &capability, Some(&headers)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn renew_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    let capability = lease_capability_from_headers(&headers)?.to_string();
+    renew_execution_for_capability(&state, id, &capability, Some(&headers)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn renew_execution_for_capability(state: &AppState, id: Uuid, capability: &str, worker_headers: Option<&HeaderMap>) -> Result<(), ApiError> {
     let now = Utc::now();
     let lease = now + chrono::Duration::seconds(DEFAULT_LEASE_SECONDS);
     let mut tx = state.db.begin().await.map_err(db_error)?;
@@ -1939,19 +2061,26 @@ async fn renew_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>
     let task_id: String = row.try_get("task_id").map_err(internal)?;
     let worker_id: String = row.try_get("worker_id").map_err(internal)?;
     let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
-    let worker_id = uuid(worker_id)?;
-    require_worker(&state.db, worker_id, &headers).await?;
-    require_lease_capability(&headers, &capability_hash)?;
+    if let Some(headers) = worker_headers { require_worker(&state.db, uuid(worker_id.clone())?, headers).await?; }
+    require_lease_capability_value(capability, &capability_hash)?;
     if !is_latest_execution(&mut tx, &task_id, id).await? { return Err((StatusCode::CONFLICT, "stale execution".into())); }
-    sqlx::query("UPDATE executions SET state='running',lease_until=?,started_at=COALESCE(started_at,?) WHERE id=?")
-        .bind(ts(lease)).bind(ts(now)).bind(id.to_string()).execute(&mut *tx).await.map_err(db_error)?;
-    sqlx::query("UPDATE tasks SET state='running',updated_at=? WHERE id=? AND state IN ('assigned','running')")
-        .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+    let changed = sqlx::query("UPDATE executions SET state='running',lease_until=?,started_at=COALESCE(started_at,?) WHERE id=? AND state IN ('assigned','running') AND lease_capability_hash=?")
+        .bind(ts(lease)).bind(ts(now)).bind(id.to_string()).bind(&capability_hash).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if changed != 1 { return Err((StatusCode::CONFLICT, "execution lease changed".into())); }
+    let task_changed = sqlx::query("UPDATE tasks SET state='running',updated_at=? WHERE id=? AND state IN ('assigned','running')")
+        .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if task_changed != 1 { return Err((StatusCode::CONFLICT, "task ownership changed".into())); }
     tx.commit().await.map_err(db_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(input): Json<FinishExecution>) -> Result<StatusCode, ApiError> {
+    let capability = lease_capability_from_headers(&headers)?.to_string();
+    finish_execution_for_capability(&state, id, &capability, input.result, Some(&headers)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn finish_execution_for_capability(state: &AppState, id: Uuid, capability: &str, result: ExecutionResult, worker_headers: Option<&HeaderMap>) -> Result<(), ApiError> {
     let now = Utc::now();
     let mut tx = state.db.begin().await.map_err(db_error)?;
     let row = sqlx::query("SELECT task_id,worker_id,lease_capability_hash FROM executions WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
@@ -1960,19 +2089,94 @@ async fn finish_execution(Path(id): Path<Uuid>, State(state): State<Arc<AppState
     let task_id: String = row.try_get("task_id").map_err(internal)?;
     let worker_id: String = row.try_get("worker_id").map_err(internal)?;
     let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
-    require_worker(&state.db, uuid(worker_id.clone())?, &headers).await?;
-    require_lease_capability(&headers, &capability_hash)?;
+    if let Some(headers) = worker_headers { require_worker(&state.db, uuid(worker_id.clone())?, headers).await?; }
+    require_lease_capability_value(capability, &capability_hash)?;
     if !is_latest_execution(&mut tx, &task_id, id).await? { return Err((StatusCode::CONFLICT, "stale execution".into())); }
-    let success = input.result.status == "completed";
-    sqlx::query("UPDATE executions SET state=?,finished_at=?,result=?,lease_capability_hash=NULL WHERE id=?")
-        .bind(if success { "completed" } else { "failed" }).bind(ts(now)).bind(json(&input.result)?).bind(id.to_string())
-        .execute(&mut *tx).await.map_err(db_error)?;
-    sqlx::query("UPDATE tasks SET state=?,sticky_worker_id=CASE WHEN ? THEN sticky_worker_id ELSE NULL END,updated_at=? WHERE id=?")
-        .bind(if success { "review" } else { "failed" }).bind(success).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?;
+    let success = result.status == "completed";
+    let changed = sqlx::query("UPDATE executions SET state=?,finished_at=?,result=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running') AND lease_capability_hash=?")
+        .bind(if success { "completed" } else { "failed" }).bind(ts(now)).bind(json(&result)?).bind(id.to_string()).bind(&capability_hash)
+        .execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if changed != 1 { return Err((StatusCode::CONFLICT, "execution lease changed".into())); }
+    let task_changed = sqlx::query("UPDATE tasks SET state=?,sticky_worker_id=CASE WHEN ? THEN sticky_worker_id ELSE NULL END,updated_at=? WHERE id=? AND state IN ('assigned','running')")
+        .bind(if success { "review" } else { "failed" }).bind(success).bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if task_changed != 1 { return Err((StatusCode::CONFLICT, "task ownership changed".into())); }
     sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
         .bind(&worker_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkLeaseKind { Implementation, Review }
+
+pub(crate) async fn work_lease_kind(state: &AppState, id: Uuid) -> Result<WorkLeaseKind, ApiError> {
+    let execution: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM executions WHERE id=?")
+        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    if execution > 0 { return Ok(WorkLeaseKind::Implementation); }
+    let review: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE id=?")
+        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
+    if review > 0 { return Ok(WorkLeaseKind::Review); }
+    Err((StatusCode::NOT_FOUND, "work lease not found".into()))
+}
+
+pub(crate) async fn release_execution_for_capability(state: &AppState, id: Uuid, capability: &str, worker_headers: Option<&HeaderMap>) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let mut tx = state.db.begin().await.map_err(db_error)?;
+    let row = sqlx::query("SELECT task_id,worker_id,lease_capability_hash FROM executions WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
+        .bind(id.to_string()).bind(ts(now)).fetch_optional(&mut *tx).await.map_err(db_error)?
+        .ok_or((StatusCode::CONFLICT, "execution is not active".into()))?;
+    let task_id: String = row.try_get("task_id").map_err(internal)?;
+    let worker_id: String = row.try_get("worker_id").map_err(internal)?;
+    let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
+    if let Some(headers) = worker_headers { require_worker(&state.db, uuid(worker_id.clone())?, headers).await?; }
+    require_lease_capability_value(capability, &capability_hash)?;
+    if !is_latest_execution(&mut tx, &task_id, id).await? { return Err((StatusCode::CONFLICT, "stale execution".into())); }
+    let task_state: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+        .bind(&task_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
+    if !matches!(task_state.as_deref(), Some("assigned") | Some("running")) { return Err((StatusCode::CONFLICT, "task is no longer owned by this execution".into())); }
+    let changed = sqlx::query("UPDATE executions SET state='cancelled',finished_at=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running') AND lease_capability_hash=?")
+        .bind(ts(now)).bind(id.to_string()).bind(&capability_hash).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if changed != 1 { return Err((StatusCode::CONFLICT, "execution lease changed".into())); }
+    let task_changed = sqlx::query("UPDATE tasks SET state='queued',sticky_worker_id=NULL,updated_at=? WHERE id=? AND state IN ('assigned','running')")
+        .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if task_changed != 1 { return Err((StatusCode::CONFLICT, "task ownership changed".into())); }
+    sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
+        .bind(&worker_id).execute(&mut *tx).await.map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    if let Err((_, message)) = crate::git_broker::remove_task_repo(state, id).await {
+        warn!(execution_id=%id, error=%message, "released execution repo cleanup failed");
+    }
+    Ok(())
+}
+
+pub(crate) async fn release_review_for_capability(state: &AppState, id: Uuid, capability: &str, worker_headers: Option<&HeaderMap>) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let mut tx = state.db.begin().await.map_err(db_error)?;
+    let row = sqlx::query("SELECT task_id,execution_id,reviewer_worker_id,lease_capability_hash FROM reviews WHERE id=? AND state IN ('assigned','running') AND lease_until>=? AND lease_capability_hash IS NOT NULL")
+        .bind(id.to_string()).bind(ts(now)).fetch_optional(&mut *tx).await.map_err(db_error)?
+        .ok_or((StatusCode::CONFLICT, "review is not active".into()))?;
+    let task_id: String = row.try_get("task_id").map_err(internal)?;
+    let execution_id: String = row.try_get("execution_id").map_err(internal)?;
+    let reviewer_worker_id: String = row.try_get("reviewer_worker_id").map_err(internal)?;
+    let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
+    if let Some(headers) = worker_headers { require_worker(&state.db, uuid(reviewer_worker_id.clone())?, headers).await?; }
+    require_lease_capability_value(capability, &capability_hash)?;
+    let current_state: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+        .bind(&task_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
+    if current_state.as_deref() != Some("review") { return Err((StatusCode::CONFLICT, "task is no longer awaiting review".into())); }
+    let latest_execution: Option<String> = sqlx::query_scalar("SELECT id FROM executions WHERE task_id=? ORDER BY attempt DESC LIMIT 1")
+        .bind(&task_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
+    if latest_execution.as_deref() != Some(execution_id.as_str()) { return Err((StatusCode::CONFLICT, "review targets a stale execution".into())); }
+    let changed = sqlx::query("UPDATE reviews SET state='cancelled',finished_at=?,lease_capability_hash=NULL WHERE id=? AND state IN ('assigned','running') AND lease_capability_hash=?")
+        .bind(ts(now)).bind(id.to_string()).bind(&capability_hash).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if changed != 1 { return Err((StatusCode::CONFLICT, "review lease changed".into())); }
+    let task_changed = sqlx::query("UPDATE tasks SET updated_at=? WHERE id=? AND state='review'")
+        .bind(ts(now)).bind(&task_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+    if task_changed != 1 { return Err((StatusCode::CONFLICT, "task review ownership changed".into())); }
+    sqlx::query("UPDATE workers SET running_slots=MAX(running_slots-1,0),state=CASE WHEN state IN ('pending','draining','degraded') THEN state WHEN running_slots<=1 THEN 'idle' ELSE 'busy' END WHERE id=?")
+        .bind(&reviewer_worker_id).execute(&mut *tx).await.map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(())
 }
 
 fn issue_lease_capability() -> (String, String) {
@@ -1981,15 +2185,22 @@ fn issue_lease_capability() -> (String, String) {
     (capability, hash)
 }
 
-pub(crate) fn require_lease_capability(headers: &HeaderMap, stored_hash: &str) -> Result<(), ApiError> {
-    let supplied = headers
+fn lease_capability_from_headers(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
         .get(LEASE_CAPABILITY_HEADER)
         .and_then(|value| value.to_str().ok())
-        .ok_or((StatusCode::UNAUTHORIZED, "lease capability required".into()))?;
+        .ok_or((StatusCode::UNAUTHORIZED, "lease capability required".into()))
+}
+
+fn require_lease_capability_value(supplied: &str, stored_hash: &str) -> Result<(), ApiError> {
     if !secure_hash_eq(&hash_secret(supplied), stored_hash) {
         return Err((StatusCode::UNAUTHORIZED, "lease capability rejected".into()));
     }
     Ok(())
+}
+
+pub(crate) fn require_lease_capability(headers: &HeaderMap, stored_hash: &str) -> Result<(), ApiError> {
+    require_lease_capability_value(lease_capability_from_headers(headers)?, stored_hash)
 }
 
 pub(crate) async fn require_worker(db: &SqlitePool, worker_id: Uuid, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -2035,6 +2246,8 @@ async fn sticky_worker_reservation_active(
         .await
         .map_err(db_error)?;
     let Some(row) = row else { return Ok(false); };
+    let internal_actor: i64 = row.try_get("internal_actor").unwrap_or(0);
+    if internal_actor != 0 { return Ok(false); }
     let preferred = worker_from_row(&row)?;
     let fresh_after = Utc::now() - chrono::Duration::seconds(45);
     Ok(preferred.role == AgentRole::Worker
@@ -2066,6 +2279,8 @@ async fn review_reserved_for_live_preferred_reviewer(
         .await
         .map_err(db_error)?;
     let Some(row) = row else { return Ok(false); };
+    let internal_actor: i64 = row.try_get("internal_actor").unwrap_or(0);
+    if internal_actor != 0 { return Ok(false); }
     let preferred = worker_from_row(&row)?;
     let fresh_after = Utc::now() - chrono::Duration::seconds(45);
     let live = preferred.role == AgentRole::Reviewer
@@ -2843,7 +3058,7 @@ fn review_retries_exhausted(reviewer_retries: i64, limit: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     #[test]
     fn reviewer_runtime_failures_are_bounded() {
@@ -3002,6 +3217,480 @@ mod tests {
         };
         assert!(resolve_agent_selection(&unselected, Some("only-provider".into()), None, false).is_err());
         assert!(resolve_agent_selection(&unselected, None, Some("only-model".into()), false).is_err());
+    }
+
+
+    async fn lease_test_state() -> Arc<AppState> {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        Arc::new(AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: std::env::temp_dir().join(format!("lazyteam-work-lease-test-{}", Uuid::new_v4())),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+            oauth_login_states: Default::default(),
+        })
+    }
+
+
+    async fn race_lease_test_state() -> Arc<AppState> {
+        let root = std::env::temp_dir().join(format!("lazyteam-work-race-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(root.join("state.db"))
+            .create_if_missing(true)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let db = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        Arc::new(AppState {
+            db,
+            public_url: None,
+            oauth_password: None,
+            git_credential_key: None,
+            git_root: root.join("git"),
+            agent_auth_updates: Default::default(),
+            model_refresh_requests: Default::default(),
+            oauth_login_states: Default::default(),
+        })
+    }
+
+    async fn task_for_test(state: &AppState, task_id: Uuid) -> Task {
+        let row = sqlx::query("SELECT * FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        task_from_row(&row).unwrap()
+    }
+
+    async fn worker_for_test(state: &AppState, worker_id: Uuid) -> Worker {
+        let row = sqlx::query("SELECT * FROM workers WHERE id=?")
+            .bind(worker_id.to_string()).fetch_one(&state.db).await.unwrap();
+        worker_from_row(&row).unwrap()
+    }
+
+    async fn seed_real_race_worker(state: &AppState, role: AgentRole) -> Worker {
+        let id = Uuid::new_v4();
+        let now = ts(Utc::now());
+        let role_name = match role { AgentRole::Worker => "worker", AgentRole::Reviewer => "reviewer" };
+        sqlx::query("INSERT INTO workers(id,name,role,state,os,arch,tags,allowed_projects,slots,running_slots,protocol_version,worker_version,last_heartbeat_at,created_at,agent_provider,agent_model,agent_capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(id.to_string()).bind(format!("race-{role_name}")).bind(role_name).bind("idle").bind("linux").bind("x86_64")
+            .bind("{}").bind("[\"*\"]").bind(1_i64).bind(0_i64).bind(PROTOCOL_VERSION as i64).bind("test")
+            .bind(&now).bind(&now).bind("prov").bind("mod")
+            .bind(r#"{"models":[{"provider":"prov","id":"mod"}]}"#)
+            .execute(&state.db).await.unwrap();
+        worker_for_test(state, id).await
+    }
+
+    fn test_execution(task_id: Uuid, worker_id: Uuid, id: Uuid, attempt: u32) -> Execution {
+        Execution {
+            id,
+            task_id,
+            worker_id,
+            attempt,
+            state: ExecutionState::Assigned,
+            lease_until: Utc::now() + chrono::Duration::minutes(5),
+            started_at: None,
+            finished_at: None,
+            result: None,
+        }
+    }
+
+    fn completed_test_result() -> ExecutionResult {
+        ExecutionResult {
+            status: "completed".into(),
+            summary: "done".into(),
+            commit_sha: Some("candidate".into()),
+            base_sha: Some("base".into()),
+            patch: None,
+            patch_truncated: false,
+            workspace_clean: Some(true),
+            review_ref: Some("lazyteam/test".into()),
+            changed_files: vec![],
+            validation: vec![],
+            warnings: vec![],
+            artifacts: vec![],
+            integration: None,
+        }
+    }
+
+    async fn seed_completed_execution_for_race(state: &AppState, task_id: Uuid) -> Execution {
+        let impl_id = ensure_internal_work_actor(state, AgentRole::Worker).await.unwrap();
+        let now = Utc::now();
+        let mut execution = test_execution(task_id, impl_id, Uuid::new_v4(), 1);
+        execution.state = ExecutionState::Completed;
+        execution.finished_at = Some(now);
+        execution.result = Some(completed_test_result());
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,finished_at,result,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(execution.id.to_string()).bind(task_id.to_string()).bind(impl_id.to_string()).bind(1_i64).bind("completed")
+            .bind(ts(execution.lease_until)).bind(ts(now)).bind(json(execution.result.as_ref().unwrap()).unwrap()).bind(ts(now))
+            .execute(&state.db).await.unwrap();
+        execution
+    }
+
+    async fn seed_lease_test_project_task(state: &AppState, task_state: &str) -> (Uuid, Uuid) {
+        let now = ts(Utc::now());
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,slug,name,repo_url,default_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(project_id.to_string()).bind(format!("p-{project_id}")).bind("P").bind("https://example.invalid/repo.git").bind("main").bind(&now).bind(&now)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,project_id,title,description,expected_outcome,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(task_id.to_string()).bind(project_id.to_string()).bind("lease task").bind("").bind("").bind(task_state).bind(&now).bind(&now)
+            .execute(&state.db).await.unwrap();
+        (project_id, task_id)
+    }
+
+
+    async fn seed_active_review_lease(state: &AppState, retry_limit: i64) -> (Uuid, Uuid, String, Uuid) {
+        sqlx::query("UPDATE host_settings SET review_retry_limit=? WHERE id=1")
+            .bind(retry_limit).execute(&state.db).await.unwrap();
+        let (_, task_id) = seed_lease_test_project_task(state, "review").await;
+        let implementation_worker = ensure_internal_work_actor(state, AgentRole::Worker).await.unwrap();
+        let reviewer = ensure_internal_work_actor(state, AgentRole::Reviewer).await.unwrap();
+        let execution_id = Uuid::new_v4();
+        let review_id = Uuid::new_v4();
+        let now = Utc::now();
+        let lease_until = now + chrono::Duration::minutes(5);
+        let result = ExecutionResult {
+            status: "completed".into(),
+            summary: "done".into(),
+            commit_sha: Some("candidate".into()),
+            base_sha: Some("base".into()),
+            patch: None,
+            patch_truncated: false,
+            workspace_clean: Some(true),
+            review_ref: Some("lazyteam/test".into()),
+            changed_files: vec![],
+            validation: vec![],
+            warnings: vec![],
+            artifacts: vec![],
+            integration: None,
+        };
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,finished_at,result,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(execution_id.to_string()).bind(task_id.to_string()).bind(implementation_worker.to_string()).bind(1_i64).bind("completed")
+            .bind(ts(now)).bind(ts(now)).bind(json(&result).unwrap()).bind(ts(now))
+            .execute(&state.db).await.unwrap();
+        let (capability, capability_hash) = issue_lease_capability();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,review_cycle) VALUES(?,?,?,?,?,?,?,?,0)")
+            .bind(review_id.to_string()).bind(task_id.to_string()).bind(execution_id.to_string()).bind(reviewer.to_string()).bind("assigned")
+            .bind(ts(lease_until)).bind(ts(now)).bind(capability_hash)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE workers SET running_slots=1,state='busy' WHERE id=?")
+            .bind(reviewer.to_string()).execute(&state.db).await.unwrap();
+        (task_id, review_id, capability, implementation_worker)
+    }
+
+
+    #[tokio::test]
+    async fn two_interactive_implementation_picks_have_one_authoritative_owner() {
+        let state = race_lease_test_state().await;
+        let (_, task_id) = seed_lease_test_project_task(&state, "queued").await;
+        let task = task_for_test(&state, task_id).await;
+        let actor_id = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();
+        let actor = worker_for_test(&state, actor_id).await;
+        let a = test_execution(task_id, actor_id, Uuid::new_v4(), 1);
+        let b = test_execution(task_id, actor_id, Uuid::new_v4(), 1);
+        let (_, ah) = issue_lease_capability();
+        let (_, bh) = issue_lease_capability();
+        let now = Utc::now();
+
+        let (ra, rb) = tokio::join!(
+            persist_task_claim(&state, &task, &actor, &a, 1, &ah, now),
+            persist_task_claim(&state, &task, &actor, &b, 1, &bh, now),
+        );
+        let won = [ra.unwrap(), rb.unwrap()].into_iter().filter(|won| *won).count();
+        assert_eq!(won, 1);
+        let owners: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM executions WHERE task_id=? AND state IN ('assigned','running')")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(owners, 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_implementation_and_rest_worker_share_one_claim_cas() {
+        let state = race_lease_test_state().await;
+        let (_, task_id) = seed_lease_test_project_task(&state, "queued").await;
+        let task = task_for_test(&state, task_id).await;
+        let actor_id = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();
+        let actor = worker_for_test(&state, actor_id).await;
+        let rest_worker = seed_real_race_worker(&state, AgentRole::Worker).await;
+        let interactive = test_execution(task_id, actor.id, Uuid::new_v4(), 1);
+        let rest = test_execution(task_id, rest_worker.id, Uuid::new_v4(), 1);
+        let (_, ih) = issue_lease_capability();
+        let (_, rh) = issue_lease_capability();
+        let now = Utc::now();
+
+        let (ri, rr) = tokio::join!(
+            persist_task_claim(&state, &task, &actor, &interactive, 1, &ih, now),
+            persist_task_claim(&state, &task, &rest_worker, &rest, 1, &rh, now),
+        );
+        let won = [ri.unwrap(), rr.unwrap()].into_iter().filter(|won| *won).count();
+        assert_eq!(won, 1);
+        let owners: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM executions WHERE task_id=? AND state IN ('assigned','running')")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(owners, 1);
+    }
+
+    #[tokio::test]
+    async fn two_interactive_review_picks_have_one_authoritative_owner() {
+        let state = race_lease_test_state().await;
+        let (_, task_id) = seed_lease_test_project_task(&state, "review").await;
+        let task = task_for_test(&state, task_id).await;
+        let execution = seed_completed_execution_for_race(&state, task_id).await;
+        let actor_id = ensure_internal_work_actor(&state, AgentRole::Reviewer).await.unwrap();
+        let actor = worker_for_test(&state, actor_id).await;
+        let now = Utc::now();
+        let a = ReviewLease { id: Uuid::new_v4(), task_id, execution_id: execution.id, reviewer_worker_id: actor.id, lease_until: now + chrono::Duration::minutes(5) };
+        let b = ReviewLease { id: Uuid::new_v4(), task_id, execution_id: execution.id, reviewer_worker_id: actor.id, lease_until: now + chrono::Duration::minutes(5) };
+        let (_, ah) = issue_lease_capability();
+        let (_, bh) = issue_lease_capability();
+        let result = completed_test_result();
+
+        let (ra, rb) = tokio::join!(
+            persist_review_claim(&state, &task, &actor, &execution, &a, &ah, &result, "upstream", "integration", "diff", now),
+            persist_review_claim(&state, &task, &actor, &execution, &b, &bh, &result, "upstream", "integration", "diff", now),
+        );
+        let won = [ra.unwrap(), rb.unwrap()].into_iter().filter(|won| *won).count();
+        assert_eq!(won, 1);
+        let owners: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(owners, 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_review_and_rest_reviewer_share_one_claim_cas() {
+        let state = race_lease_test_state().await;
+        let (_, task_id) = seed_lease_test_project_task(&state, "review").await;
+        let task = task_for_test(&state, task_id).await;
+        let execution = seed_completed_execution_for_race(&state, task_id).await;
+        let actor_id = ensure_internal_work_actor(&state, AgentRole::Reviewer).await.unwrap();
+        let actor = worker_for_test(&state, actor_id).await;
+        let rest_reviewer = seed_real_race_worker(&state, AgentRole::Reviewer).await;
+        let now = Utc::now();
+        let interactive = ReviewLease { id: Uuid::new_v4(), task_id, execution_id: execution.id, reviewer_worker_id: actor.id, lease_until: now + chrono::Duration::minutes(5) };
+        let rest = ReviewLease { id: Uuid::new_v4(), task_id, execution_id: execution.id, reviewer_worker_id: rest_reviewer.id, lease_until: now + chrono::Duration::minutes(5) };
+        let (_, ih) = issue_lease_capability();
+        let (_, rh) = issue_lease_capability();
+        let result = completed_test_result();
+
+        let (ri, rr) = tokio::join!(
+            persist_review_claim(&state, &task, &actor, &execution, &interactive, &ih, &result, "upstream", "integration", "diff", now),
+            persist_review_claim(&state, &task, &rest_reviewer, &execution, &rest, &rh, &result, "upstream", "integration", "diff", now),
+        );
+        let won = [ri.unwrap(), rr.unwrap()].into_iter().filter(|won| *won).count();
+        assert_eq!(won, 1);
+        let owners: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE task_id=? AND state IN ('assigned','running')")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(owners, 1);
+    }
+
+    #[tokio::test]
+    async fn internal_work_actors_are_hidden_from_worker_inventory() {
+        let state = lease_test_state().await;
+        let implementation = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();
+        let review = ensure_internal_work_actor(&state, AgentRole::Reviewer).await.unwrap();
+        assert_ne!(implementation, review);
+
+        let Json(workers) = list_workers(State(state.clone())).await.unwrap();
+        assert!(workers.is_empty(), "internal actors leaked into workers_list");
+
+        let internal_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workers WHERE internal_actor=1")
+            .fetch_one(&state.db).await.unwrap();
+        assert_eq!(internal_count, 2);
+    }
+
+
+    #[tokio::test]
+    async fn expired_implementation_lease_cannot_finish() {
+        let state = lease_test_state().await;
+        let (_, task_id) = seed_lease_test_project_task(&state, "assigned").await;
+        let worker_id = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();
+        let execution_id = Uuid::new_v4();
+        let now = Utc::now();
+        let expired = now - chrono::Duration::seconds(1);
+        let (capability, capability_hash) = issue_lease_capability();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,lease_capability_hash) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(execution_id.to_string()).bind(task_id.to_string()).bind(worker_id.to_string()).bind(1_i64).bind("assigned")
+            .bind(ts(expired)).bind(ts(now)).bind(capability_hash)
+            .execute(&state.db).await.unwrap();
+        let error = finish_execution_for_capability(
+            &state,
+            execution_id,
+            &capability,
+            completed_test_result(),
+            None,
+        ).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn implementation_release_requeues_without_failure_and_revokes_capability() {
+        let state = lease_test_state().await;
+        let (_, task_id) = seed_lease_test_project_task(&state, "assigned").await;
+        let worker_id = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();
+        let execution_id = Uuid::new_v4();
+        let now = Utc::now();
+        let lease_until = now + chrono::Duration::minutes(5);
+        let (capability, capability_hash) = issue_lease_capability();
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,created_at,lease_capability_hash) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(execution_id.to_string()).bind(task_id.to_string()).bind(worker_id.to_string()).bind(1_i64).bind("assigned")
+            .bind(ts(lease_until)).bind(ts(now)).bind(capability_hash)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE workers SET running_slots=1,state='busy' WHERE id=?")
+            .bind(worker_id.to_string()).execute(&state.db).await.unwrap();
+
+        release_execution_for_capability(&state, execution_id, &capability, None).await.unwrap();
+
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?").bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        let execution_state: String = sqlx::query_scalar("SELECT state FROM executions WHERE id=?").bind(execution_id.to_string()).fetch_one(&state.db).await.unwrap();
+        let capability_after: Option<String> = sqlx::query_scalar("SELECT lease_capability_hash FROM executions WHERE id=?").bind(execution_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(task_state, "queued");
+        assert_eq!(execution_state, "cancelled");
+        assert!(capability_after.is_none());
+
+        let stale = renew_execution_for_capability(&state, execution_id, &capability, None).await.unwrap_err();
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn review_release_keeps_review_state_and_does_not_count_retry_or_failure() {
+        let state = lease_test_state().await;
+        let (_, task_id) = seed_lease_test_project_task(&state, "review").await;
+        let implementation_worker = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();
+        let reviewer = ensure_internal_work_actor(&state, AgentRole::Reviewer).await.unwrap();
+        let execution_id = Uuid::new_v4();
+        let review_id = Uuid::new_v4();
+        let now = Utc::now();
+        let lease_until = now + chrono::Duration::minutes(5);
+        let result = ExecutionResult {
+            status: "completed".into(),
+            summary: "done".into(),
+            commit_sha: Some("candidate".into()),
+            base_sha: Some("base".into()),
+            patch: None,
+            patch_truncated: false,
+            workspace_clean: Some(true),
+            review_ref: Some("lazyteam/test".into()),
+            changed_files: vec![],
+            validation: vec![],
+            warnings: vec![],
+            artifacts: vec![],
+            integration: None,
+        };
+        sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,finished_at,result,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(execution_id.to_string()).bind(task_id.to_string()).bind(implementation_worker.to_string()).bind(1_i64).bind("completed")
+            .bind(ts(now)).bind(ts(now)).bind(json(&result).unwrap()).bind(ts(now))
+            .execute(&state.db).await.unwrap();
+        let (capability, capability_hash) = issue_lease_capability();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(review_id.to_string()).bind(task_id.to_string()).bind(execution_id.to_string()).bind(reviewer.to_string()).bind("assigned")
+            .bind(ts(lease_until)).bind(ts(now)).bind(capability_hash)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE workers SET running_slots=1,state='busy' WHERE id=?")
+            .bind(reviewer.to_string()).execute(&state.db).await.unwrap();
+
+        release_review_for_capability(&state, review_id, &capability, None).await.unwrap();
+
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?").bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        let review_state: String = sqlx::query_scalar("SELECT state FROM reviews WHERE id=?").bind(review_id.to_string()).fetch_one(&state.db).await.unwrap();
+        let counted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE id=? AND state IN ('failed','lost','completed')")
+            .bind(review_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(task_state, "review");
+        assert_eq!(review_state, "cancelled");
+        assert_eq!(counted, 0);
+
+        let stale = renew_review_for_capability(&state, review_id, &capability, None).await.unwrap_err();
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn review_finish_rejects_lease_pinned_to_old_execution() {
+        let state = lease_test_state().await;
+        let (_, task_id) = seed_lease_test_project_task(&state, "review").await;
+        let implementation_worker = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();
+        let reviewer = ensure_internal_work_actor(&state, AgentRole::Reviewer).await.unwrap();
+        let now = Utc::now();
+        let lease_until = now + chrono::Duration::minutes(5);
+        let old_execution = Uuid::new_v4();
+        let new_execution = Uuid::new_v4();
+        let review_id = Uuid::new_v4();
+        let result = ExecutionResult {
+            status: "completed".into(),
+            summary: "done".into(),
+            commit_sha: Some("candidate".into()),
+            base_sha: Some("base".into()),
+            patch: None,
+            patch_truncated: false,
+            workspace_clean: Some(true),
+            review_ref: Some("lazyteam/test".into()),
+            changed_files: vec![],
+            validation: vec![],
+            warnings: vec![],
+            artifacts: vec![],
+            integration: None,
+        };
+        for (execution_id, attempt) in [(old_execution, 1_i64), (new_execution, 2_i64)] {
+            sqlx::query("INSERT INTO executions(id,task_id,worker_id,attempt,state,lease_until,finished_at,result,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+                .bind(execution_id.to_string()).bind(task_id.to_string()).bind(implementation_worker.to_string()).bind(attempt).bind("completed")
+                .bind(ts(now)).bind(ts(now)).bind(json(&result).unwrap()).bind(ts(now))
+                .execute(&state.db).await.unwrap();
+        }
+        let (capability, capability_hash) = issue_lease_capability();
+        sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(review_id.to_string()).bind(task_id.to_string()).bind(old_execution.to_string()).bind(reviewer.to_string()).bind("assigned")
+            .bind(ts(lease_until)).bind(ts(now)).bind(capability_hash)
+            .execute(&state.db).await.unwrap();
+
+        let verdict = ReviewVerdict { verdict: ReviewVerdictKind::Approve, reason: "approved".into(), validation: vec![] };
+        let error = finish_review_for_capability(&state, review_id, &capability, "completed", Some(verdict), None, None).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("stale execution"));
+
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?").bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(task_state, "review");
+    }
+
+
+    #[tokio::test]
+    async fn review_approve_moves_task_to_merge_pending() {
+        let state = lease_test_state().await;
+        let (task_id, review_id, capability, _) = seed_active_review_lease(&state, 5).await;
+        let verdict = ReviewVerdict { verdict: ReviewVerdictKind::Approve, reason: "approved".into(), validation: vec![] };
+        finish_review_for_capability(&state, review_id, &capability, "completed", Some(verdict), None, None).await.unwrap();
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(task_state, "merge_pending");
+    }
+
+    #[tokio::test]
+    async fn review_retry_requeues_and_retry_limit_blocks() {
+        let state = lease_test_state().await;
+        let (task_id, review_id, capability, implementation_worker) = seed_active_review_lease(&state, 2).await;
+        let verdict = ReviewVerdict { verdict: ReviewVerdictKind::Retry, reason: "fix".into(), validation: vec![] };
+        finish_review_for_capability(&state, review_id, &capability, "completed", Some(verdict), None, None).await.unwrap();
+        let row = sqlx::query("SELECT state,sticky_worker_id FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        let task_state: String = row.try_get("state").unwrap();
+        let sticky: Option<String> = row.try_get("sticky_worker_id").unwrap();
+        assert_eq!(task_state, "queued");
+        let expected_worker = implementation_worker.to_string();
+        assert_eq!(sticky.as_deref(), Some(expected_worker.as_str()));
+
+        let state = lease_test_state().await;
+        let (task_id, review_id, capability, _) = seed_active_review_lease(&state, 1).await;
+        let verdict = ReviewVerdict { verdict: ReviewVerdictKind::Retry, reason: "still wrong".into(), validation: vec![] };
+        finish_review_for_capability(&state, review_id, &capability, "completed", Some(verdict), None, None).await.unwrap();
+        let task_state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id=?")
+            .bind(task_id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(task_state, "blocked");
     }
 
     #[tokio::test]

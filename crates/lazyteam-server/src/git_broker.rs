@@ -9,7 +9,6 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use lazyteam_core::{GitCredential, IntegrationSnapshot, MergeConflictEvidence, MergeConflictFile, Project};
-use rmcp::schemars::JsonSchema;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -353,189 +352,6 @@ async fn seed_candidate_ref(
         return Err((StatusCode::CONFLICT, "prior candidate seed verification failed".into()));
     }
     Ok(())
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-pub(crate) struct ReviewTextPage {
-    pub(crate) revision: Option<String>,
-    pub(crate) path: Option<String>,
-    pub(crate) start_line: usize,
-    pub(crate) end_line: usize,
-    pub(crate) limit: usize,
-    pub(crate) total_lines: usize,
-    pub(crate) content: String,
-    pub(crate) next_start_line: Option<usize>,
-}
-
-const MAX_REVIEW_PAGE_LINES: usize = 400;
-
-fn review_page(text: &str, revision: Option<&str>, path: Option<&str>, start_line: usize, limit: usize) -> ReviewTextPage {
-    let lines: Vec<&str> = text.lines().collect();
-    let total_lines = lines.len();
-    let limit = limit.clamp(1, MAX_REVIEW_PAGE_LINES);
-    let requested_start = start_line.max(1);
-    let start = requested_start.saturating_sub(1).min(total_lines);
-    let end = start.saturating_add(limit).min(total_lines);
-    ReviewTextPage {
-        revision: revision.map(str::to_string),
-        path: path.map(str::to_string),
-        start_line: if total_lines == 0 { 0 } else { start + 1 },
-        end_line: end,
-        limit,
-        total_lines,
-        content: lines[start..end].join("\n"),
-        next_start_line: (end < total_lines).then_some(end + 1),
-    }
-}
-
-fn normalize_review_path(raw: &str) -> Result<String, ApiError> {
-    use std::path::Component;
-    let raw = raw.trim();
-    if raw.is_empty() || raw.len() > 4096 {
-        return Err((StatusCode::BAD_REQUEST, "review path must be a non-empty repository-relative path".into()));
-    }
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        return Err((StatusCode::BAD_REQUEST, "review path must be repository-relative".into()));
-    }
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => {
-                if part == ".git" {
-                    return Err((StatusCode::BAD_REQUEST, ".git internals are not readable through review tools".into()));
-                }
-                parts.push(part.to_string_lossy().into_owned());
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err((StatusCode::BAD_REQUEST, "review path may not escape the repository".into()));
-            }
-        }
-    }
-    Ok(parts.join("/"))
-}
-
-async fn verified_review_repo(
-    state: &AppState,
-    evidence: &api::ReviewEvidence,
-) -> Result<(PathBuf, String, String), ApiError> {
-    let candidate_sha = evidence.checkout.commit_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate commit".into()))?;
-    let base_sha = evidence.checkout.base_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no pinned base commit".into()))?;
-    let review_ref = evidence.checkout.review_ref.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate ref".into()))?;
-    let task_repo = task_repo_path(state, evidence.execution.id);
-    verify_reviewed_candidate(&task_repo, review_ref, candidate_sha, base_sha).await?;
-    Ok((task_repo, candidate_sha.to_string(), base_sha.to_string()))
-}
-
-fn review_revision<'a>(revision: &str, candidate_sha: &'a str, base_sha: &'a str) -> Result<&'a str, ApiError> {
-    match revision {
-        "candidate" => Ok(candidate_sha),
-        "base" => Ok(base_sha),
-        _ => Err((StatusCode::BAD_REQUEST, "revision must be candidate or base".into())),
-    }
-}
-
-pub(crate) async fn verify_review_snapshot(
-    state: &AppState,
-    evidence: &api::ReviewEvidence,
-    candidate_sha: &str,
-) -> Result<(), ApiError> {
-    let (_, pinned_candidate, _) = verified_review_repo(state, evidence).await?;
-    if candidate_sha.trim() != pinned_candidate {
-        return Err((StatusCode::CONFLICT, format!("candidate_sha does not match pinned review candidate {pinned_candidate}")));
-    }
-    Ok(())
-}
-
-pub(crate) async fn review_show(
-    state: &AppState,
-    evidence: &api::ReviewEvidence,
-    revision: &str,
-    path: &str,
-    start_line: usize,
-    limit: usize,
-) -> Result<ReviewTextPage, ApiError> {
-    let path = normalize_review_path(path)?;
-    let display_path = if path.is_empty() { "." } else { &path };
-    let (repo, candidate_sha, base_sha) = verified_review_repo(state, evidence).await?;
-    let sha = review_revision(revision, &candidate_sha, &base_sha)?;
-    let spec = if path.is_empty() { format!("{sha}:") } else { format!("{sha}:{path}") };
-    let output = git_run(
-        &HostGitAuth::none(),
-        Command::new("git").arg("-C").arg(&repo).args(["show", "--no-ext-diff", &spec]),
-    ).await?;
-    if !output.status.success() {
-        return Err((StatusCode::NOT_FOUND, format!("path {display_path} does not exist in {revision}")));
-    }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("path {display_path} is not UTF-8 text")))?;
-    Ok(review_page(&text, Some(revision), Some(display_path), start_line, limit))
-}
-
-pub(crate) async fn review_grep(
-    state: &AppState,
-    evidence: &api::ReviewEvidence,
-    revision: &str,
-    pattern: &str,
-    paths: &[String],
-    start_line: usize,
-    limit: usize,
-) -> Result<ReviewTextPage, ApiError> {
-    let pattern = pattern.trim();
-    if pattern.is_empty() || pattern.len() > 1024 {
-        return Err((StatusCode::BAD_REQUEST, "review grep pattern must be 1..=1024 characters".into()));
-    }
-    let (repo, candidate_sha, base_sha) = verified_review_repo(state, evidence).await?;
-    let sha = review_revision(revision, &candidate_sha, &base_sha)?;
-    let mut command = Command::new("git");
-    command.arg("-C").arg(&repo).args(["grep", "-n", "-I", "-F", "-e", pattern, sha, "--"]);
-    if paths.is_empty() {
-        command.arg(".");
-    } else {
-        for path in paths {
-            let path = normalize_review_path(path)?;
-            if path.is_empty() {
-                command.arg(".");
-            } else {
-                command.arg(format!(":(literal){path}"));
-            }
-        }
-    }
-    let output = git_run(&HostGitAuth::none(), &mut command).await?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err((StatusCode::BAD_GATEWAY, format!("host Git grep failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
-    }
-    let text = String::from_utf8(output.stdout).map_err(internal)?;
-    let prefix = format!("{sha}:");
-    let text = text.lines()
-        .map(|line| line.strip_prefix(&prefix).unwrap_or(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(review_page(&text, Some(revision), None, start_line, limit))
-}
-
-pub(crate) async fn review_diff(
-    state: &AppState,
-    evidence: &api::ReviewEvidence,
-    path: Option<&str>,
-    start_line: usize,
-    limit: usize,
-) -> Result<ReviewTextPage, ApiError> {
-    let (repo, candidate_sha, base_sha) = verified_review_repo(state, evidence).await?;
-    let clean_path = path.map(normalize_review_path).transpose()?;
-    let mut command = Command::new("git");
-    command.arg("-C").arg(&repo).args(["diff", "--no-ext-diff", "--unified=3", &base_sha, &candidate_sha, "--"]);
-    if let Some(path) = clean_path.as_deref().filter(|path| !path.is_empty()) {
-        command.arg(format!(":(literal){path}"));
-    }
-    let output = git_run(&HostGitAuth::none(), &mut command).await?;
-    if !output.status.success() {
-        return Err((StatusCode::BAD_GATEWAY, format!("host Git diff failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
-    }
-    let text = String::from_utf8(output.stdout).map_err(internal)?;
-    let display_path = clean_path.as_deref().map(|path| if path.is_empty() { "." } else { path });
-    Ok(review_page(&text, None, display_path, start_line, limit))
 }
 
 const MAX_CONFLICT_FILES: usize = 20;
@@ -996,66 +812,6 @@ async fn merge_in_host_workspace(
     result
 }
 
-pub(crate) async fn verify_external_merge(
-    state: &AppState,
-    evidence: &api::ReviewEvidence,
-    merge_commit_sha: &str,
-) -> Result<(), ApiError> {
-    let candidate_sha = evidence.checkout.commit_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate commit".into()))?;
-    let base_sha = evidence.checkout.base_sha.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no pinned base commit".into()))?;
-    let review_ref = evidence.checkout.review_ref.as_deref().ok_or((StatusCode::CONFLICT, "reviewed execution has no candidate ref".into()))?;
-    let task_repo = task_repo_path(state, evidence.execution.id);
-    // External-merge recovery verifies the exact reviewed ref and compares the
-    // complete tree delta against the supplied upstream commit. It intentionally
-    // does not require candidate ancestry: older retry workspaces could produce
-    // a tree-correct reviewed candidate on stale history.
-    verify_candidate_ref(&task_repo, review_ref, candidate_sha).await?;
-
-    let project_row = sqlx::query("SELECT * FROM projects WHERE id=?")
-        .bind(evidence.project.id.to_string()).fetch_one(&state.db).await.map_err(internal)?;
-    let credential = api::git_credential_from_row(state, &project_row)?;
-    let upstream_url = upstream_repo_url(&evidence.project.repo_url, &credential).map_err(internal)?;
-    let auth = HostGitAuth::prepare(state, &credential).await.map_err(internal)?;
-    let result = async {
-        let mirror = project_mirror(state, evidence.project.id);
-        refresh_project_mirror(&mirror, &upstream_url, &auth).await?;
-        let default_ref = format!("refs/heads/{}", evidence.project.default_branch);
-        let ancestor = git_run(
-            &HostGitAuth::none(),
-            Command::new("git").arg("-C").arg(&mirror).args(["merge-base", "--is-ancestor", merge_commit_sha, &default_ref]),
-        ).await?;
-        if !ancestor.status.success() {
-            return Err((StatusCode::CONFLICT, format!("merge commit {merge_commit_sha} is not on current {}", evidence.project.default_branch)));
-        }
-        let changed = git_output(
-            &HostGitAuth::none(),
-            Command::new("git").arg("-C").arg(&task_repo).args(["diff", "--name-only", base_sha, candidate_sha]),
-        ).await?;
-        for path in changed.lines().filter(|path| !path.is_empty()) {
-            let candidate = git_object_id(&task_repo, &format!("{candidate_sha}:{path}")).await?;
-            let merged = git_object_id(&mirror, &format!("{merge_commit_sha}:{path}")).await?;
-            if candidate != merged {
-                return Err((StatusCode::CONFLICT, format!("external merge does not preserve reviewed content for {path}")));
-            }
-        }
-        Ok(())
-    }.await;
-    auth.cleanup().await;
-    result
-}
-
-async fn git_object_id(repo: &Path, spec: &str) -> Result<Option<String>, ApiError> {
-    let output = git_run(
-        &HostGitAuth::none(),
-        Command::new("git").arg("-C").arg(repo).args(["rev-parse", "--verify", spec]),
-    ).await?;
-    if output.status.success() {
-        Ok(Some(String::from_utf8(output.stdout).map_err(internal)?.trim().to_string()))
-    } else {
-        Ok(None)
-    }
-}
-
 pub(crate) async fn remove_task_repo(state: &AppState, execution_id: Uuid) -> Result<(), ApiError> {
     let path = task_repo_path(state, execution_id);
     if path.exists() {
@@ -1097,7 +853,11 @@ async fn task_git(
     .ok_or((StatusCode::NOT_FOUND, "Git execution endpoint is not active".into()))?;
     let worker_id: String = row.try_get("worker_id").map_err(internal)?;
     let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
-    api::require_worker(&state.db, Uuid::parse_str(&worker_id).map_err(internal)?, request.headers()).await?;
+    let internal_actor: i64 = sqlx::query_scalar("SELECT internal_actor FROM workers WHERE id=?")
+        .bind(&worker_id).fetch_one(&state.db).await.map_err(internal)?;
+    if internal_actor == 0 {
+        api::require_worker(&state.db, Uuid::parse_str(&worker_id).map_err(internal)?, request.headers()).await?;
+    }
     api::require_lease_capability(request.headers(), &capability_hash)?;
     serve_git(state, execution_id, path, request, true).await
 }
@@ -1119,7 +879,11 @@ async fn review_git(
     let worker_id: String = row.try_get("reviewer_worker_id").map_err(internal)?;
     let execution_id: String = row.try_get("execution_id").map_err(internal)?;
     let capability_hash: String = row.try_get("lease_capability_hash").map_err(internal)?;
-    api::require_worker(&state.db, Uuid::parse_str(&worker_id).map_err(internal)?, request.headers()).await?;
+    let internal_actor: i64 = sqlx::query_scalar("SELECT internal_actor FROM workers WHERE id=?")
+        .bind(&worker_id).fetch_one(&state.db).await.map_err(internal)?;
+    if internal_actor == 0 {
+        api::require_worker(&state.db, Uuid::parse_str(&worker_id).map_err(internal)?, request.headers()).await?;
+    }
     api::require_lease_capability(request.headers(), &capability_hash)?;
     serve_git(
         state,

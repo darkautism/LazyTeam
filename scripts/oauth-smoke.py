@@ -95,17 +95,13 @@ EXPECTED_TOOL_ANNOTATIONS = {
     "tasks_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
     "tasks_get": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
     "tasks_create": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
-    "reviews_get": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
-    "reviews_show": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
-    "reviews_grep": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
-    "reviews_diff": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
-    "reviews_decide": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "work_pick": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "work_renew": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "work_finish": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "work_release": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "tasks_merge": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
-    "tasks_confirm_merge": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
-    "tasks_retry": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "tasks_delete": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     "workers_list": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
-    "workers_retire": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
 }
 
 
@@ -205,7 +201,8 @@ def main():
     expect(tokens["token_type"] == "Bearer", "wrong token type")
     expect(tokens.get("refresh_token"), "refresh token missing")
 
-    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_get", "tasks_create", "reviews_get", "tasks_merge", "tasks_retry", "workers_list"}
+    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_get", "tasks_create", "tasks_delete", "workers_list", "work_pick", "work_renew", "work_finish", "work_release", "tasks_merge"}
+    forbidden_tools = {"reviews_get", "reviews_show", "reviews_grep", "reviews_diff", "reviews_decide", "tasks_retry", "tasks_confirm_merge", "workers_retire"}
 
     legacy_initialize = mcp_call(tokens["access_token"], "initialize", {
         "protocolVersion": MCP_LEGACY_VERSION,
@@ -243,6 +240,7 @@ def main():
     legacy_tools = legacy_tool_result.get("result", {}).get("tools", [])
     legacy_names = {tool.get("name") for tool in legacy_tools}
     expect(required_tools.issubset(legacy_names), f"legacy tools/list missing tools: {sorted(required_tools - legacy_names)}")
+    expect(forbidden_tools.isdisjoint(legacy_names), f"legacy tools/list still exposes removed tools: {sorted(forbidden_tools & legacy_names)}")
     expect("tasks_approve" not in legacy_names, "legacy tools/list still advertises removed tasks_approve bypass")
     validate_tool_schemas(legacy_tools)
 
@@ -271,6 +269,7 @@ def main():
     modern_tools = tool_result.get("result", {}).get("tools", [])
     names = {tool.get("name") for tool in modern_tools}
     expect(required_tools.issubset(names), f"tools/list missing tools: {sorted(required_tools - names)}")
+    expect(forbidden_tools.isdisjoint(names), f"tools/list still exposes removed tools: {sorted(forbidden_tools & names)}")
     expect("tasks_approve" not in names, "tools/list still advertises removed tasks_approve bypass")
     validate_tool_schemas(modern_tools)
 

@@ -249,11 +249,11 @@ You are an autonomous LazyTeam coding worker. Execute only the assigned task in 
 
 Reviewer policy belongs to the **reviewer worker**, not the Project. Open **Workers → Configure**, set Role to Reviewer, and edit that worker's **Initial prompt**. There is no separate Project-level review prompt. The Home board keeps review work in two lanes: **Review** contains tasks awaiting/under reviewer-worker review, while **MergePending** contains approved candidates waiting for the main agent to invoke Host publish.
 
-`reviews_get(task_id)` exposes pinned execution metadata and evidence for the main agent: implementation worker, candidate SHA, base SHA, stable review ref, patch/summary, and Host repository metadata. The actual reviewer worker gets a worker-authenticated read-only Host broker checkout and performs its independent inspection there; no upstream credential is involved.
+`work_pick(role="review", task_id?)` acquires the same authoritative review lease used by reviewer workers and returns the complete pinned review context in one response: implementation execution/worker, candidate SHA, base SHA, stable review ref, upstream SHA, integration SHA, effective diff hash, review cycle, and a read-only Host broker checkout URL. No upstream credential is involved.
 
 A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, reserves implementation return work for the worker that owns the logical implementation session, and injects the feedback into that retained session. Review work follows the same rule: the latest reviewer owns the logical review session and receives return review work first. Busy/full owners keep the reservation without holding a physical slot; another eligible worker may take over only when the owner is unavailable/ineligible or the affinity window expires. Affinity never reuses authority: every execution/review claim receives a fresh lease capability, and the previous capability stays revoked.
 
-A reviewer-role worker's approve verdict is the only path that moves the task `review -> merge_pending`. Approval does not release dependencies or delete worker state. The main agent then calls `tasks_merge(task_id)`. The Host re-fetches upstream and refuses to publish if the default branch no longer equals the reviewed `base_sha` or if the task ref no longer equals the reviewed candidate SHA. On success the Host pushes that exact candidate, marks the task `done`, unlocks dependencies, and queues cleanup. The worker deletes only its local task workspace/session; the Host owns broker-repository cleanup.
+An approve verdict submitted through `work_finish` for the currently active review lease is the only path that moves the task `review -> merge_pending`. The lease may be held by a reviewer daemon or an OAuth-authenticated interactive agent, but both use the same review row, pinned execution, integration snapshot, expiry, and opaque capability checks. Approval does not release dependencies or delete worker state. The main agent then calls `tasks_merge(task_id)`. The Host revalidates the reviewed candidate and integration context before publishing, marks the task `done` on success, unlocks dependencies, and queues cleanup.
 
 The worker also captures up to 256 KiB of textual patch evidence and marks truncated patches explicitly. Full-context reviewer validation uses the worker-authenticated Host review broker rather than an upstream review branch.
 
@@ -273,9 +273,10 @@ queued -> assigned -> running -> review -> merge_pending -> done
 
 - Completed worker executions enter `review` and publish a stable review ref.
 - Review retry requires feedback and is sticky to the same worker so workspace/session state is reused.
-- A reviewer-worker approve verdict or an exact-candidate main-agent `reviews_decide` approve moves `review -> merge_pending`; dependencies remain blocked.
-- `tasks_merge` performs Host-side upstream publish of the exact reviewed candidate, moves `merge_pending -> done`, releases dependencies, and queues worker cleanup. It refuses the publish if upstream or the candidate moved after review.
-- Every execution still gets its own UUID/attempt record, but attempts share the task workspace/session until merge.
+- Only `work_finish` on an active, unexpired review lease can approve or retry review work. Approve moves `review -> merge_pending`; retry follows the configured per-cycle retry limit. There is no direct review-decision bypass.
+- `work_release` voluntarily abandons a lease without counting a failure: implementation returns to `queued` and its execution repo is cleaned; review stays in `review`.
+- `tasks_merge` is the single MCP merge action. It performs Host-side upstream publish of the exact reviewed candidate, moves `merge_pending -> done`, releases dependencies, and queues cleanup. It refuses publication if the reviewed integration is no longer valid.
+- Every execution/review claim still gets its own UUID and opaque `ltc_*` capability; stale capabilities cannot renew, finish, or release newer ownership.
 
 ## MCP and OAuth detail
 
@@ -285,23 +286,20 @@ Current MCP tools:
 projects_list
 projects_create
 tasks_list
+tasks_get
 tasks_create
-reviews_get
-reviews_show
-reviews_grep
-reviews_diff
-reviews_decide
-tasks_merge
-tasks_confirm_merge
-tasks_retry
 tasks_delete
 workers_list
-workers_retire
+work_pick
+work_renew
+work_finish
+work_release
+tasks_merge
 ```
 
-`tasks_confirm_merge` covers only the recovery case where an approved change was already merged outside `tasks_merge`; it verifies the upstream commit contains the exact reviewed content before marking the task done.
+The four `work_*` tools are the only public MCP ownership lifecycle. REST worker-daemon claim/renew/finish/release endpoints call the same internal lifecycle service, so interactive agents and daemons compete through the same task/review rows and CAS rules rather than parallel authority models. Interactive MCP ownership reuses two hidden internal actor rows solely for the existing execution/review foreign keys; they are excluded from normal worker inventory and scheduling, and no separate work-lease table exists.
 
-The intended flow is that a strong planner such as ChatGPT talks to the OAuth-protected MCP control plane, creates project-scoped work, and lets idle workers claim matching tasks automatically. The authorization page uses `LAZYTEAM_OAUTH_PASSWORD` for the human approval step. See [Security model](#security-model) for PKCE, DCR, CIMD, token, DNS, and rate-limit hardening.
+The intended flow is that a strong planner such as ChatGPT talks to the OAuth-protected MCP control plane, creates project-scoped work, and either lets idle workers claim matching tasks automatically or explicitly acquires work with `work_pick`. The authorization page uses `LAZYTEAM_OAUTH_PASSWORD` for the human approval step. See [Security model](#security-model) for PKCE, DCR, CIMD, token, DNS, and rate-limit hardening.
 
 ## Storage, migrations, and operations
 
