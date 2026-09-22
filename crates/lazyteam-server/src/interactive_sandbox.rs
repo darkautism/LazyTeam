@@ -81,7 +81,7 @@ struct ProcessState {
     exit_code: Option<i32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(crate) struct BashResult {
     pub(crate) status: &'static str,
     pub(crate) pid: u32,

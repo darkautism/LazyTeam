@@ -4,7 +4,7 @@ use axum::{extract::{Path, State}, Json};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
@@ -158,6 +158,11 @@ pub struct WorkFinishParams {
     pub verdict: Option<ReviewDecision>,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct TextToolOutput {
+    output: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -406,13 +411,13 @@ impl LazyTeamMcp {
         description = "Read a UTF-8 text file inside the attached LazyTeam sandbox. Relative paths resolve from the sandbox workspace. Output is bounded to 2000 lines or 50KB; use offset/limit to continue large files. Every successful access validates and renews the authoritative work lease.",
         annotations(title = "Read file", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn read(&self, Parameters(input): Parameters<ReadParams>) -> Result<CallToolResult, McpError> {
+    async fn read(&self, Parameters(input): Parameters<ReadParams>) -> Result<rmcp::Json<TextToolOutput>, McpError> {
         let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
         let text = self.state.interactive_sandboxes
             .read(&self.state, sandbox_id, &input.path, input.offset, input.limit)
             .await
             .map_err(api_to_mcp)?;
-        Ok(text_result(text))
+        Ok(rmcp::Json(TextToolOutput { output: text }))
     }
 
     #[tool(
@@ -421,13 +426,13 @@ impl LazyTeamMcp {
         description = "Write a file inside the attached LazyTeam sandbox. Relative paths resolve from the sandbox workspace; parent directories are created automatically. The sandbox cannot access Host Git credentials or files outside its allowlist.",
         annotations(title = "Write file", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn write(&self, Parameters(input): Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
+    async fn write(&self, Parameters(input): Parameters<WriteParams>) -> Result<rmcp::Json<TextToolOutput>, McpError> {
         let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
         self.state.interactive_sandboxes
             .write(&self.state, sandbox_id, &input.path, &input.content)
             .await
             .map_err(api_to_mcp)?;
-        Ok(text_result(format!("Successfully wrote to {}", input.path)))
+        Ok(rmcp::Json(TextToolOutput { output: format!("Successfully wrote to {}", input.path) }))
     }
 
     #[tool(
@@ -436,7 +441,7 @@ impl LazyTeamMcp {
         description = "Make precise exact-text replacements inside the attached LazyTeam sandbox. Each edits[].oldText must match exactly once in the original file and edits may not overlap.",
         annotations(title = "Edit file", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn edit(&self, Parameters(input): Parameters<EditParams>) -> Result<CallToolResult, McpError> {
+    async fn edit(&self, Parameters(input): Parameters<EditParams>) -> Result<rmcp::Json<TextToolOutput>, McpError> {
         let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
         let edits = input.edits.iter()
             .map(|edit| (edit.old_text.clone(), edit.new_text.clone()))
@@ -445,7 +450,7 @@ impl LazyTeamMcp {
             .edit(&self.state, sandbox_id, &input.path, &edits)
             .await
             .map_err(api_to_mcp)?;
-        Ok(text_result(format!("Successfully applied {} edit(s) to {}", input.edits.len(), input.path)))
+        Ok(rmcp::Json(TextToolOutput { output: format!("Successfully applied {} edit(s) to {}", input.edits.len(), input.path) }))
     }
 
     #[tool(
@@ -454,15 +459,13 @@ impl LazyTeamMcp {
         description = "Run a non-interactive bash command inside the attached LazyTeam sandbox, or attach to a PID returned by an earlier call. Synchronous wait is capped at 10 seconds; longer commands continue in the sandbox and return a PID. Pipes and redirection are supported; interactive TTY programs are not.",
         annotations(title = "Run shell command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
     )]
-    async fn bash(&self, Parameters(input): Parameters<BashParams>) -> Result<CallToolResult, McpError> {
+    async fn bash(&self, Parameters(input): Parameters<BashParams>) -> Result<rmcp::Json<crate::interactive_sandbox::BashResult>, McpError> {
         let sandbox_id = parse_sandbox_id(&input.sandbox_id)?;
         let result = self.state.interactive_sandboxes
             .bash(&self.state, sandbox_id, input.command, input.pid)
             .await
             .map_err(api_to_mcp)?;
-        let text = serde_json::to_string_pretty(&result)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(text_result(text))
+        Ok(rmcp::Json(result))
     }
 
     #[tool(
@@ -646,10 +649,6 @@ fn parse_task_id(raw: &str) -> Result<Uuid, McpError> {
 fn parse_sandbox_id(raw: &str) -> Result<Uuid, McpError> {
     Uuid::parse_str(raw)
         .map_err(|e| McpError::invalid_params("invalid sandbox_id", Some(serde_json::json!({"error": e.to_string()}))))
-}
-
-fn text_result(text: impl Into<String>) -> CallToolResult {
-    CallToolResult::success(vec![ContentBlock::text(text.into())])
 }
 
 fn api_to_mcp((status, message): crate::ApiError) -> McpError {
