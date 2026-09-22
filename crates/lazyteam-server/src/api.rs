@@ -257,31 +257,6 @@ struct TaskBoardItem {
     waiting: Option<WaitingInfo>,
 }
 
-/// Conservative review-hell signal for Home task cards.
-///
-/// Only durable history counts: the latest implementation attempt number and
-/// completed reviewer `retry` verdicts **in the current review cycle**.
-/// Lifetime history must not gate automatic redispatch: an old task that was
-/// manually republished starts a fresh cycle, so blocking uses the
-/// Runtime `failed`/`lost` review rows are reported separately and must
-/// never count as reviewer disagreement, and
-/// free-form `review_feedback` prose (including Host merge-conflict text)
-/// must never trigger this signal; those belong to the
-/// structured-outcome/Insights work.
-fn task_board_looping(attempt: u32, reviewer_retries: i64) -> bool {
-    attempt >= 4 || reviewer_retries >= 3
-}
-
-/// True when a durable completed-review verdict row is a reviewer `retry`.
-/// Inspects only the stored verdict JSON, never `review_feedback` prose, so a
-/// reason that merely mentions "retry" or "merge conflict" cannot qualify.
-fn is_reviewer_retry_verdict(verdict_json: Option<&str>) -> bool {
-    let Some(raw) = verdict_json else { return false; };
-    // Compact serde form is `{"verdict":"retry",...}`; accept one optional
-    // space after the colon for robustness without parsing prose.
-    raw.contains("\"verdict\":\"retry\"") || raw.contains("\"verdict\": \"retry\"")
-}
-
 #[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct TaskStatus {
     pub(crate) task: Task,
