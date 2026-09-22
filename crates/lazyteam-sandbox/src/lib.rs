@@ -1390,6 +1390,36 @@ async fn set_private_file(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_allows_self_tgkill_but_blocks_parent_tgkill() {
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if child == 0 {
+                let parent = libc::getppid();
+                if install_seccomp_denylist().is_err() {
+                    libc::_exit(10);
+                }
+                let own_pid = libc::getpid();
+                let own_tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+                if libc::syscall(libc::SYS_tgkill, own_pid, own_tid, 0) != 0 {
+                    libc::_exit(11);
+                }
+                if libc::syscall(libc::SYS_tgkill, parent, parent, 0) == 0 {
+                    libc::_exit(12);
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+                    libc::_exit(13);
+                }
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            assert_eq!(status, 0, "seccomp tgkill probe child status={status}");
+        }
+    }
+
     #[test]
     fn managed_rust_paths_require_image_toolchain_and_parse_versions() {
         let root = std::env::temp_dir().join(format!(
