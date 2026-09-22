@@ -63,7 +63,7 @@ No manual `chown`, PUID, or PGID setting is required in the normal case. The con
 - Docker named volumes work without extra settings.
 - If an older root-run image left a root-owned database inside a non-root dataset, the dataset owner wins and the database ownership is repaired.
 
-After initialization, the LazyTeam server itself runs non-root and its effective Linux capabilities are cleared. The root filesystem remains read-only and `no-new-privileges` is enabled. For unusual environments, `PUID`/`PGID` (or `LAZYTEAM_PUID`/`LAZYTEAM_PGID`) may explicitly override the automatic identity selection, but they are not required for TrueNAS or ordinary Docker deployments.
+After initialization, the LazyTeam server itself runs non-root. The server container keeps only `SYS_ADMIN` and `SYS_CHROOT` in its effective/inheritable capability set so it can create the same mount/user-namespace sandbox used by worker agents on kernels without Landlock; the sandbox child applies its filesystem policy, `no-new-privileges`, and seccomp denylist, then drops capabilities before executing agent commands. The root filesystem remains read-only and `no-new-privileges` is enabled for the container. For unusual environments, `PUID`/`PGID` (or `LAZYTEAM_PUID`/`LAZYTEAM_PGID`) may explicitly override the automatic identity selection, but they are not required for TrueNAS or ordinary Docker deployments.
 
 ### Required production settings
 
