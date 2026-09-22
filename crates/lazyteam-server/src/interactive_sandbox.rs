@@ -523,6 +523,15 @@ impl InteractiveSandboxManager {
         let attachment = self.inner.write().await.remove(&sandbox_id);
         if let Some(attachment) = attachment {
             attachment.cancel.cancel();
+            #[cfg(unix)]
+            {
+                let pids = attachment.processes.read().await.keys().copied().collect::<Vec<_>>();
+                for pid in pids {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
+            }
             let _ = tokio::fs::remove_dir_all(&attachment.root).await;
         }
     }
