@@ -1626,13 +1626,20 @@ async fn persist_review_claim(
     now: DateTime<Utc>,
 ) -> Result<bool, ApiError> {
     let mut tx = state.db.begin().await.map_err(db_error)?;
-    let inserted = sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle,upstream_sha,integration_sha,effective_diff_hash) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM tasks WHERE id=? AND state='review') AND NOT EXISTS (SELECT 1 FROM reviews WHERE task_id=? AND state IN ('assigned','running'))")
+    let inserted = match sqlx::query("INSERT INTO reviews(id,task_id,execution_id,reviewer_worker_id,state,lease_until,created_at,lease_capability_hash,reviewer_agent_type,reviewer_provider,reviewer_model,review_cycle,upstream_sha,integration_sha,effective_diff_hash) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM tasks WHERE id=? AND state='review') AND NOT EXISTS (SELECT 1 FROM reviews WHERE task_id=? AND state IN ('assigned','running'))")
         .bind(review.id.to_string()).bind(task.id.to_string()).bind(execution.id.to_string()).bind(worker.id.to_string())
         .bind("assigned").bind(ts(review.lease_until)).bind(ts(now)).bind(lease_capability_hash)
         .bind(worker.agent.agent_type.clone()).bind(worker.agent.provider.clone()).bind(worker.agent.model.clone()).bind(task.review_cycle)
         .bind(upstream_sha).bind(integration_sha).bind(effective_diff_hash)
         .bind(task.id.to_string()).bind(task.id.to_string())
-        .execute(&mut *tx).await.map_err(db_conflict)?.rows_affected();
+        .execute(&mut *tx).await {
+            Ok(result) => result.rows_affected(),
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                tx.rollback().await.map_err(db_error)?;
+                return Ok(false);
+            }
+            Err(error) => return Err(db_error(error)),
+        };
     if inserted != 1 {
         tx.rollback().await.map_err(db_error)?;
         return Ok(false);
@@ -3013,10 +3020,6 @@ fn datetime(value: String) -> Result<DateTime<Utc>, ApiError> { DateTime::parse_
 fn uuid(value: String) -> Result<Uuid, ApiError> { Uuid::parse_str(&value).map_err(internal) }
 fn internal(error: impl std::fmt::Display) -> ApiError { (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()) }
 fn db_error(error: sqlx::Error) -> ApiError { internal(error) }
-fn db_conflict(error: sqlx::Error) -> ApiError {
-    if matches!(error, sqlx::Error::Database(ref e) if e.is_unique_violation()) { (StatusCode::CONFLICT, error.to_string()) } else { db_error(error) }
-}
-
 #[allow(dead_code)]
 fn review_failures_exhausted(failed_reviews: i64, limit: i64) -> bool {
     failed_reviews >= limit
