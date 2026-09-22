@@ -257,6 +257,17 @@ struct TaskBoardItem {
     waiting: Option<WaitingInfo>,
 }
 
+#[cfg(test)]
+fn task_board_looping(attempt: u32, reviewer_retries: i64) -> bool {
+    attempt >= 4 || reviewer_retries >= 3
+}
+
+#[cfg(test)]
+fn is_reviewer_retry_verdict(verdict_json: Option<&str>) -> bool {
+    let Some(raw) = verdict_json else { return false; };
+    raw.contains("\"verdict\":\"retry\"") || raw.contains("\"verdict\": \"retry\"")
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct TaskStatus {
     pub(crate) task: Task,
