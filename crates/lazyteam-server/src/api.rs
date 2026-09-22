@@ -3020,6 +3020,10 @@ fn datetime(value: String) -> Result<DateTime<Utc>, ApiError> { DateTime::parse_
 fn uuid(value: String) -> Result<Uuid, ApiError> { Uuid::parse_str(&value).map_err(internal) }
 fn internal(error: impl std::fmt::Display) -> ApiError { (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()) }
 fn db_error(error: sqlx::Error) -> ApiError { internal(error) }
+fn db_conflict(error: sqlx::Error) -> ApiError {
+    if matches!(error, sqlx::Error::Database(ref e) if e.is_unique_violation()) { (StatusCode::CONFLICT, error.to_string()) } else { db_error(error) }
+}
+
 #[allow(dead_code)]
 fn review_failures_exhausted(failed_reviews: i64, limit: i64) -> bool {
     failed_reviews >= limit
