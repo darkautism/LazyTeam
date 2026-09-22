@@ -596,6 +596,8 @@ async fn start_command(attachment: Arc<Attachment>, command: String) -> Result<B
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
+    #[cfg(unix)]
+    child.process_group(0);
     let mut child = child.spawn().map_err(internal)?;
     let pid = child
         .id()
@@ -617,6 +619,11 @@ async fn start_command(attachment: Arc<Attachment>, command: String) -> Result<B
         let exit_code = tokio::select! {
             waited = child.wait() => waited.ok().and_then(|status| status.code()),
             _ = cancel.cancelled() => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(watcher.pid as i32), libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
                 let _ = child.kill().await;
                 child.wait().await.ok().and_then(|status| status.code())
             }
