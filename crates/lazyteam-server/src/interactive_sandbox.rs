@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context};
+use anyhow::bail;
 use lazyteam_core::{Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict};
 use lazyteam_sandbox::{prepare_agent_workspace, sync_agent_workspace, AgentSandbox};
 use serde::Serialize;
@@ -61,7 +61,6 @@ struct Attachment {
 
 #[derive(Clone)]
 struct ImplementationMeta {
-    project_name: String,
     contributor_name: String,
     contributor_email: String,
     task_title: String,
@@ -137,7 +136,6 @@ impl InteractiveSandboxManager {
             cancel: CancellationToken::new(),
             processes: RwLock::new(HashMap::new()),
             implementation: Some(ImplementationMeta {
-                project_name: assignment.project.name.clone(),
                 contributor_name: assignment.project.contributor.name.clone(),
                 contributor_email: assignment.project.contributor.email.clone(),
                 task_title: assignment.task.title.clone(),
@@ -248,24 +246,7 @@ impl InteractiveSandboxManager {
         limit: Option<usize>,
     ) -> Result<String, ApiError> {
         let attachment = self.attachment(state, sandbox_id).await?;
-        let mut command = attachment
-            .sandbox
-            .command("/bin/cat", &attachment.agent_workspace, None)
-            .map_err(internal)?;
-        let output = command
-            .arg("--")
-            .arg(path)
-            .output()
-            .await
-            .map_err(internal)?;
-        if !output.status.success() {
-            return Err(conflict(format!(
-                "read {path}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        let text = String::from_utf8(output.stdout)
-            .map_err(|_| conflict(format!("{path} is not a UTF-8 text file")))?;
+        let text = read_full(&attachment, path).await?;
         Ok(bounded_lines(&text, offset, limit))
     }
 
@@ -319,7 +300,8 @@ impl InteractiveSandboxManager {
         if edits.is_empty() {
             return Err(conflict("edits must not be empty"));
         }
-        let original = self.read(state, sandbox_id, path, None, None).await?;
+        let attachment = self.attachment(state, sandbox_id).await?;
+        let original = read_full(&attachment, path).await?;
         let mut replacements = Vec::with_capacity(edits.len());
         for (old, new) in edits {
             if old.is_empty() {
@@ -561,6 +543,22 @@ async fn renew_attachment(state: &Arc<AppState>, attachment: &Attachment) -> Res
             .await
         }
     }
+}
+
+async fn read_full(attachment: &Attachment, path: &str) -> Result<String, ApiError> {
+    let mut command = attachment
+        .sandbox
+        .command("/bin/cat", &attachment.agent_workspace, None)
+        .map_err(internal)?;
+    let output = command.arg("--").arg(path).output().await.map_err(internal)?;
+    if !output.status.success() {
+        return Err(conflict(format!(
+            "read {path}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| conflict(format!("{path} is not a UTF-8 text file")))
 }
 
 async fn start_command(attachment: Arc<Attachment>, command: String) -> Result<BashResult, ApiError> {

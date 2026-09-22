@@ -34,9 +34,9 @@ You can watch all of this on the Home board: queued → being worked on → in r
 
 ### MCP work leases
 
-Interactive agents use the same authoritative ownership model as worker daemons. `work_pick` claims implementation or review work and returns an opaque lease plus the pinned working context. While the job is active, `work_renew` extends that lease; `work_finish` completes the exact lease and moves the task through the normal implementation or review state transition.
+Interactive agents use the same authoritative ownership model and the same sandbox engine as worker daemons. `work_pick` claims implementation or review work, prepares an isolated workspace, and returns a `sandbox_id`. The agent then works only through the four PC-style tools: `read`, `write`, `edit`, and `bash`, each scoped by that `sandbox_id`. LazyTeam renews the lease automatically in the background and on tool activity; the agent never handles lease capabilities or Git credentials.
 
-If the agent cannot continue, `work_release` gives the lease back voluntarily. A release is not a failure: implementation work returns to the queue, while review work remains available for another reviewer. This keeps ownership explicit without inventing fake failures or separate review-specific mutation commands.
+`work_finish` syncs implementation changes back through the trusted Host layer, creates and publishes the task candidate, or records the pinned review verdict. If the agent cannot continue, `work_release` gives the work back voluntarily and destroys the sandbox. A release is not a failure: implementation returns to the queue, while review remains available for another reviewer.
 
 ## Install / deploy it
 

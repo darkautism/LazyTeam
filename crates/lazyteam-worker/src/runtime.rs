@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::sandbox::AgentSandbox;
+use lazyteam_sandbox::AgentSandbox;
 
 const DEFAULT_WATCHDOG_PROBE_INTERVAL_SECS: u64 = 120;
 const DEFAULT_WATCHDOG_PROBE_GRACE_SECS: u64 = 30;

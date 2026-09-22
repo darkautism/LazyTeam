@@ -2103,16 +2103,6 @@ pub(crate) async fn finish_execution_for_capability(state: &AppState, id: Uuid, 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkLeaseKind { Implementation, Review }
 
-pub(crate) async fn work_lease_kind(state: &AppState, id: Uuid) -> Result<WorkLeaseKind, ApiError> {
-    let execution: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM executions WHERE id=?")
-        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
-    if execution > 0 { return Ok(WorkLeaseKind::Implementation); }
-    let review: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE id=?")
-        .bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
-    if review > 0 { return Ok(WorkLeaseKind::Review); }
-    Err((StatusCode::NOT_FOUND, "work lease not found".into()))
-}
-
 pub(crate) async fn release_execution_for_capability(state: &AppState, id: Uuid, capability: &str, worker_headers: Option<&HeaderMap>) -> Result<(), ApiError> {
     let now = Utc::now();
     let mut tx = state.db.begin().await.map_err(db_error)?;

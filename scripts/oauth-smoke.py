@@ -96,7 +96,10 @@ EXPECTED_TOOL_ANNOTATIONS = {
     "tasks_get": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
     "tasks_create": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "work_pick": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
-    "work_renew": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "read": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+    "write": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    "edit": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    "bash": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     "work_finish": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "work_release": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "tasks_merge": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
@@ -201,8 +204,8 @@ def main():
     expect(tokens["token_type"] == "Bearer", "wrong token type")
     expect(tokens.get("refresh_token"), "refresh token missing")
 
-    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_get", "tasks_create", "tasks_delete", "workers_list", "work_pick", "work_renew", "work_finish", "work_release", "tasks_merge"}
-    forbidden_tools = {"reviews_get", "reviews_show", "reviews_grep", "reviews_diff", "reviews_decide", "tasks_retry", "tasks_confirm_merge", "workers_retire"}
+    required_tools = {"projects_list", "projects_create", "tasks_list", "tasks_get", "tasks_create", "tasks_delete", "workers_list", "work_pick", "read", "write", "edit", "bash", "work_finish", "work_release", "tasks_merge"}
+    forbidden_tools = {"work_renew", "reviews_get", "reviews_show", "reviews_grep", "reviews_diff", "reviews_decide", "tasks_retry", "tasks_confirm_merge", "workers_retire"}
 
     legacy_initialize = mcp_call(tokens["access_token"], "initialize", {
         "protocolVersion": MCP_LEGACY_VERSION,

@@ -249,7 +249,7 @@ You are an autonomous LazyTeam coding worker. Execute only the assigned task in 
 
 Reviewer policy belongs to the **reviewer worker**, not the Project. Open **Workers → Configure**, set Role to Reviewer, and edit that worker's **Initial prompt**. There is no separate Project-level review prompt. The Home board keeps review work in two lanes: **Review** contains tasks awaiting/under reviewer-worker review, while **MergePending** contains approved candidates waiting for the main agent to invoke Host publish.
 
-`work_pick(role="review", task_id?)` acquires the same authoritative review lease used by reviewer workers and returns the complete pinned review context in one response: implementation execution/worker, candidate SHA, base SHA, stable review ref, upstream SHA, integration SHA, effective diff hash, review cycle, and a read-only Host broker checkout URL. No upstream credential is involved.
+`work_pick(role="review", task_id?)` acquires the same authoritative review lease used by reviewer workers, prepares an isolated Host-side review sandbox from the pinned integration snapshot, and returns `sandbox_id` plus the review context. The interactive reviewer uses only `read` / `write` / `edit` / `bash(sandbox_id, ...)`; it never receives an upstream credential, lease capability, or broker credential. Review-sandbox edits are disposable and cannot modify the reviewed candidate.
 
 A review retry requires a reason. LazyTeam stores that reason as `review_feedback`, reserves implementation return work for the worker that owns the logical implementation session, and injects the feedback into that retained session. Review work follows the same rule: the latest reviewer owns the logical review session and receives return review work first. Busy/full owners keep the reservation without holding a physical slot; another eligible worker may take over only when the owner is unavailable/ineligible or the affinity window expires. Affinity never reuses authority: every execution/review claim receives a fresh lease capability, and the previous capability stays revoked.
 
@@ -273,10 +273,11 @@ queued -> assigned -> running -> review -> merge_pending -> done
 
 - Completed worker executions enter `review` and publish a stable review ref.
 - Review retry requires feedback and is sticky to the same worker so workspace/session state is reused.
-- Only `work_finish` on an active, unexpired review lease can approve or retry review work. Approve moves `review -> merge_pending`; retry follows the configured per-cycle retry limit. There is no direct review-decision bypass.
-- `work_release` voluntarily abandons a lease without counting a failure: implementation returns to `queued` and its execution repo is cleaned; review stays in `review`.
+- Only `work_finish(sandbox_id, ...)` on a sandbox still attached to an active review lease can approve or retry review work. Approve moves `review -> merge_pending`; retry follows the configured per-cycle retry limit. There is no direct review-decision bypass.
+- `work_release(sandbox_id)` voluntarily abandons work without counting a failure: implementation returns to `queued`; review stays in `review`. The Host stops sandbox processes and tears the sandbox down.
+- Interactive lease renewal is internal. The Host renews the authoritative execution/review lease every 30 seconds while the sandbox is attached, and each `read` / `write` / `edit` / `bash` operation validates and renews it again. There is no public `work_renew` tool.
 - `tasks_merge` is the single MCP merge action. It performs Host-side upstream publish of the exact reviewed candidate, moves `merge_pending -> done`, releases dependencies, and queues cleanup. It refuses publication if the reviewed integration is no longer valid.
-- Every execution/review claim still gets its own UUID and opaque `ltc_*` capability; stale capabilities cannot renew, finish, or release newer ownership.
+- Every execution/review claim still gets its own UUID and opaque `ltc_*` capability internally; interactive agents see only a random `sandbox_id`. `sandbox_id` is an operation handle, not a second ownership authority.
 
 ## MCP and OAuth detail
 
@@ -291,13 +292,16 @@ tasks_create
 tasks_delete
 workers_list
 work_pick
-work_renew
+read
+write
+edit
+bash
 work_finish
 work_release
 tasks_merge
 ```
 
-The four `work_*` tools are the only public MCP ownership lifecycle. REST worker-daemon claim/renew/finish/release endpoints call the same internal lifecycle service, so interactive agents and daemons compete through the same task/review rows and CAS rules rather than parallel authority models. Interactive MCP ownership reuses two hidden internal actor rows solely for the existing execution/review foreign keys; they are excluded from normal worker inventory and scheduling, and no separate work-lease table exists.
+`work_pick`, `work_finish`, and `work_release` are the public interactive ownership lifecycle. `read`, `write`, `edit`, and `bash` are the same four coding operations exposed by PC, but routed through the Host-attached `sandbox_id`. REST worker-daemon claim/renew/finish/release endpoints and interactive MCP work call the same internal lifecycle service, so interactive agents and daemons compete through the same task/review rows and CAS rules rather than parallel authority models. Interactive MCP ownership reuses two hidden internal actor rows solely for the existing execution/review foreign keys; they are excluded from normal worker inventory and scheduling. Sandbox attachments are ephemeral routing state only and never become a second lease authority.
 
 The intended flow is that a strong planner such as ChatGPT talks to the OAuth-protected MCP control plane, creates project-scoped work, and either lets idle workers claim matching tasks automatically or explicitly acquires work with `work_pick`. The authorization page uses `LAZYTEAM_OAUTH_PASSWORD` for the human approval step. See [Security model](#security-model) for PKCE, DCR, CIMD, token, DNS, and rate-limit hardening.
 
