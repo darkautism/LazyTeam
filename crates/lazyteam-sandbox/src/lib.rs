@@ -251,6 +251,7 @@ impl AgentSandbox {
             .unwrap_or(std::env::current_exe().context("resolve sandbox launcher executable")?);
         let launcher_exe = std::fs::canonicalize(&launcher_exe)
             .with_context(|| format!("canonicalize sandbox launcher {}", launcher_exe.display()))?;
+        read_only.insert(launcher_exe.clone());
         let sandbox = Self {
             state_dir,
             pi_config_dir,
@@ -415,9 +416,8 @@ impl AgentSandbox {
             );
         }
 
-        let current_exe = std::env::current_exe().context("resolve worker for sandbox signal probe")?;
-        let current_exe = current_exe.to_str().context("worker executable path is not UTF-8")?;
-        let mut command = self.command(current_exe, &self.probe_dir, None)?;
+        let launcher = self.launcher_exe.to_str().context("sandbox launcher path is not UTF-8")?;
+        let mut command = self.command(launcher, &self.probe_dir, None)?;
         command.arg(SIGNAL_PROBE_ARG);
         command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let output = command.output().await.context("probe sandbox process isolation")?;
