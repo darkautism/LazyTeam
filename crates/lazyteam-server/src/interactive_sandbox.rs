@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use lazyteam_core::{Assignment, ExecutionResult, ReviewAssignment, ReviewVerdict};
 use lazyteam_sandbox::{prepare_agent_workspace, sync_agent_workspace, AgentSandbox};
 use serde::Serialize;
@@ -90,6 +90,19 @@ pub(crate) struct BashResult {
     pub(crate) full_output_path: Option<String>,
     pub(crate) truncated: bool,
     pub(crate) instruction: Option<&'static str>,
+}
+
+pub(crate) async fn cleanup_stale_sandboxes(git_root: &Path) -> anyhow::Result<()> {
+    let root = git_root.join("interactive-sandboxes");
+    match tokio::fs::remove_dir_all(&root).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context(format!("remove stale interactive sandbox root {}", root.display())),
+    }
+    tokio::fs::create_dir_all(&root)
+        .await
+        .with_context(|| format!("create interactive sandbox root {}", root.display()))?;
+    Ok(())
 }
 
 impl InteractiveSandboxManager {
@@ -1036,6 +1049,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires LAZYTEAM_SANDBOX_LAUNCHER pointing at a built lazyteam-server binary"]
     async fn interactive_sandbox_runs_implementation_and_review_end_to_end() {
         let (state, task_id, root) = e2e_state().await;
         let worker = ensure_internal_work_actor(&state, AgentRole::Worker).await.unwrap();

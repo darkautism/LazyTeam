@@ -109,6 +109,7 @@ pub struct AgentSandbox {
     container_rootfs: Option<PathBuf>,
     container_read_only: Vec<PathBuf>,
     trusted_container_daemon: bool,
+    launcher_exe: PathBuf,
 }
 
 impl AgentSandbox {
@@ -245,6 +246,11 @@ impl AgentSandbox {
             }
         }
 
+        let launcher_exe = std::env::var_os("LAZYTEAM_SANDBOX_LAUNCHER")
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_exe().context("resolve sandbox launcher executable")?);
+        let launcher_exe = std::fs::canonicalize(&launcher_exe)
+            .with_context(|| format!("canonicalize sandbox launcher {}", launcher_exe.display()))?;
         let sandbox = Self {
             state_dir,
             pi_config_dir,
@@ -260,6 +266,7 @@ impl AgentSandbox {
             container_rootfs,
             container_read_only: container_read_only.into_iter().collect(),
             trusted_container_daemon,
+            launcher_exe,
         };
         sandbox.probe().await?;
         Ok(sandbox)
@@ -337,7 +344,7 @@ impl AgentSandbox {
             nested_read_only,
             trusted_container_daemon: self.trusted_container_daemon,
         };
-        let mut command = Command::new(std::env::current_exe().context("resolve lazyteam-worker executable")?);
+        let mut command = Command::new(&self.launcher_exe);
         command.arg(if self.container_rootfs.is_some() { CONTAINER_EXEC_ARG } else { EXEC_ARG }).arg(program);
         command.current_dir(&workspace);
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());

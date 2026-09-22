@@ -132,6 +132,9 @@ async fn main() -> anyhow::Result<()> {
     }
     tokio::fs::create_dir_all(&args.git_root).await.context("create Git broker storage")?;
     let git_root = tokio::fs::canonicalize(&args.git_root).await.context("canonicalize Git broker storage")?;
+    interactive_sandbox::cleanup_stale_sandboxes(&git_root)
+        .await
+        .context("cleanup stale interactive sandboxes")?;
     let git_credential_key = Some(git_credentials::load_or_create_master_key(
         &git_root.join("credential.key"),
         args.git_credential_key.as_deref(),
