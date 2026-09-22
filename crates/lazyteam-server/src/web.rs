@@ -183,6 +183,7 @@ mod tests {
         assert!(INDEX.contains("Upstream Git access (Host only)"));
         assert!(INDEX.contains("workers never access upstream directly"));
         assert!(INDEX.contains("<option value=\"https_basic\">HTTPS username + token/password</option>"));
+        assert!(INDEX.contains("<option value=\"ssh_key\">SSH private key</option>"));
         assert!(INDEX.contains("project-git-secret"));
         assert!(INDEX.contains("x-access-token"));
         assert!(INDEX.contains("Git credential was not stored; project remains unusable."));

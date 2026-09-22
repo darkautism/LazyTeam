@@ -131,7 +131,7 @@ def main():
            "ambiguous worker-managed Git checkbox must not coexist with server credential fields")
     expect('<option value="host">No stored credential</option>' in ui and
            '<option value="https_basic">HTTPS username + token/password</option>' in ui,
-           "project Git auth selector must make Host environment vs Host HTTPS token mutually exclusive")
+           "project Git auth selector must distinguish no stored credential from stored HTTPS auth")
     expect('Upstream Git access (Host only)' in ui and 'workers never access upstream directly' in ui,
            "project Git UI must state that upstream credentials stay on the Host")
     expect('Advanced review' not in ui and 'project-reviewer-prompt' not in ui,

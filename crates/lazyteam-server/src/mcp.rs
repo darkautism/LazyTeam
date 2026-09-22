@@ -187,6 +187,7 @@ struct ProjectRef {
     id: Uuid,
     slug: String,
     name: String,
+    /// Project routing tags. Example: {"smart":"true"}.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     required_worker_tags: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -219,6 +220,7 @@ struct TaskListItem {
     title: String,
     state: TaskState,
     priority: i32,
+    /// Task routing requirements.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     required_tags: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
