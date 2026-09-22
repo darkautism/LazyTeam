@@ -125,6 +125,8 @@ impl InteractiveSandboxManager {
             &trusted,
             &assignment.project.default_branch,
             &review_ref,
+            &assignment.project.contributor.name,
+            &assignment.project.contributor.email,
         )
         .await
         .map_err(internal)?;
@@ -680,6 +682,8 @@ async fn prepare_implementation_checkout(
     trusted: &Path,
     default_branch: &str,
     review_ref: &str,
+    contributor_name: &str,
+    contributor_email: &str,
 ) -> anyhow::Result<String> {
     clone_default(task_repo, trusted, default_branch).await?;
     let base_sha = git_output(trusted, &["rev-parse", "HEAD"]).await?;
@@ -699,7 +703,21 @@ async fn prepare_implementation_checkout(
             &["checkout", "-b", "lazyteam-task", "refs/remotes/origin/lazyteam-seeded"],
         )
         .await?;
-        command_ok(trusted, &["merge", "--no-edit", &base_sha]).await?;
+        let merge = trusted_git_command()
+            .args(["-c", &format!("user.name={contributor_name}")])
+            .args(["-c", &format!("user.email={contributor_email}")])
+            .args(["merge", "--no-edit", &base_sha])
+            .current_dir(trusted)
+            .output()
+            .await?;
+        if !merge.status.success() {
+            let conflicts = git_output(trusted, &["diff", "--name-only", "--diff-filter=U"])
+                .await
+                .unwrap_or_default();
+            if conflicts.trim().is_empty() {
+                bail!("merge current base into prior candidate failed: {}", String::from_utf8_lossy(&merge.stderr));
+            }
+        }
     } else {
         command_ok(trusted, &["checkout", "-b", "lazyteam-task"]).await?;
     }
@@ -783,7 +801,11 @@ async fn sanitize_trusted_checkout(path: &Path) -> anyhow::Result<()> {
 }
 
 async fn auto_commit(path: &Path, meta: &ImplementationMeta) -> anyhow::Result<()> {
-    command_ok(path, &["reset"]).await?;
+    let git_dir = git_output(path, &["rev-parse", "--git-dir"]).await?;
+    let git_dir = if Path::new(&git_dir).is_absolute() { PathBuf::from(git_dir) } else { path.join(git_dir) };
+    if !git_dir.join("MERGE_HEAD").exists() {
+        command_ok(path, &["reset"]).await?;
+    }
     command_ok(path, &["add", "-A"]).await?;
     let status = trusted_git_command()
         .args(["diff", "--cached", "--quiet"])

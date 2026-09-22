@@ -16,6 +16,7 @@ services:
       LAZYTEAM_WORKER_TOKEN: "${LAZYTEAM_WORKER_TOKEN:?set LAZYTEAM_WORKER_TOKEN}"
       LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS: "${LAZYTEAM_ALLOWED_OAUTH_CLIENT_HOSTS:-chatgpt.com,*.chatgpt.com}"
       LAZYTEAM_ALLOWED_REDIRECT_HOSTS: "${LAZYTEAM_ALLOWED_REDIRECT_HOSTS:-chatgpt.com,*.chatgpt.com}"
+      LAZYTEAM_INTERACTIVE_SANDBOX_CAPS: "1"
       RUST_LOG: "${RUST_LOG:-lazyteam_server=info,tower_http=info}"
     volumes:
       - lazyteam-data:/app/data
@@ -30,8 +31,12 @@ services:
       - DAC_OVERRIDE
       - SETGID
       - SETUID
+      - SYS_ADMIN
+      - SYS_CHROOT
     security_opt:
       - no-new-privileges:true
+      - seccomp=unconfined
+      - apparmor=unconfined
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
       interval: 30s

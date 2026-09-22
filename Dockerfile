@@ -7,7 +7,7 @@ RUN cargo build --release -p lazyteam-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git gosu openssh-client \
+    && apt-get install -y --no-install-recommends ca-certificates curl git gosu openssh-client util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 lazyteam \
     && useradd --system --uid 10001 --gid 10001 --home-dir /app/data/home --shell /usr/sbin/nologin lazyteam \

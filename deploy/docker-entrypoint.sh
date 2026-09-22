@@ -153,6 +153,20 @@ if [ "$runtime_uid" -ne 0 ]; then
       echo "lazyteam-entrypoint: running trusted worker daemon with container mount capability (state owner: $runtime_uid:$runtime_gid; auto source: $source)"
       exec "$@"
       ;;
+    lazyteam-server|/usr/local/bin/lazyteam-server)
+      if [ "${LAZYTEAM_INTERACTIVE_SANDBOX_CAPS:-0}" = "1" ]; then
+        echo "lazyteam-entrypoint: running server as $runtime_uid:$runtime_gid with sandbox-only SYS_ADMIN/SYS_CHROOT capabilities (auto source: $source)"
+        exec setpriv \
+          --reuid="$runtime_uid" \
+          --regid="$runtime_gid" \
+          --clear-groups \
+          --inh-caps=+sys_admin,+sys_chroot \
+          --ambient-caps=+sys_admin,+sys_chroot \
+          "$@"
+      fi
+      echo "lazyteam-entrypoint: running server as $runtime_uid:$runtime_gid without interactive sandbox capabilities (auto source: $source)"
+      exec gosu "$runtime_uid:$runtime_gid" "$@"
+      ;;
     *)
       echo "lazyteam-entrypoint: running command as $runtime_uid:$runtime_gid (auto source: $source)"
       exec gosu "$runtime_uid:$runtime_gid" "$@"
