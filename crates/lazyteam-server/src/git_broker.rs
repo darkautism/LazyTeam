@@ -9,7 +9,6 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use lazyteam_core::{GitCredential, IntegrationSnapshot, MergeConflictEvidence, MergeConflictFile, Project};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::{io::AsyncWriteExt, process::Command};
