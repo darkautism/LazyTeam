@@ -32,11 +32,11 @@ You can watch all of this on the Home board: queued → being worked on → in r
 
 > **Settle the bet:** give one worker your GPT key and another your Gemini key, assign them similar tasks, and compare the review verdicts. May the least-hallucinated skills win.
 
-### MCP work leases
+### MCP sandbox work
 
 Interactive agents use the same authoritative ownership model and the same sandbox engine as worker daemons. `work_pick` claims implementation or review work, prepares an isolated workspace, and returns a `sandbox_id`. The agent then works only through the four PC-style tools: `read`, `write`, `edit`, and `bash`, each scoped by that `sandbox_id`. LazyTeam renews the lease automatically in the background and on tool activity; the agent never handles lease capabilities or Git credentials.
 
-`work_finish` syncs implementation changes back through the trusted Host layer, creates and publishes the task candidate, or records the pinned review verdict. If the agent cannot continue, `work_release` gives the work back voluntarily and destroys the sandbox. A release is not a failure: implementation returns to the queue, while review remains available for another reviewer.
+`work_finish(sandbox_id, ...)` syncs implementation changes back through the trusted Host layer, creates and publishes the task candidate, or records the pinned review verdict. If the agent cannot continue, `work_release(sandbox_id)` gives the work back voluntarily and destroys the sandbox. A release is not a failure: implementation returns to the queue, while review remains available for another reviewer.
 
 ## Install / deploy it
 
