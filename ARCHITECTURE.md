@@ -154,9 +154,9 @@ For non-production local development, the security middleware keeps the original
 
 Each project chooses how the Host reaches upstream:
 
-- **Host environment / public repository** (default): the Host uses anonymous access or Git/SSH configuration already present in the Host runtime.
-- **Host SSH private key**: store a project-scoped private key in LazyTeam. The Host materializes it only for the upstream Git command and removes the temporary key afterward.
-- **Host HTTPS username + token/password**: store a project-scoped HTTPS credential. The Host applies it only to its upstream fetch/publish command.
+- **No stored credential** (default): LazyTeam stores no project secret; upstream Git uses anonymous access or Git/SSH configuration already present in the Host runtime.
+- **SSH private key**: store a project-scoped private key in LazyTeam. The Host materializes it only for the upstream Git command and removes the temporary key afterward.
+- **HTTPS username + token/password**: store a project-scoped HTTPS credential. The Host applies it only to its upstream fetch/publish command.
 
 ### GitHub fine-grained PAT: least privilege
 
