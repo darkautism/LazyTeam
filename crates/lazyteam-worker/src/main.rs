@@ -458,7 +458,7 @@ async fn async_main() -> anyhow::Result<()> {
         match poll_agent_auth(&client, &server, &worker_credential, worker_id).await {
             Ok(Some(update)) => {
                 let provider = update.provider.clone();
-                if let Err(error) = agent_sandbox.store_pi_api_key(&update.provider, &update.api_key).await {
+                if let Err(error) = probe_runtime.store_api_key(&update.provider, &update.api_key).await {
                     error!(%error, provider = %provider, credential_update = %update.id, "failed to store provider API key");
                 } else {
                     info!(provider = %provider, credential_update = %update.id, "provider API key stored in isolated Pi config");

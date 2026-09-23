@@ -1624,6 +1624,48 @@ impl PiRuntime {
         Ok(index)
     }
 
+    pub async fn store_api_key(&self, provider: &str, api_key: &str) -> anyhow::Result<()> {
+        let provider = provider.trim();
+        if provider.is_empty() || api_key.trim().is_empty() {
+            bail!("provider and API key are required");
+        }
+        let index = self.pi_module_index()?;
+        let dist = index.parent().context("Pi public module missing dist parent")?;
+        let auth_storage_url = serde_json::to_string(&format!(
+            "file://{}",
+            dist.join("core").join("auth-storage.js").display()
+        ))?;
+        let script = format!(
+            r#"import {{ AuthStorage }} from {auth_storage_url};
+let input="";
+for await (const chunk of process.stdin) input+=chunk;
+const {{provider,key}}=JSON.parse(input);
+const dir=process.env.PI_CODING_AGENT_DIR;
+const auth=AuthStorage.create(dir+"/auth.json");
+await auth.modify(provider,async()=>({{type:"api_key",key}}));
+console.log("ok");"#
+        );
+        let payload = serde_json::to_vec(&json!({"provider": provider, "key": api_key}))?;
+        let sandbox = self.sandbox.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
+            command.arg("--input-type=module").arg("--eval").arg(script);
+            command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut child = command.spawn().context("spawn Pi credential store helper")?;
+            let mut stdin = child.stdin.take().context("Pi credential store helper stdin missing")?;
+            stdin.write_all(&payload).await?;
+            stdin.shutdown().await?;
+            drop(stdin);
+            let output = child.wait_with_output().await.context("wait for Pi credential store helper")?;
+            if !output.status.success() {
+                bail!("Pi credential store helper failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await.context("Pi credential store helper timed out")??;
+        self.sandbox.repair_pi_auth_permissions().await?;
+        Ok(())
+    }
+
     async fn probe_providers(&self) -> anyhow::Result<Vec<AgentProvider>> {
         let index = self.pi_module_index()?;
         let dist = index.parent().context("Pi public module missing dist parent")?;

@@ -504,29 +504,11 @@ impl AgentSandbox {
         }
     }
 
-    pub async fn store_pi_api_key(&self, provider: &str, api_key: &str) -> anyhow::Result<()> {
-        let provider = provider.trim();
-        if provider.is_empty() || api_key.trim().is_empty() {
-            bail!("provider and API key are required");
-        }
+    pub async fn repair_pi_auth_permissions(&self) -> anyhow::Result<()> {
         let auth_path = self.pi_config_dir.join("auth.json");
-        let mut root = match tokio::fs::read(&auth_path).await {
-            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice::<serde_json::Value>(&bytes)
-                .context("parse isolated Pi auth.json")?,
-            Ok(_) => serde_json::json!({}),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-            Err(error) => return Err(error).context("read isolated Pi auth.json"),
-        };
-        let object = root.as_object_mut().context("isolated Pi auth.json must contain a JSON object")?;
-        object.insert(provider.to_string(), serde_json::json!({"type":"api_key","key":api_key}));
-        let tmp_path = self.pi_config_dir.join(format!("auth.json.tmp-{}", uuid::Uuid::new_v4()));
-        tokio::fs::write(&tmp_path, serde_json::to_vec_pretty(&root)?).await?;
-        if self.trusted_container_daemon {
-            set_shared_pi_file(&tmp_path).await?;
-        } else {
-            set_private_file(&tmp_path).await?;
+        if !auth_path.exists() {
+            return Ok(());
         }
-        tokio::fs::rename(&tmp_path, &auth_path).await?;
         if self.trusted_container_daemon {
             set_shared_pi_file(&auth_path).await?;
         } else {
