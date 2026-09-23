@@ -1246,6 +1246,15 @@ async fn write_oauth_paste(
     Ok(())
 }
 
+async fn best_effort_after_oauth_complete<F>(operation: F)
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    if let Err(error) = operation.await {
+        warn!(%error, "OAuth credential is stored, but post-login model/capability refresh failed");
+    }
+}
+
 async fn execute_oauth_login(
     client: &Client,
     server: &str,
@@ -1379,9 +1388,15 @@ try {{
         let _ = report_oauth_event(client, server, credential, worker_id, claim.id, &report).await;
     }
     if !completed { anyhow::bail!("Pi OAuth login did not complete successfully"); }
-    runtime.force_refresh_models(&claim.provider).await?;
-    let capabilities = runtime.capabilities().await;
-    report_capabilities(client, server, credential, worker_id, &capabilities).await?;
+    // Pi's complete event is the credential commit point. Anything below is
+    // cache/control-plane follow-up and must never downgrade that successful
+    // login to failed.
+    best_effort_after_oauth_complete(async {
+        runtime.force_refresh_models(&claim.provider).await?;
+        let capabilities = runtime.capabilities().await;
+        report_capabilities(client, server, credential, worker_id, &capabilities).await?;
+        Ok(())
+    }).await;
     Ok(())
 }
 
@@ -3186,6 +3201,13 @@ mod tests {
         assert!(!outcome.completed);
         assert!(!outcome.failed_reported);
         assert_eq!(kinds, vec!["awaiting_input"]);
+    }
+
+    #[tokio::test]
+    async fn oauth_post_complete_refresh_failure_is_nonfatal() {
+        best_effort_after_oauth_complete(async {
+            anyhow::bail!("synthetic post-login refresh failure");
+        }).await;
     }
 
     #[tokio::test]
