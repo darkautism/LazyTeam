@@ -241,6 +241,7 @@ pub struct AgentSandbox {
     rustup_home: Option<PathBuf>,
     container_rootfs: Option<PathBuf>,
     container_read_only: Vec<PathBuf>,
+    pi_package_dir: Option<PathBuf>,
     trusted_container_daemon: bool,
     sandbox_uid_dir: PathBuf,
     launcher_exe: PathBuf,
@@ -366,6 +367,7 @@ impl AgentSandbox {
             path = std::env::join_paths(paths).context("compose agent PATH with managed Rust")?;
         }
 
+        let mut pi_package_dir = None;
         if let Some(program) = resolve_program(pi_bin, &host_path) {
             // A managed Pi runtime uses a stable symlink under state/pi-runtime
             // and atomically switches that link after a fully installed update.
@@ -380,6 +382,10 @@ impl AgentSandbox {
                 }
             }
             if let Ok(target) = std::fs::canonicalize(&program) {
+                // Always tell Pi its canonical package root. Managed installs
+                // under state/pi-runtime need the same deterministic asset
+                // lookup as the bundled fallback.
+                pi_package_dir = nearest_package_root(&target);
                 let runtime_root = common_ancestor(&program, &target).filter(|root| path_depth(root) >= 3)
                     .or_else(|| program.parent().map(Path::to_path_buf));
                 if let Some(root) = runtime_root {
@@ -401,9 +407,9 @@ impl AgentSandbox {
                 // state/pi-runtime and are already covered by the stable runtime
                 // root above, so this only broadens the bundled fallback closure.
                 if container_rootfs.is_some() && !target.starts_with(&state_dir) {
-                    if let Some(package_root) = nearest_package_root(&target) {
+                    if let Some(package_root) = pi_package_dir.as_ref() {
                         read_only.insert(package_root.clone());
-                        container_read_only.insert(package_root);
+                        container_read_only.insert(package_root.clone());
                     }
                     if let Some(node) = resolve_program("node", &host_path)
                         .and_then(|path| std::fs::canonicalize(path).ok())
@@ -471,6 +477,7 @@ impl AgentSandbox {
             rustup_home,
             container_rootfs,
             container_read_only: container_read_only.into_iter().collect(),
+            pi_package_dir,
             trusted_container_daemon,
             sandbox_uid_dir,
             launcher_exe,
@@ -574,6 +581,16 @@ impl AgentSandbox {
         command.env("PATH", &self.path);
         command.env("HOME", &self.home_dir);
         command.env("PI_CODING_AGENT_DIR", &self.pi_config_dir);
+        if let Some(pi_package_dir) = &self.pi_package_dir {
+            // Pi's bundled Node code discovers assets with fs.existsSync().
+            // Per-task UIDs intentionally cannot traverse root-owned 0750
+            // package-parent directories via normal DAC checks, even though
+            // the package tree itself is Landlock-admitted and readable via
+            // the retained DAC override capability. Give Pi its already
+            // validated canonical package root explicitly so asset lookup
+            // never falls back to the bundle chunk directory.
+            command.env("PI_PACKAGE_DIR", pi_package_dir);
+        }
         command.env("CARGO_HOME", &self.cargo_home);
         command.env("CARGO_TARGET_DIR", &self.cargo_target_dir);
         command.env("XDG_CACHE_HOME", self.home_dir.join(".cache"));

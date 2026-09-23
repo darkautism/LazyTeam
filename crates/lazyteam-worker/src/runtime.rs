@@ -1626,15 +1626,25 @@ impl PiRuntime {
 
     async fn probe_providers(&self) -> anyhow::Result<Vec<AgentProvider>> {
         let index = self.pi_module_index()?;
-        let import_url = format!("file://{}", index.display());
-        let import_url = serde_json::to_string(&import_url)?;
+        let dist = index.parent().context("Pi public module missing dist parent")?;
+        let import_url = serde_json::to_string(&format!("file://{}", index.display()))?;
+        let auth_storage_url = serde_json::to_string(&format!(
+            "file://{}",
+            dist.join("core").join("auth-storage.js").display()
+        ))?;
+        let models_store_url = serde_json::to_string(&format!(
+            "file://{}",
+            dist.join("core").join("models-store.js").display()
+        ))?;
         let script = format!(
             r#"import {{ ModelRuntime }} from {import_url};
+import {{ ReadOnlyAuthStorage }} from {auth_storage_url};
+import {{ InMemoryCodingAgentModelsStore }} from {models_store_url};
 const dir=process.env.PI_CODING_AGENT_DIR;
 const rt=await ModelRuntime.create({{
-  authPath:dir+"/auth.json",
+  credentials:new ReadOnlyAuthStorage(dir+"/auth.json"),
   modelsPath:dir+"/models.json",
-  modelsStorePath:dir+"/models-store.json",
+  modelsStore:new InMemoryCodingAgentModelsStore(),
   allowModelNetwork:false,
   refreshOnCreate:false
 }});
@@ -1702,39 +1712,47 @@ console.log("ok");"#
     }
 
     async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
-        let binary = self.binary.clone();
+        let index = self.pi_module_index()?;
+        let dist = index.parent().context("Pi public module missing dist parent")?;
+        let import_url = serde_json::to_string(&format!("file://{}", index.display()))?;
+        let auth_storage_url = serde_json::to_string(&format!(
+            "file://{}",
+            dist.join("core").join("auth-storage.js").display()
+        ))?;
+        let models_store_url = serde_json::to_string(&format!(
+            "file://{}",
+            dist.join("core").join("models-store.js").display()
+        ))?;
+        let script = format!(
+            r#"import {{ ModelRuntime }} from {import_url};
+import {{ ReadOnlyAuthStorage }} from {auth_storage_url};
+import {{ InMemoryCodingAgentModelsStore }} from {models_store_url};
+const dir=process.env.PI_CODING_AGENT_DIR;
+const rt=await ModelRuntime.create({{
+  credentials:new ReadOnlyAuthStorage(dir+"/auth.json"),
+  modelsPath:dir+"/models.json",
+  modelsStore:new InMemoryCodingAgentModelsStore(),
+  allowModelNetwork:false,
+  refreshOnCreate:false
+}});
+const models=await rt.getAvailable();
+console.log(JSON.stringify(models));"#
+        );
         let sandbox = self.sandbox.clone();
         tokio::time::timeout(std::time::Duration::from_secs(10), async move {
-            let mut command = sandbox.command(&binary, sandbox.probe_workspace(), None)?;
-            command.arg("--mode").arg("rpc").arg("--no-session");
-            command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-            let mut child = command.spawn().with_context(|| format!("spawn sandboxed {binary} for capability probe"))?;
-            let mut stdin = child.stdin.take().context("Pi capability probe stdin missing")?;
-            let stdout = child.stdout.take().context("Pi capability probe stdout missing")?;
-            let request = json!({"id":"lazyteam-models","type":"get_available_models"});
-            stdin.write_all(request.to_string().as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.flush().await?;
-            let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next_line().await? {
-                let event: Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
-                if event.get("type").and_then(Value::as_str) == Some("response")
-                    && event.get("id").and_then(Value::as_str) == Some("lazyteam-models")
-                {
-                    if event.get("success").and_then(Value::as_bool) != Some(true) {
-                        let _ = child.kill().await;
-                        bail!("Pi get_available_models failed: {event}");
-                    }
-                    let models = event.get("data").and_then(|v| v.get("models")).and_then(Value::as_array)
-                        .context("Pi get_available_models response omitted data.models")?
-                        .iter().filter_map(agent_model_from_pi).collect();
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    return Ok(models);
-                }
+            let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
+            command.arg("--input-type=module").arg("--eval").arg(script);
+            command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = command.output().await.context("run Pi ModelRuntime model probe")?;
+            if !output.status.success() {
+                bail!("Pi model probe failed: {}", String::from_utf8_lossy(&output.stderr).trim());
             }
-            let _ = child.kill().await;
-            bail!("Pi exited before returning available models")
+            let models = serde_json::from_slice::<Vec<Value>>(&output.stdout)
+                .context("parse Pi ModelRuntime model probe output")?
+                .iter()
+                .filter_map(agent_model_from_pi)
+                .collect();
+            Ok(models)
         }).await.context("Pi capability probe timed out")?
     }
 }
