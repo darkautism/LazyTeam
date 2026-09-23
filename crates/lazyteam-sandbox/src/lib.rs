@@ -13,7 +13,9 @@ const EXEC_ARG: &str = "__lazyteam-sandbox-exec";
 const CONTAINER_EXEC_ARG: &str = "__lazyteam-container-exec";
 const SIGNAL_PROBE_ARG: &str = "__lazyteam-sandbox-signal-probe";
 const SPEC_ENV: &str = "LAZYTEAM_SANDBOX_SPEC";
-const PID_NAMESPACE_ENV: &str = "LAZYTEAM_SANDBOX_PID_NAMESPACE";
+const UID_ISOLATION_ENV: &str = "LAZYTEAM_SANDBOX_UID";
+const SANDBOX_UID_MIN: u32 = 20_000;
+const SANDBOX_UID_MAX: u32 = 59_999;
 const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".pytest_cache", ".venv"];
 /// Image-native paths that may be visible to agents when present in the frozen
 /// container rootfs. These paths join the same canonical read_only policy
@@ -123,6 +125,90 @@ fn add_runtime_metadata_read_only(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn sandbox_uid_key(workspace: &Path) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in workspace.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_uid_for_workspace(uid_dir: &Path, workspace: &Path) -> anyhow::Result<u32> {
+    use std::{fs::OpenOptions, os::fd::AsRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::create_dir_all(uid_dir).context("create sandbox uid directory")?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(uid_dir.join(".lock"))
+        .context("open sandbox uid allocation lock")?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        bail!("lock sandbox uid allocator failed: {}", std::io::Error::last_os_error());
+    }
+
+    let workspace_text = workspace.to_string_lossy().to_string();
+    let key = sandbox_uid_key(workspace);
+    let mapping_path = uid_dir.join(format!("{key}.json"));
+    if mapping_path.exists() {
+        let value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&mapping_path).context("read sandbox uid mapping")?,
+        )
+        .context("parse sandbox uid mapping")?;
+        let mapped_workspace = value.get("workspace").and_then(serde_json::Value::as_str)
+            .context("sandbox uid mapping missing workspace")?;
+        let uid = value.get("uid").and_then(serde_json::Value::as_u64)
+            .context("sandbox uid mapping missing uid")?;
+        if mapped_workspace != workspace_text {
+            bail!("sandbox uid mapping hash collision for {}", workspace.display());
+        }
+        let uid: u32 = uid.try_into().context("sandbox uid mapping out of range")?;
+        if !(SANDBOX_UID_MIN..=SANDBOX_UID_MAX).contains(&uid) {
+            bail!("sandbox uid mapping {uid} is outside reserved range");
+        }
+        return Ok(uid);
+    }
+
+    let mut used = BTreeSet::new();
+    used.insert(unsafe { libc::geteuid() });
+    if let Some(state_dir) = uid_dir.parent() {
+        if let Ok(metadata) = std::fs::metadata(state_dir) {
+            used.insert(metadata.uid());
+        }
+    }
+    for entry in std::fs::read_dir(uid_dir).context("scan sandbox uid mappings")? {
+        let entry = entry?;
+        if entry.path().extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else { continue; };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue; };
+        if let Some(uid) = value.get("uid").and_then(serde_json::Value::as_u64)
+            .and_then(|uid| u32::try_from(uid).ok())
+        {
+            used.insert(uid);
+        }
+    }
+    let uid = (SANDBOX_UID_MIN..=SANDBOX_UID_MAX)
+        .find(|uid| !used.contains(uid))
+        .context("sandbox uid pool exhausted")?;
+    let mapping = serde_json::json!({"workspace": workspace_text, "uid": uid});
+    let temp_path = uid_dir.join(format!(".{key}-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temp_path, serde_json::to_vec(&mapping)?)
+        .context("write sandbox uid mapping")?;
+    std::fs::rename(&temp_path, &mapping_path).context("publish sandbox uid mapping")?;
+    Ok(uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_uid_for_workspace(_uid_dir: &Path, _workspace: &Path) -> anyhow::Result<u32> {
+    bail!("sandbox uid isolation requires Linux")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SandboxSpec {
     read_only: Vec<PathBuf>,
@@ -135,6 +221,8 @@ struct SandboxSpec {
     nested_read_only: Vec<PathBuf>,
     #[serde(default)]
     trusted_container_daemon: bool,
+    #[serde(default)]
+    sandbox_uid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +241,7 @@ pub struct AgentSandbox {
     container_rootfs: Option<PathBuf>,
     container_read_only: Vec<PathBuf>,
     trusted_container_daemon: bool,
+    sandbox_uid_dir: PathBuf,
     launcher_exe: PathBuf,
 }
 
@@ -174,7 +263,7 @@ impl AgentSandbox {
         // Trust is a property of the worker daemon deployment, not of whether
         // the optional nested rootfs mount namespace is available. The outer-
         // container Landlock fallback still runs inside the same trusted worker
-        // container and can use a private PID namespace for safe child control.
+        // container and can use per-sandbox Unix credentials for safe child control.
         let trusted_container_daemon = std::env::var_os("LAZYTEAM_TRUSTED_CONTAINER_DAEMON")
             .is_some_and(|value| value == "1");
         let pi_config_dir = state_dir.join("pi-agent");
@@ -184,10 +273,11 @@ impl AgentSandbox {
         let tmp_dir = state_dir.join("agent-tmp");
         let probe_dir = state_dir.join("agent-probe");
         let namespace_root_base = state_dir.join("sandbox-roots");
+        let sandbox_uid_dir = state_dir.join("sandbox-uids");
         if namespace_root_base.exists() {
             tokio::fs::remove_dir_all(&namespace_root_base).await?;
         }
-        for dir in [&pi_config_dir, &home_dir, &cargo_home, &cargo_target_dir, &tmp_dir, &probe_dir, &namespace_root_base] {
+        for dir in [&pi_config_dir, &home_dir, &cargo_home, &cargo_target_dir, &tmp_dir, &probe_dir, &namespace_root_base, &sandbox_uid_dir] {
             tokio::fs::create_dir_all(dir).await?;
             set_private_dir(dir).await?;
         }
@@ -320,6 +410,7 @@ impl AgentSandbox {
             container_rootfs,
             container_read_only: container_read_only.into_iter().collect(),
             trusted_container_daemon,
+            sandbox_uid_dir,
             launcher_exe,
         };
         sandbox.probe().await?;
@@ -388,6 +479,11 @@ impl AgentSandbox {
 
         let nested_read_only = workspace.join(".git");
         let nested_read_only = nested_read_only.exists().then_some(nested_read_only).into_iter().collect();
+        let sandbox_uid = if self.trusted_container_daemon {
+            Some(sandbox_uid_for_workspace(&self.sandbox_uid_dir, &workspace)?)
+        } else {
+            None
+        };
         let spec = SandboxSpec {
             read_only: self.read_only.clone(),
             read_write,
@@ -397,6 +493,7 @@ impl AgentSandbox {
             container_read_only: self.container_read_only.clone(),
             nested_read_only,
             trusted_container_daemon: self.trusted_container_daemon,
+            sandbox_uid,
         };
         let mut command = Command::new(&self.launcher_exe);
         command.arg(if self.container_rootfs.is_some() { CONTAINER_EXEC_ARG } else { EXEC_ARG }).arg(program);
@@ -544,13 +641,27 @@ fn sandbox_signal_probe() -> anyhow::Result<()> {
         bail!("tgkill(2) self-thread probe was blocked: {}", std::io::Error::last_os_error());
     }
 
-    if std::env::var_os(PID_NAMESPACE_ENV).is_some_and(|value| value == "1") {
-        if own_pid <= 1 || unsafe { libc::getppid() } != 1 {
+    if let Some(expected_uid) = std::env::var_os(UID_ISOLATION_ENV) {
+        let expected_uid: u32 = expected_uid
+            .to_string_lossy()
+            .parse()
+            .context("parse sandbox uid isolation marker")?;
+        if unsafe { libc::geteuid() } != expected_uid {
             bail!(
-                "sandbox process-isolation probe is not below private namespace init: pid={own_pid} ppid={}",
-                unsafe { libc::getppid() }
+                "sandbox uid isolation probe ran as uid {}, expected {expected_uid}",
+                unsafe { libc::geteuid() }
             );
         }
+
+        let parent = unsafe { libc::getppid() };
+        if unsafe { libc::kill(parent, 0) } == 0 {
+            bail!("sandbox uid isolation unexpectedly allowed signalling parent pid {parent}");
+        }
+        let parent_error = std::io::Error::last_os_error();
+        if parent_error.raw_os_error() != Some(libc::EPERM) {
+            bail!("sandbox parent signal probe returned {parent_error}, expected EPERM from uid isolation");
+        }
+
         let child = unsafe { libc::fork() };
         if child < 0 {
             bail!("fork sandbox signal probe child failed: {}", std::io::Error::last_os_error());
@@ -601,13 +712,20 @@ fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Resul
     let raw = std::env::var(SPEC_ENV).context("sandbox helper missing policy")?;
     let spec: SandboxSpec = serde_json::from_str(&raw).context("parse sandbox policy")?;
 
-    // Trusted worker containers have enough namespace capability to isolate
-    // process IDs as well as mounts. Give those sandboxes a private PID
-    // namespace so an agent may safely terminate/reap its own descendants
-    // without gaining a PID that addresses the worker daemon or a sibling.
-    #[cfg(target_os = "linux")]
     if spec.trusted_container_daemon {
-        return sandbox_exec_in_pid_namespace(program, args, &spec, enter_container);
+        let sandbox_uid = spec.sandbox_uid.context("trusted sandbox missing isolated uid")?;
+        if enter_container {
+            enter_agent_container(&spec)?;
+        }
+        enable_agent_no_new_privs()?;
+        // Filesystem policy is installed while the trusted launcher still has
+        // setup capabilities. Process signalling is then protected by Linux
+        // credential checks: each logical sandbox has a distinct uid, while
+        // descendants inherit that uid and retain normal kill/wait semantics.
+        apply_policy(&spec, true)?;
+        enter_sandbox_uid(sandbox_uid)?;
+        unsafe { std::env::set_var(UID_ISOLATION_ENV, sandbox_uid.to_string()); }
+        return exec_sandboxed_program(program, args);
     }
 
     if enter_container {
@@ -617,83 +735,6 @@ fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Resul
     apply_policy(&spec, false)?;
     drop_agent_capabilities()?;
     exec_sandboxed_program(program, args)
-}
-
-#[cfg(target_os = "linux")]
-fn sandbox_exec_in_pid_namespace(
-    program: OsString,
-    args: Vec<OsString>,
-    spec: &SandboxSpec,
-    enter_container: bool,
-) -> anyhow::Result<()> {
-    // CLONE_NEWPID applies to subsequently-created children. The original
-    // helper remains outside the namespace as a trusted supervisor so the
-    // worker can always terminate the whole sandbox. Its child becomes PID 1.
-    if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
-        bail!("unshare agent pid namespace failed: {}", std::io::Error::last_os_error());
-    }
-    let init_pid = unsafe { libc::fork() };
-    if init_pid < 0 {
-        bail!("fork agent pid namespace init failed: {}", std::io::Error::last_os_error());
-    }
-    if init_pid > 0 {
-        let status = wait_for_pid(init_pid, "agent pid namespace init")?;
-        exit_with_wait_status(status)
-    }
-
-    // We are PID 1 in the private namespace. If the trusted outer supervisor
-    // disappears, terminate the namespace init; Linux then tears down every
-    // remaining process in this PID namespace.
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-        bail!("set agent pid namespace parent-death signal failed: {}", std::io::Error::last_os_error());
-    }
-
-    // Perform optional mount/chroot work in this trusted namespace-init helper.
-    // When the nested rootfs is unavailable we intentionally keep the existing
-    // outer-container Landlock filesystem policy, but still retain PID
-    // isolation so child signalling remains safe.
-    if enter_container {
-        enter_agent_container(spec)?;
-    }
-    enable_agent_no_new_privs()?;
-
-    let target_pid = unsafe { libc::fork() };
-    if target_pid < 0 {
-        bail!("fork sandboxed agent target failed: {}", std::io::Error::last_os_error());
-    }
-    if target_pid == 0 {
-        // The target is a normal PID (not namespace init), preserving ordinary
-        // Node/Bun child and signal semantics. PID isolation makes process
-        // signalling safe, so seccomp can allow signals within this namespace.
-        apply_policy(spec, true)?;
-        drop_agent_capabilities()?;
-        unsafe { std::env::set_var(PID_NAMESPACE_ENV, "1"); }
-        return exec_sandboxed_program(program, args);
-    }
-
-    // The namespace init no longer needs setup capabilities once the target
-    // exists. Drop them before entering the reaper loop.
-    drop_agent_capabilities()?;
-
-    // Namespace init waits for the real agent target. If the target exits with
-    // detached descendants still alive, kill and reap those descendants before
-    // mirroring the target status to the trusted outer supervisor.
-    let status = wait_for_pid(target_pid, "sandboxed agent target")?;
-    unsafe {
-        libc::kill(-1, libc::SIGKILL);
-        loop {
-            let mut ignored = 0;
-            let result = libc::waitpid(-1, &mut ignored, 0);
-            if result > 0 {
-                continue;
-            }
-            if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break;
-        }
-    }
-    exit_with_wait_status(status)
 }
 
 #[cfg(target_os = "linux")]
@@ -709,17 +750,6 @@ fn wait_for_pid(pid: libc::pid_t, label: &str) -> anyhow::Result<i32> {
         }
         bail!("wait for {label} failed: {}", std::io::Error::last_os_error());
     }
-}
-
-#[cfg(target_os = "linux")]
-fn exit_with_wait_status(status: i32) -> ! {
-    if libc::WIFEXITED(status) {
-        std::process::exit(libc::WEXITSTATUS(status));
-    }
-    if libc::WIFSIGNALED(status) {
-        std::process::exit(128 + libc::WTERMSIG(status));
-    }
-    std::process::exit(1)
 }
 
 #[cfg(unix)]
@@ -985,6 +1015,70 @@ fn enable_agent_no_new_privs() -> anyhow::Result<()> {
 fn enable_agent_no_new_privs() -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(target_os = "linux")]
+fn enter_sandbox_uid(uid: u32) -> anyhow::Result<()> {
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapHeader { version: u32, pid: i32 }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapData { effective: u32, permitted: u32, inheritable: u32 }
+
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const CAP_DAC_OVERRIDE_BIT: u32 = 1 << 1;
+
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("trusted sandbox uid isolation requires uid 0 launcher");
+    }
+    if !(SANDBOX_UID_MIN..=SANDBOX_UID_MAX).contains(&uid) {
+        bail!("sandbox uid {uid} is outside reserved range");
+    }
+
+    // Keep only enough privilege to use the existing Landlock-approved
+    // writable paths after switching away from uid 0. CAP_KILL is deliberately
+    // not retained: Linux uid checks are the process-isolation boundary.
+    if unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) } != 0 {
+        bail!("enable keepcaps for sandbox uid switch failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        bail!("clear sandbox supplementary groups failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setresgid(uid, uid, uid) } != 0 {
+        bail!("set sandbox gid {uid} failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setresuid(uid, uid, uid) } != 0 {
+        bail!("set sandbox uid {uid} failed: {}", std::io::Error::last_os_error());
+    }
+
+    let mut header = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let mut data = [
+        CapData {
+            effective: CAP_DAC_OVERRIDE_BIT,
+            permitted: CAP_DAC_OVERRIDE_BIT,
+            inheritable: CAP_DAC_OVERRIDE_BIT,
+        },
+        CapData { effective: 0, permitted: 0, inheritable: 0 },
+    ];
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_mut_ptr()) } != 0 {
+        bail!("retain sandbox CAP_DAC_OVERRIDE failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) } != 0 {
+        bail!("disable keepcaps after sandbox uid switch failed: {}", std::io::Error::last_os_error());
+    }
+    // Preserve only DAC override across exec so the isolated uid can use the
+    // already-Landlock-confined shared caches/config and its workspace. No
+    // CAP_KILL, CAP_SYS_ADMIN, CAP_SETUID, or CAP_SETGID survives into the agent.
+    if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, 1, 0, 0) } != 0 {
+        bail!("raise sandbox ambient CAP_DAC_OVERRIDE failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enter_sandbox_uid(_uid: u32) -> anyhow::Result<()> {
+    bail!("sandbox uid isolation requires Linux")
+}
+
+#[cfg(target_os = "linux")]
 fn drop_agent_capabilities() -> anyhow::Result<()> {
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -1012,7 +1106,7 @@ fn drop_agent_capabilities() -> anyhow::Result<()> {
 fn drop_agent_capabilities() -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(target_os = "linux")]
-fn apply_policy(spec: &SandboxSpec, signals_are_pid_namespaced: bool) -> anyhow::Result<()> {
+fn apply_policy(spec: &SandboxSpec, signals_are_uid_isolated: bool) -> anyhow::Result<()> {
     use landlock::{
         path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus, ABI,
@@ -1038,7 +1132,7 @@ fn apply_policy(spec: &SandboxSpec, signals_are_pid_namespaced: bool) -> anyhow:
         _ => bail!("Landlock policy was only partially enforced; refusing ambiguous sandbox: {status:?}"),
     }
 
-    install_seccomp_denylist(signals_are_pid_namespaced)?;
+    install_seccomp_denylist(signals_are_uid_isolated)?;
     Ok(())
 }
 
@@ -1272,7 +1366,7 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn install_seccomp_denylist(signals_are_pid_namespaced: bool) -> anyhow::Result<()> {
+fn install_seccomp_denylist(signals_are_uid_isolated: bool) -> anyhow::Result<()> {
     use seccompiler::{
         apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
         SeccompCondition, SeccompFilter, SeccompRule,
@@ -1292,7 +1386,7 @@ fn install_seccomp_denylist(signals_are_pid_namespaced: bool) -> anyhow::Result<
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
     ];
-    if !signals_are_pid_namespaced {
+    if !signals_are_uid_isolated {
         denied.extend([
             libc::SYS_kill,
             libc::SYS_tkill,
@@ -1304,10 +1398,10 @@ fn install_seccomp_denylist(signals_are_pid_namespaced: bool) -> anyhow::Result<
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
         denied.into_iter().map(|syscall| (syscall, vec![])).collect();
 
-    if !signals_are_pid_namespaced {
+    if !signals_are_uid_isolated {
         // Bun/JSC uses tgkill(tgid=self, tid=worker, SIGPWR) to suspend its own
         // threads even for trivial commands such as `opencode --version`.
-        // Outside a private PID namespace, keep cross-process signalling
+        // Without per-sandbox uid isolation, keep cross-process signalling
         // blocked while allowing only the sandbox root thread group.
         let sandbox_tgid = unsafe { libc::getpid() } as u64;
         rules.insert(
@@ -1335,7 +1429,7 @@ fn install_seccomp_denylist(signals_are_pid_namespaced: bool) -> anyhow::Result<
 }
 
 #[cfg(not(target_os = "linux"))]
-fn apply_policy(_spec: &SandboxSpec, _signals_are_pid_namespaced: bool) -> anyhow::Result<()> {
+fn apply_policy(_spec: &SandboxSpec, _signals_are_uid_isolated: bool) -> anyhow::Result<()> {
     bail!("embedded agent sandbox requires Linux; refusing to run an unsandboxed agent")
 }
 
@@ -1617,7 +1711,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn seccomp_pid_namespace_mode_allows_child_termination() {
+    fn seccomp_uid_isolation_mode_allows_child_termination() {
         unsafe {
             let child = libc::fork();
             assert!(child >= 0, "fork failed: {}", std::io::Error::last_os_error());
@@ -1647,8 +1741,29 @@ mod tests {
             }
             let mut status = 0;
             assert_eq!(libc::waitpid(child, &mut status, 0), child);
-            assert_eq!(status, 0, "namespaced-signal seccomp child status={status}");
+            assert_eq!(status, 0, "uid-isolated signal seccomp child status={status}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_uid_allocator_is_stable_and_unique_per_workspace() {
+        let root = std::env::temp_dir().join(format!("lazyteam-sandbox-uids-{}", uuid::Uuid::new_v4()));
+        let uid_dir = root.join("uids");
+        let a = root.join("agent-workspaces").join(uuid::Uuid::new_v4().to_string());
+        let b = root.join("agent-workspaces").join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&uid_dir).unwrap();
+
+        let uid_a = sandbox_uid_for_workspace(&uid_dir, &a).unwrap();
+        let uid_a_again = sandbox_uid_for_workspace(&uid_dir, &a).unwrap();
+        let uid_b = sandbox_uid_for_workspace(&uid_dir, &b).unwrap();
+        assert_eq!(uid_a, uid_a_again);
+        assert_ne!(uid_a, uid_b);
+        assert!((SANDBOX_UID_MIN..=SANDBOX_UID_MAX).contains(&uid_a));
+        assert!((SANDBOX_UID_MIN..=SANDBOX_UID_MAX).contains(&uid_b));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
