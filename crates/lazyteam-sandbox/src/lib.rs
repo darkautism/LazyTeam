@@ -19,6 +19,22 @@ const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", 
 /// consumed by every filesystem enforcement backend; they are not host
 /// overlays and must never grow a backend-specific allowlist.
 const CONTAINER_NATIVE_READ_ONLY: &[&str] = &["/opt/lazyteam"];
+// Minimal Linux runtime metadata used by Bun/JSC and similar runtimes. Keep
+// these narrow: exposing all of /proc would let an agent inspect sibling Host
+// processes running under the same uid.
+const RUNTIME_PROC_READ_ONLY: &[&str] = &[
+    "/proc/self",
+    "/proc/version",
+    "/proc/sys/vm/overcommit_memory",
+    "/proc/sys/vm/mmap_min_addr",
+];
+const RUNTIME_SYS_READ_ONLY: &[&str] = &[
+    "/sys/devices/system/cpu/online",
+    "/sys/fs/cgroup/cpu.max",
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory.high",
+    "/sys/kernel/mm/transparent_hugepage/enabled",
+];
 const CONTAINER_RUSTUP_HOME: &str = "/opt/lazyteam/rustup";
 const CONTAINER_CARGO_BIN: &str = "/opt/lazyteam/cargo/bin";
 
@@ -75,6 +91,33 @@ fn add_container_native_read_only(
         let Ok(relative) = absolute.strip_prefix("/") else { continue; };
         if rootfs.join(relative).exists() {
             read_only.insert(absolute.to_path_buf());
+        }
+    }
+}
+
+fn add_runtime_metadata_read_only(
+    read_only: &mut BTreeSet<PathBuf>,
+    container_read_only: &mut BTreeSet<PathBuf>,
+    container_rootfs: Option<&Path>,
+) {
+    // /proc is freshly mounted before Landlock in nested-container mode, and
+    // refers to the sandbox launcher itself in outer-container mode. Preserve
+    // the magic /proc/self path rather than canonicalizing it in the Host.
+    for path in RUNTIME_PROC_READ_ONLY {
+        read_only.insert(PathBuf::from(path));
+    }
+
+    // The nested rootfs does not mount sysfs. Bind only the exact metadata
+    // files that exist on the Host, read-only. In outer-container mode the same
+    // paths are simply admitted by Landlock.
+    for path in RUNTIME_SYS_READ_ONLY {
+        let absolute = PathBuf::from(path);
+        if !absolute.exists() {
+            continue;
+        }
+        read_only.insert(absolute.clone());
+        if container_rootfs.is_some() {
+            container_read_only.insert(absolute);
         }
     }
 }
@@ -180,6 +223,11 @@ impl AgentSandbox {
         // can be entered. NAS/container runtimes that deny CLONE_NEWNS instead
         // use the outer container plus the same Landlock/seccomp policy.
         add_container_native_read_only(&mut read_only, container_rootfs.as_deref());
+        add_runtime_metadata_read_only(
+            &mut read_only,
+            &mut container_read_only,
+            container_rootfs.as_deref(),
+        );
 
         // Managed Rust remains usable in both layouts. In nested-rootfs mode the
         // agent sees /opt/lazyteam directly; in outer-container fallback mode use
@@ -1418,6 +1466,20 @@ mod tests {
             assert_eq!(libc::waitpid(child, &mut status, 0), child);
             assert_eq!(status, 0, "seccomp tgkill probe child status={status}");
         }
+    }
+
+    #[test]
+    fn runtime_metadata_allowlist_is_narrow() {
+        let mut read_only = BTreeSet::new();
+        let mut container_read_only = BTreeSet::new();
+        add_runtime_metadata_read_only(&mut read_only, &mut container_read_only, None);
+
+        for path in RUNTIME_PROC_READ_ONLY {
+            assert!(read_only.contains(Path::new(path)), "missing {path}");
+        }
+        assert!(!read_only.contains(Path::new("/proc")));
+        assert!(!read_only.contains(Path::new("/sys")));
+        assert!(container_read_only.is_empty());
     }
 
     #[test]
