@@ -1709,6 +1709,7 @@ console.log(JSON.stringify(providers));"#
         tokio::time::timeout(std::time::Duration::from_secs(10), async move {
             let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
             command.arg("--input-type=module").arg("--eval").arg(script);
+            command.kill_on_drop(true);
             command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = command.output().await.context("run Pi ModelRuntime provider probe")?;
             if !output.status.success() {
@@ -1805,6 +1806,7 @@ console.log(JSON.stringify(models));"#
         tokio::time::timeout(std::time::Duration::from_secs(10), async move {
             let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
             command.arg("--input-type=module").arg("--eval").arg(script);
+            command.kill_on_drop(true);
             command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = command.output().await.context("run Pi ModelRuntime model probe")?;
             if !output.status.success() {
