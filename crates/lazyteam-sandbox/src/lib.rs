@@ -1996,6 +1996,8 @@ mod tests {
             let mut status = 0;
             assert_eq!(libc::waitpid(child, &mut status, 0), child);
             assert_eq!(status, 0, "uid-isolated signal seccomp child status={status}");
+            // Regression: the terminated child must be fully reaped; waiting again must fail.
+            assert_eq!(libc::waitpid(child, &mut status, libc::WNOHANG), -1, "terminated sandbox child was not reaped");
         }
     }
 
