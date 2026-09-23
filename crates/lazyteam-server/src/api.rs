@@ -1347,12 +1347,18 @@ async fn start_worker_oauth_login(
     if candidate.oauth_label.is_none() {
         return Err((StatusCode::BAD_REQUEST, "this provider does not expose OAuth authentication in Pi".into()));
     }
+    let mut logins = state.oauth_login_states.lock().await;
+    if let Some(existing) = logins.get(&id) {
+        if !matches!(existing.status.as_str(), "complete" | "failed") {
+            return Err((StatusCode::CONFLICT, format!("OAuth login is already {}", existing.status)));
+        }
+    }
     let login = AgentOAuthLoginState {
         id: Uuid::new_v4(), provider: provider.to_string(), status: "queued".into(),
         message: Some("Waiting for the worker to start Pi OAuth. The authorization URL will appear here; open it on any machine, then paste back the redirect URL if asked.".into()), verification_uri: None, user_code: None,
         authorization_url: None, paste_prompt: None, paste_placeholder: None, pending_input: None,
     };
-    state.oauth_login_states.lock().await.insert(id, login.clone());
+    logins.insert(id, login.clone());
     Ok(Json(login))
 }
 
@@ -1458,6 +1464,9 @@ async fn submit_worker_oauth_login_input(
     let login = logins.get_mut(&id).ok_or((StatusCode::NOT_FOUND, "OAuth login not found".into()))?;
     if !matches!(login.status.as_str(), "awaiting_authorization" | "awaiting_callback" | "running" | "waiting_user") {
         return Err((StatusCode::CONFLICT, format!("OAuth login is {} and is not waiting for input", login.status)));
+    }
+    if login.pending_input.is_some() {
+        return Err((StatusCode::CONFLICT, "OAuth callback input is already pending delivery".into()));
     }
     login.pending_input = Some(PendingOAuthInput { id: Uuid::new_v4(), input: pasted });
     if login.status != "awaiting_callback" {
@@ -5071,6 +5080,15 @@ mod tests {
         ).await.unwrap();
         assert_eq!(login.status, "queued");
         assert!(login.message.as_deref().unwrap_or_default().contains("authorization URL"));
+        // Starting another login while this one is active must not silently
+        // replace the request that the worker is about to claim.
+        let err = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(state.oauth_login_states.lock().await.get(&worker_id).unwrap().id, login.id);
         // The worker claims the queued request; the Host must not claim completion yet.
         let claimed = claim_worker_oauth_login(Path(worker_id), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
         assert_eq!(claimed.status(), StatusCode::OK);
@@ -5104,6 +5122,16 @@ mod tests {
         let raw = serde_json::to_value(&updated).unwrap();
         assert!(raw.get("pending_input").is_none(), "pasted code must never serialize to Host UI");
         assert!(!raw.to_string().contains("code=abc"), "pasted code must never leak into UI responses");
+        let pending_before = state.oauth_login_states.lock().await.get(&worker_id).unwrap().pending_input.clone().unwrap();
+        let err = submit_worker_oauth_login_input(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthInputSubmit { input: "replacement-must-not-win".into() }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let pending_after = state.oauth_login_states.lock().await.get(&worker_id).unwrap().pending_input.clone().unwrap();
+        assert_eq!(pending_after.id, pending_before.id);
+        assert_eq!(pending_after.input, pending_before.input);
         // The worker can refetch the same paste until it ACKs the
         // successful handoff to Pi stdin.
         let first = claim_worker_oauth_login_input(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
@@ -5139,6 +5167,14 @@ mod tests {
         // Unknown event kinds are rejected with an actionable error.
         let err = report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(oauth_event("bogus"))).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // Terminal state is replaceable by an explicitly requested new login.
+        let Json(restarted) = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+        ).await.unwrap();
+        assert_eq!(restarted.status, "queued");
+        assert_ne!(restarted.id, login.id);
     }
 
     #[tokio::test]
