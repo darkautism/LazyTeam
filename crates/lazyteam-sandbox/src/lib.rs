@@ -277,10 +277,19 @@ impl AgentSandbox {
         if namespace_root_base.exists() {
             tokio::fs::remove_dir_all(&namespace_root_base).await?;
         }
-        for dir in [&pi_config_dir, &home_dir, &cargo_home, &cargo_target_dir, &tmp_dir, &probe_dir, &namespace_root_base, &sandbox_uid_dir] {
+        for dir in [&home_dir, &cargo_home, &cargo_target_dir, &tmp_dir, &probe_dir, &namespace_root_base, &sandbox_uid_dir] {
             tokio::fs::create_dir_all(dir).await?;
             set_private_dir(dir).await?;
         }
+        tokio::fs::create_dir_all(&pi_config_dir).await?;
+        // Sandboxed Pi runs under a per-workspace uid. Node's fs.existsSync()
+        // uses access(2)-style checks that ignore CAP_DAC_OVERRIDE for a
+        // non-root real uid, so a 0700 parent makes an existing auth.json look
+        // absent even though direct reads work. Pi then creates "{}" and
+        // silently erases the queued credential. Grant execute-only traversal
+        // to other sandbox uids; auth.json itself remains 0600 and Landlock
+        // still limits visibility to this worker's Pi config path.
+        set_traversable_private_dir(&pi_config_dir).await?;
         let host_path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
         let mut path = if container_rootfs.is_some() {
             OsString::from("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -1678,6 +1687,16 @@ async fn set_private_dir(path: &Path) -> anyhow::Result<()> {
 async fn set_private_dir(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(unix)]
+async fn set_traversable_private_dir(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o711)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn set_traversable_private_dir(_path: &Path) -> anyhow::Result<()> { Ok(()) }
+
+#[cfg(unix)]
 async fn set_private_file(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
@@ -1776,6 +1795,18 @@ mod tests {
         assert!((SANDBOX_UID_MIN..=SANDBOX_UID_MAX).contains(&uid_a));
         assert!((SANDBOX_UID_MIN..=SANDBOX_UID_MAX).contains(&uid_b));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_config_dir_allows_traversal_but_not_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lazyteam-pi-config-mode-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        set_traversable_private_dir(&root).await.unwrap();
+        let mode = tokio::fs::metadata(&root).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o711);
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[test]
