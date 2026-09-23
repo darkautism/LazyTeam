@@ -416,6 +416,13 @@ impl AgentSandbox {
         let launcher_exe = std::fs::canonicalize(&launcher_exe)
             .with_context(|| format!("canonicalize sandbox launcher {}", launcher_exe.display()))?;
         read_only.insert(launcher_exe.clone());
+        // The sandbox helper re-execs this binary for probes and process-isolation
+        // checks. Nested Ubuntu rootfs mode must therefore bind the Host-visible
+        // launcher into the chroot at the same absolute path; the ordinary
+        // read_only list alone is evaluated only after entering that rootfs.
+        if container_rootfs.is_some() {
+            container_read_only.insert(launcher_exe.clone());
+        }
         let sandbox = Self {
             state_dir,
             pi_config_dir,
