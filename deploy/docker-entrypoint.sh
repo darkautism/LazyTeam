@@ -18,6 +18,38 @@ is_uint() {
   esac
 }
 
+prepare_worker_pi_runtime() {
+  configured_pi="${LAZYTEAM_PI_BIN:-pi}"
+  if [ "$configured_pi" != "pi" ]; then
+    echo "lazyteam-entrypoint: custom LAZYTEAM_PI_BIN=$configured_pi; managed Pi auto-update skipped"
+    return 0
+  fi
+
+  runtime_dir="${LAZYTEAM_PI_RUNTIME_DIR:-$DATA_DIR/pi-runtime}"
+  export LAZYTEAM_PI_RUNTIME_DIR="$runtime_dir"
+
+  if ! /usr/local/bin/lazyteam-pi-update prepare; then
+    echo "lazyteam-entrypoint: Pi runtime link preparation failed; using bundled Pi" >&2
+    return 0
+  fi
+
+  export LAZYTEAM_PI_BIN="$runtime_dir/bin/pi"
+  case "${LAZYTEAM_PI_AUTO_UPDATE:-1}" in
+    0|false|FALSE|no|NO)
+      echo "lazyteam-entrypoint: Pi auto-update disabled; using $LAZYTEAM_PI_BIN"
+      return 0
+      ;;
+  esac
+
+  if timeout 180s /usr/local/bin/lazyteam-pi-update once; then
+    echo "lazyteam-entrypoint: Pi runtime checked for updates"
+  else
+    echo "lazyteam-entrypoint: Pi update check failed/timed out; continuing with $("$LAZYTEAM_PI_BIN" --version 2>/dev/null || echo bundled)" >&2
+  fi
+  /usr/local/bin/lazyteam-pi-update loop &
+  echo "lazyteam-entrypoint: Pi daily updater enabled (interval ${LAZYTEAM_PI_UPDATE_INTERVAL_SECS:-86400}s)"
+}
+
 mkdir -p "$DATA_DIR" "$WORKSPACE_DIR"
 
 requested_uid="${LAZYTEAM_PUID:-${PUID:-}}"
@@ -50,6 +82,11 @@ if [ "$current_uid" -ne 0 ]; then
 
   export HOME="$HOME_DIR"
   umask 027
+  case "${1:-}" in
+    lazyteam-worker|/usr/local/bin/lazyteam-worker)
+      prepare_worker_pi_runtime
+      ;;
+  esac
   echo "lazyteam-entrypoint: platform selected numeric runtime $current_uid:$current_gid; nested privileged sandbox features will be probed and optional"
   exec "$@"
 fi
@@ -150,6 +187,7 @@ if [ "$runtime_uid" -ne 0 ]; then
   case "${1:-}" in
     lazyteam-worker|/usr/local/bin/lazyteam-worker)
       export LAZYTEAM_TRUSTED_CONTAINER_DAEMON=1
+      prepare_worker_pi_runtime
       echo "lazyteam-entrypoint: running trusted worker daemon with container mount capability (state owner: $runtime_uid:$runtime_gid; auto source: $source)"
       exec "$@"
       ;;
@@ -176,5 +214,11 @@ fi
 
 export HOME="$HOME_DIR"
 umask 027
+case "${1:-}" in
+  lazyteam-worker|/usr/local/bin/lazyteam-worker)
+    export LAZYTEAM_TRUSTED_CONTAINER_DAEMON=1
+    prepare_worker_pi_runtime
+    ;;
+esac
 echo "lazyteam-entrypoint: explicit root runtime requested"
 exec "$@"

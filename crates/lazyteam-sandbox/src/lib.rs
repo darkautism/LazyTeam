@@ -343,6 +343,18 @@ impl AgentSandbox {
         }
 
         if let Some(program) = resolve_program(pi_bin, &host_path) {
+            // A managed Pi runtime uses a stable symlink under state/pi-runtime
+            // and atomically switches that link after a fully installed update.
+            // Admit the stable runtime root up front so a later daily update can
+            // point at a new version without rebuilding the sandbox policy.
+            if program.starts_with(&state_dir) {
+                if let Some(runtime_root) = program.parent().and_then(Path::parent) {
+                    read_only.insert(runtime_root.to_path_buf());
+                    if container_rootfs.is_some() {
+                        container_read_only.insert(runtime_root.to_path_buf());
+                    }
+                }
+            }
             if let Ok(target) = std::fs::canonicalize(&program) {
                 let runtime_root = common_ancestor(&program, &target).filter(|root| path_depth(root) >= 3)
                     .or_else(|| program.parent().map(Path::to_path_buf));

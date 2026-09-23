@@ -16,7 +16,7 @@ COPY . .
 RUN cargo build --release -p lazyteam-worker
 
 FROM node:22-bookworm-slim
-ARG PI_CODING_AGENT_VERSION=0.85.1
+ARG PI_CODING_AGENT_VERSION=0.87.1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash build-essential ca-certificates coreutils curl findutils git gosu grep gzip openssh-client pkg-config procps sed tar util-linux \
@@ -29,7 +29,8 @@ COPY --from=builder /src/target/release/lazyteam-worker /usr/local/bin/lazyteam-
 COPY --from=agent-base /tmp/lazyteam-ubuntu-rootfs.tar.gz /opt/lazyteam/ubuntu-rootfs.tar.gz
 COPY --from=agent-base /tmp/lazyteam-ubuntu-rootfs.tar.gz.sha256 /opt/lazyteam/ubuntu-rootfs.tar.gz.sha256
 COPY deploy/docker-entrypoint.sh /usr/local/bin/lazyteam-entrypoint
-RUN chmod 0755 /usr/local/bin/lazyteam-entrypoint
+COPY deploy/pi-auto-update.sh /usr/local/bin/lazyteam-pi-update
+RUN chmod 0755 /usr/local/bin/lazyteam-entrypoint /usr/local/bin/lazyteam-pi-update
 WORKDIR /app
 ENV HOME=/app/state/home
 ENV LAZYTEAM_DATA_DIR=/app/state
@@ -37,6 +38,8 @@ ENV LAZYTEAM_HOME=/app/state/home
 ENV LAZYTEAM_WORKER_STATE_DIR=/app/state
 ENV LAZYTEAM_WORKSPACE_DIR=/app/workspaces
 ENV LAZYTEAM_PI_BIN=pi
+ENV LAZYTEAM_PI_AUTO_UPDATE=1
+ENV LAZYTEAM_PI_UPDATE_INTERVAL_SECS=86400
 ENV LAZYTEAM_UBUNTU_BASE_ARCHIVE=/opt/lazyteam/ubuntu-rootfs.tar.gz
 ENV LAZYTEAM_UBUNTU_BASE_ID=ubuntu-24.04-oci
 ENV RUST_LOG=lazyteam_worker=info

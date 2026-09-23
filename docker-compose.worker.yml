@@ -9,6 +9,8 @@ services:
       LAZYTEAM_PUID: "${LAZYTEAM_PUID:-}"
       LAZYTEAM_PGID: "${LAZYTEAM_PGID:-}"
       RUST_LOG: "${RUST_LOG:-lazyteam_worker=info}"
+      LAZYTEAM_PI_AUTO_UPDATE: "${LAZYTEAM_PI_AUTO_UPDATE:-1}"
+      LAZYTEAM_PI_UPDATE_INTERVAL_SECS: "${LAZYTEAM_PI_UPDATE_INTERVAL_SECS:-86400}"
     command: ["lazyteam-worker", "--project", "*", "--slots", "${LAZYTEAM_WORKER_SLOTS:-1}"]
     volumes:
       - lazyteam-worker-state:/app/state

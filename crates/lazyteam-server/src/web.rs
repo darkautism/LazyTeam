@@ -40,6 +40,7 @@ mod tests {
         assert!(INDEX.contains("Pi-reported metadata"));
         assert!(INDEX.contains("Choose provider"));
         assert!(INDEX.contains("No available models yet"));
+        assert!(INDEX.contains("configured, currently unavailable"));
         assert!(INDEX.contains("worker-provider-api-key"));
         assert!(INDEX.contains("/provider-key"));
         assert!(INDEX.contains("API keys are write-only"));

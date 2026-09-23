@@ -14,6 +14,7 @@ jobs:
       - run: cargo check --workspace
       - run: cargo test --workspace
       - run: python3 scripts/ui-regression.py
+      - run: sh scripts/pi-auto-update-smoke.sh
 
       - name: Development OAuth and scheduler smoke tests
         env:

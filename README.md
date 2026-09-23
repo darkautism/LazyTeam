@@ -63,7 +63,7 @@ https://lazyteam.example.com/mcp
 
 Connect that URL in ChatGPT as an MCP server and log in with your OAuth password when asked. Local administration (creating projects, generating worker join codes) happens on the server itself at `http://127.0.0.1:8787/ui` with your admin token — that dashboard is never exposed to the internet.
 
-Published images are `ghcr.io/darkautism/lazyteam:latest` (server) and `ghcr.io/darkautism/lazyteam-worker:latest` (worker, includes Pi `@earendil-works/pi-coding-agent@0.85.1`), both for `linux/amd64` and `linux/arm64`.
+Published images are `ghcr.io/darkautism/lazyteam:latest` (server) and `ghcr.io/darkautism/lazyteam-worker:latest` (worker, bundled with Pi `@earendil-works/pi-coding-agent@0.87.1` as an offline fallback), both for `linux/amd64` and `linux/arm64`.
 
 ### 2. Add a worker
 
@@ -76,7 +76,7 @@ export LAZYTEAM_WORKER_SLOTS=1
 docker compose -f docker-compose.worker.yml up -d
 ```
 
-The supplied worker Compose file always refreshes the published `latest` image before recreating the worker, so a restart cannot silently reuse an older local image. Worker containers accept arbitrary numeric runtime identities: platforms may force a user such as TrueNAS `568`, ordinary Linux `1001`, or `0` (root), and root-started containers may explicitly set `LAZYTEAM_PUID`/`LAZYTEAM_PGID`. The image does not require UID 10001. NAS runtimes that deny nested mount namespaces automatically use the outer container with the same fail-closed Landlock/seccomp policy instead of refusing to start. The join code is a short-lived (10-minute) invite — after the worker joins once, it remembers its own credential and you can throw the code away.
+The supplied worker Compose file always refreshes the published `latest` image before recreating the worker, so a restart cannot silently reuse an older local image. Pi itself is also checked for updates at worker startup and every 24 hours while the worker stays running. Updates are installed into the persistent worker state and switched atomically only after the new Pi passes its version probe; a failed network/update check leaves the last working Pi in place. Set `LAZYTEAM_PI_AUTO_UPDATE=0` to disable this or `LAZYTEAM_PI_UPDATE_INTERVAL_SECS` to change the interval. Worker containers accept arbitrary numeric runtime identities: platforms may force a user such as TrueNAS `568`, ordinary Linux `1001`, or `0` (root), and root-started containers may explicitly set `LAZYTEAM_PUID`/`LAZYTEAM_PGID`. The image does not require UID 10001. NAS runtimes that deny nested mount namespaces automatically use the outer container with the same fail-closed Landlock/seccomp policy instead of refusing to start. The join code is a short-lived (10-minute) invite — after the worker joins once, it remembers its own credential and you can throw the code away.
 
 **Native worker (from source):**
 
