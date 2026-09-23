@@ -13,6 +13,7 @@ const EXEC_ARG: &str = "__lazyteam-sandbox-exec";
 const CONTAINER_EXEC_ARG: &str = "__lazyteam-container-exec";
 const SIGNAL_PROBE_ARG: &str = "__lazyteam-sandbox-signal-probe";
 const SPEC_ENV: &str = "LAZYTEAM_SANDBOX_SPEC";
+const PID_NAMESPACE_ENV: &str = "LAZYTEAM_SANDBOX_PID_NAMESPACE";
 const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".pytest_cache", ".venv"];
 /// Image-native paths that may be visible to agents when present in the frozen
 /// container rootfs. These paths join the same canonical read_only policy
@@ -471,7 +472,7 @@ impl AgentSandbox {
         let output = command.output().await.context("probe sandbox process isolation")?;
         if !output.status.success() {
             bail!(
-                "agent sandbox parent-signal syscall was not denied by seccomp: {}",
+                "agent sandbox process-isolation probe failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -539,6 +540,31 @@ fn sandbox_signal_probe() -> anyhow::Result<()> {
         bail!("tgkill(2) self-thread probe was blocked: {}", std::io::Error::last_os_error());
     }
 
+    if std::env::var_os(PID_NAMESPACE_ENV).is_some_and(|value| value == "1") {
+        if own_pid <= 1 || unsafe { libc::getppid() } != 1 {
+            bail!(
+                "sandbox process-isolation probe is not below private namespace init: pid={own_pid} ppid={}",
+                unsafe { libc::getppid() }
+            );
+        }
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            bail!("fork sandbox signal probe child failed: {}", std::io::Error::last_os_error());
+        }
+        if child == 0 {
+            unsafe { libc::pause(); }
+            unreachable!();
+        }
+        if unsafe { libc::kill(child, libc::SIGKILL) } != 0 {
+            bail!("kill(2) sandbox child probe failed: {}", std::io::Error::last_os_error());
+        }
+        let status = wait_for_pid(child, "sandbox signal probe child")?;
+        if !libc::WIFSIGNALED(status) || libc::WTERMSIG(status) != libc::SIGKILL {
+            bail!("sandbox child signal probe returned unexpected wait status {status}");
+        }
+        return Ok(());
+    }
+
     let parent = unsafe { libc::getppid() };
     if unsafe { libc::syscall(libc::SYS_tgkill, parent, parent, 0) } == 0 {
         bail!("tgkill(2) unexpectedly reached parent pid {parent}");
@@ -570,26 +596,136 @@ fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Resul
     let program = args.remove(0);
     let raw = std::env::var(SPEC_ENV).context("sandbox helper missing policy")?;
     let spec: SandboxSpec = serde_json::from_str(&raw).context("parse sandbox policy")?;
+
+    // Trusted worker containers have enough namespace capability to isolate
+    // process IDs as well as mounts. Give those sandboxes a private PID
+    // namespace so an agent may safely terminate/reap its own descendants
+    // without gaining a PID that addresses the worker daemon or a sibling.
+    #[cfg(target_os = "linux")]
+    if enter_container && spec.trusted_container_daemon {
+        return sandbox_exec_in_pid_namespace(program, args, &spec);
+    }
+
     if enter_container {
         enter_agent_container(&spec)?;
     }
     enable_agent_no_new_privs()?;
-    apply_policy(&spec)?;
+    apply_policy(&spec, false)?;
+    drop_agent_capabilities()?;
+    exec_sandboxed_program(program, args)
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_exec_in_pid_namespace(
+    program: OsString,
+    args: Vec<OsString>,
+    spec: &SandboxSpec,
+) -> anyhow::Result<()> {
+    // CLONE_NEWPID applies to subsequently-created children. The original
+    // helper remains outside the namespace as a trusted supervisor so the
+    // worker can always terminate the whole sandbox. Its child becomes PID 1.
+    if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+        bail!("unshare agent pid namespace failed: {}", std::io::Error::last_os_error());
+    }
+    let init_pid = unsafe { libc::fork() };
+    if init_pid < 0 {
+        bail!("fork agent pid namespace init failed: {}", std::io::Error::last_os_error());
+    }
+    if init_pid > 0 {
+        let status = wait_for_pid(init_pid, "agent pid namespace init")?;
+        exit_with_wait_status(status)
+    }
+
+    // We are PID 1 in the private namespace. If the trusted outer supervisor
+    // disappears, terminate the namespace init; Linux then tears down every
+    // remaining process in this PID namespace.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        bail!("set agent pid namespace parent-death signal failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Perform mount/chroot work in this trusted namespace-init helper. The
+    // target applies Landlock (or its namespace fallback) before dropping its
+    // inherited namespace capabilities, so fail-closed fallback remains usable.
+    enter_agent_container(spec)?;
+    enable_agent_no_new_privs()?;
+
+    let target_pid = unsafe { libc::fork() };
+    if target_pid < 0 {
+        bail!("fork sandboxed agent target failed: {}", std::io::Error::last_os_error());
+    }
+    if target_pid == 0 {
+        // The target is a normal PID (not namespace init), preserving ordinary
+        // Node/Bun child and signal semantics. PID isolation makes process
+        // signalling safe, so seccomp can allow signals within this namespace.
+        apply_policy(spec, true)?;
+        drop_agent_capabilities()?;
+        unsafe { std::env::set_var(PID_NAMESPACE_ENV, "1"); }
+        return exec_sandboxed_program(program, args);
+    }
+
+    // The namespace init no longer needs setup capabilities once the target
+    // exists. Drop them before entering the reaper loop.
     drop_agent_capabilities()?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let mut command = std::process::Command::new(program);
-        command.args(args).env_remove(SPEC_ENV);
-        let error = command.exec();
-        Err(error).context("exec sandboxed agent")
+    // Namespace init waits for the real agent target. If the target exits with
+    // detached descendants still alive, kill and reap those descendants before
+    // mirroring the target status to the trusted outer supervisor.
+    let status = wait_for_pid(target_pid, "sandboxed agent target")?;
+    unsafe {
+        libc::kill(-1, libc::SIGKILL);
+        loop {
+            let mut ignored = 0;
+            let result = libc::waitpid(-1, &mut ignored, 0);
+            if result > 0 {
+                continue;
+            }
+            if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (program, args);
-        bail!("embedded agent sandbox is only supported on Unix")
+    exit_with_wait_status(status)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_pid(pid: libc::pid_t, label: &str) -> anyhow::Result<i32> {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            return Ok(status);
+        }
+        if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        bail!("wait for {label} failed: {}", std::io::Error::last_os_error());
     }
+}
+
+#[cfg(target_os = "linux")]
+fn exit_with_wait_status(status: i32) -> ! {
+    if libc::WIFEXITED(status) {
+        std::process::exit(libc::WEXITSTATUS(status));
+    }
+    if libc::WIFSIGNALED(status) {
+        std::process::exit(128 + libc::WTERMSIG(status));
+    }
+    std::process::exit(1)
+}
+
+#[cfg(unix)]
+fn exec_sandboxed_program(program: OsString, args: Vec<OsString>) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(program);
+    command.args(args).env_remove(SPEC_ENV);
+    let error = command.exec();
+    Err(error).context("exec sandboxed agent")
+}
+
+#[cfg(not(unix))]
+fn exec_sandboxed_program(_program: OsString, _args: Vec<OsString>) -> anyhow::Result<()> {
+    bail!("embedded agent sandbox is only supported on Unix")
 }
 
 #[cfg(target_os = "linux")]
@@ -868,7 +1004,7 @@ fn drop_agent_capabilities() -> anyhow::Result<()> {
 fn drop_agent_capabilities() -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(target_os = "linux")]
-fn apply_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
+fn apply_policy(spec: &SandboxSpec, signals_are_pid_namespaced: bool) -> anyhow::Result<()> {
     use landlock::{
         path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus, ABI,
@@ -894,7 +1030,7 @@ fn apply_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
         _ => bail!("Landlock policy was only partially enforced; refusing ambiguous sandbox: {status:?}"),
     }
 
-    install_seccomp_denylist()?;
+    install_seccomp_denylist(signals_are_pid_namespaced)?;
     Ok(())
 }
 
@@ -1128,14 +1264,14 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn install_seccomp_denylist() -> anyhow::Result<()> {
+fn install_seccomp_denylist(signals_are_pid_namespaced: bool) -> anyhow::Result<()> {
     use seccompiler::{
         apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
         SeccompCondition, SeccompFilter, SeccompRule,
     };
     use std::{collections::BTreeMap, convert::TryInto};
 
-    let denied = [
+    let mut denied = vec![
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
@@ -1145,34 +1281,37 @@ fn install_seccomp_denylist() -> anyhow::Result<()> {
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
-        libc::SYS_kill,
-        libc::SYS_tkill,
-        libc::SYS_rt_sigqueueinfo,
-        libc::SYS_rt_tgsigqueueinfo,
-        libc::SYS_pidfd_send_signal,
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
     ];
+    if !signals_are_pid_namespaced {
+        denied.extend([
+            libc::SYS_kill,
+            libc::SYS_tkill,
+            libc::SYS_rt_sigqueueinfo,
+            libc::SYS_rt_tgsigqueueinfo,
+            libc::SYS_pidfd_send_signal,
+        ]);
+    }
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
         denied.into_iter().map(|syscall| (syscall, vec![])).collect();
 
-    // Bun/JSC uses tgkill(tgid=self, tid=worker, SIGPWR) to suspend its own
-    // threads even for trivial commands such as `opencode --version`. Blocking
-    // tgkill unconditionally makes Bun crash before the agent starts. Keep
-    // cross-process signalling blocked while allowing the sandbox root process
-    // to signal threads in its own thread group. Descendants inherit this
-    // filter and may only target the sandbox root tgid, never sibling/Host
-    // processes.
-    let sandbox_tgid = unsafe { libc::getpid() } as u64;
-    rules.insert(
-        libc::SYS_tgkill,
-        vec![SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Ne,
-            sandbox_tgid,
-        )?])?],
-    );
+    if !signals_are_pid_namespaced {
+        // Bun/JSC uses tgkill(tgid=self, tid=worker, SIGPWR) to suspend its own
+        // threads even for trivial commands such as `opencode --version`.
+        // Outside a private PID namespace, keep cross-process signalling
+        // blocked while allowing only the sandbox root thread group.
+        let sandbox_tgid = unsafe { libc::getpid() } as u64;
+        rules.insert(
+            libc::SYS_tgkill,
+            vec![SeccompRule::new(vec![SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Ne,
+                sandbox_tgid,
+            )?])?],
+        );
+    }
 
     let filter: BpfProgram = SeccompFilter::new(
         rules,
@@ -1188,7 +1327,7 @@ fn install_seccomp_denylist() -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn apply_policy(_spec: &SandboxSpec) -> anyhow::Result<()> {
+fn apply_policy(_spec: &SandboxSpec, _signals_are_pid_namespaced: bool) -> anyhow::Result<()> {
     bail!("embedded agent sandbox requires Linux; refusing to run an unsandboxed agent")
 }
 
@@ -1446,7 +1585,7 @@ mod tests {
             assert!(child >= 0, "fork failed: {}", std::io::Error::last_os_error());
             if child == 0 {
                 let parent = libc::getppid();
-                if install_seccomp_denylist().is_err() {
+                if install_seccomp_denylist(false).is_err() {
                     libc::_exit(10);
                 }
                 let own_pid = libc::getpid();
@@ -1465,6 +1604,42 @@ mod tests {
             let mut status = 0;
             assert_eq!(libc::waitpid(child, &mut status, 0), child);
             assert_eq!(status, 0, "seccomp tgkill probe child status={status}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_pid_namespace_mode_allows_child_termination() {
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if child == 0 {
+                if install_seccomp_denylist(true).is_err() {
+                    libc::_exit(20);
+                }
+                let grandchild = libc::fork();
+                if grandchild < 0 {
+                    libc::_exit(21);
+                }
+                if grandchild == 0 {
+                    libc::pause();
+                    libc::_exit(0);
+                }
+                if libc::kill(grandchild, libc::SIGKILL) != 0 {
+                    libc::_exit(22);
+                }
+                let mut status = 0;
+                if libc::waitpid(grandchild, &mut status, 0) != grandchild {
+                    libc::_exit(23);
+                }
+                if !libc::WIFSIGNALED(status) || libc::WTERMSIG(status) != libc::SIGKILL {
+                    libc::_exit(24);
+                }
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            assert_eq!(status, 0, "namespaced-signal seccomp child status={status}");
         }
     }
 

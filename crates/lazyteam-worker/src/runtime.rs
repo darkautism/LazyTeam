@@ -14,7 +14,9 @@ const DEFAULT_WATCHDOG_PROBE_INTERVAL_SECS: u64 = 120;
 const DEFAULT_WATCHDOG_PROBE_GRACE_SECS: u64 = 30;
 const DEFAULT_WATCHDOG_MAX_MISSED_PROBES: u32 = 3;
 const DEFAULT_WATCHDOG_MAX_INACTIVE_PROBES: u32 = 3;
-const DEFAULT_WATCHDOG_TOOL_STALL_SECS: u64 = 30 * 60;
+const DEFAULT_WATCHDOG_TOOL_STALL_SECS: u64 = 10 * 60;
+const DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS: u64 = 25 * 60;
+const TOOL_TIMEOUT_GRACE_SECS: u64 = 15;
 const DEFAULT_REVIEW_SOFT_TOOL_BUDGET: u64 = 12;
 const DEFAULT_REVIEW_HARD_TOOL_BUDGET: u64 = 20;
 const REVIEW_TERMINAL_PROMPT: &str = "LAZYTEAM_REVIEW_TERMINAL_ONLY: The substantive review is complete. Do not inspect files, run commands, or redo the review. Use only submit_review now, with the verdict, reason, and validation evidence you already decided.";
@@ -66,8 +68,17 @@ fn watchdog_tool_stall_window() -> Duration {
     bounded_duration_from_env(
         "LAZYTEAM_HARNESS_TOOL_STALL_SECS",
         DEFAULT_WATCHDOG_TOOL_STALL_SECS,
-        30 * 60,
-        6 * 60 * 60,
+        60,
+        DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS,
+    )
+}
+
+fn watchdog_tool_hard_limit() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_HARNESS_TOOL_HARD_LIMIT_SECS",
+        DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS,
+        60,
+        DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS,
     )
 }
 
@@ -98,6 +109,7 @@ struct ActiveToolState {
     program: Option<String>,
     command_summary: String,
     fingerprint: String,
+    requested_timeout_secs: Option<u64>,
 }
 
 impl ActiveToolState {
@@ -219,6 +231,23 @@ fn is_null_like(value: &Value) -> bool {
 /// Extract a bounded raw command string for classification only. The returned
 /// string is used transiently to derive a redacted class/program/hash and is
 /// never persisted itself.
+fn requested_tool_timeout_secs(tool_name: &str, event: &Value) -> Option<u64> {
+    if tool_name != "bash" {
+        return None;
+    }
+    let args = tool_args_value(event)?;
+    let timeout = args.as_object()?.get("timeout")?;
+    let seconds = match timeout {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(raw) => raw.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Some(seconds.ceil().min(DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS as f64) as u64)
+}
+
 fn raw_command_from_args(args: &Value, event: &Value) -> Option<String> {
     if let Some(s) = args.as_str() {
         return bounded_raw_command(s);
@@ -740,12 +769,26 @@ impl ActiveTools {
     /// earliest `last_progress_at` can stall first, so one entry determines
     /// the watchdog decision while the brief still lists the rest.
     fn stalest_stalled(&self, now: Instant, window: Duration) -> Option<&ActiveToolState> {
-        let stalest = self.calls.values().min_by_key(|s| s.last_progress_at)?;
+        // A bash call with an explicit timeout is allowed to be completely
+        // quiet (for example `cargo test | tail`). Its requested timeout is a
+        // stronger contract than stdout activity, so the hard-runtime check
+        // governs it instead of misclassifying buffered output as a stall.
+        let stalest = self.calls
+            .values()
+            .filter(|state| state.requested_timeout_secs.is_none())
+            .min_by_key(|state| state.last_progress_at)?;
         if tool_stalled(stalest.last_progress_at, now, window) {
             Some(stalest)
         } else {
             None
         }
+    }
+
+    fn first_hard_limit_exceeded(&self, now: Instant, hard_limit: Duration) -> Option<&ActiveToolState> {
+        self.calls
+            .values()
+            .filter(|state| now.saturating_duration_since(state.started_at) >= active_tool_hard_limit(state, hard_limit))
+            .min_by_key(|state| state.started_at)
     }
 
     /// Bounded multi-call brief for durable failure evidence. Earliest idle
@@ -788,6 +831,7 @@ impl ActiveTools {
         let call_id = extract_tool_call_id(event);
         let (args_available, command_class, program, command_summary, fingerprint) =
             derive_tool_command(&name, event);
+        let requested_timeout_secs = requested_tool_timeout_secs(&name, event);
         let key = match &call_id {
             Some(id) => format!("id:{id}"),
             None => {
@@ -808,6 +852,7 @@ impl ActiveTools {
                 program,
                 command_summary,
                 fingerprint,
+                requested_timeout_secs,
             },
         );
     }
@@ -827,6 +872,9 @@ impl ActiveTools {
         state.program = program;
         state.command_summary = command_summary;
         state.fingerprint = fingerprint;
+        if state.requested_timeout_secs.is_none() {
+            state.requested_timeout_secs = requested_tool_timeout_secs(&name, event);
+        }
     }
 
     fn on_update(&mut self, event: &Value, name: String, now: Instant) {
@@ -915,6 +963,13 @@ impl ActiveTools {
     #[cfg(test)]
     fn get(&self, call_id: &str) -> Option<&ActiveToolState> {
         self.calls.get(&format!("id:{call_id}"))
+    }
+}
+
+fn active_tool_hard_limit(state: &ActiveToolState, global_hard_limit: Duration) -> Duration {
+    match state.requested_timeout_secs {
+        Some(seconds) => Duration::from_secs(seconds.saturating_add(TOOL_TIMEOUT_GRACE_SECS)).min(global_hard_limit),
+        None => global_hard_limit,
     }
 }
 
@@ -1012,9 +1067,12 @@ fn format_tool_diagnostic(state: &ActiveToolState, now: Instant) -> String {
     let call_id = state.call_id.as_deref().unwrap_or("none");
     let program = state.program.as_deref().unwrap_or("none");
     let args = if state.args_available { "available" } else { "unavailable" };
+    let timeout = state.requested_timeout_secs
+        .map(|seconds| format!("{seconds}s"))
+        .unwrap_or_else(|| "none".to_string());
     format!(
-        "tool={} call_id={} updates={} started_ago={}s idle={}s class={} program={} summary='{}' fingerprint={} args={}",
-        state.name, call_id, state.update_count, started_ago, idle_for, state.command_class, program, state.command_summary, state.fingerprint, args,
+        "tool={} call_id={} updates={} started_ago={}s idle={}s class={} program={} summary='{}' fingerprint={} args={} timeout={}",
+        state.name, call_id, state.update_count, started_ago, idle_for, state.command_class, program, state.command_summary, state.fingerprint, args, timeout,
     )
 }
 
@@ -1311,6 +1369,7 @@ impl PiRuntime {
         let max_missed_probes = watchdog_max_missed_probes();
         let max_inactive_probes = watchdog_max_inactive_probes();
         let tool_stall_window = watchdog_tool_stall_window();
+        let tool_hard_limit = watchdog_tool_hard_limit();
         let mut phase = RunPhase::Starting;
         let mut active_tools = ActiveTools::new();
         let mut next_probe_at = Instant::now() + probe_interval;
@@ -1410,6 +1469,27 @@ impl PiRuntime {
 
             if phase == RunPhase::ToolRunning {
                 let now = Instant::now();
+                if let Some(expired) = active_tools.first_hard_limit_exceeded(now, tool_hard_limit) {
+                    let elapsed = now.saturating_duration_since(expired.started_at);
+                    let effective_limit = active_tool_hard_limit(expired, tool_hard_limit);
+                    let diagnostic = format_tool_diagnostic(expired, now);
+                    tracing::warn!(
+                        session = session_name,
+                        active_tool = expired.name_label(),
+                        elapsed_secs = elapsed.as_secs(),
+                        hard_limit_secs = effective_limit.as_secs(),
+                        "Pi tool exceeded hard runtime limit; aborting run"
+                    );
+                    let reason = format!(
+                        "Pi tool '{}' exceeded its hard runtime limit after {}s (limit {}s); {}",
+                        expired.name,
+                        elapsed.as_secs(),
+                        effective_limit.as_secs(),
+                        diagnostic,
+                    );
+                    abort_pi_run(&mut child, &mut stdin).await;
+                    bail!(reason);
+                }
                 if let Some(stalled) = active_tools.stalest_stalled(now, tool_stall_window) {
                     let stalled_for = now.saturating_duration_since(stalled.last_progress_at);
                     let diagnostic = format_tool_diagnostic(stalled, now);
@@ -1769,7 +1849,16 @@ mod tests {
             "type": "tool_execution_start",
             "toolCallId": id,
             "toolName": "bash",
-            "args": {"command": command, "timeout": 300},
+            "args": {"command": command},
+        })
+    }
+
+    fn pi_bash_start_with_timeout(id: &str, command: &str, timeout: u64) -> Value {
+        json!({
+            "type": "tool_execution_start",
+            "toolCallId": id,
+            "toolName": "bash",
+            "args": {"command": command, "timeout": timeout},
         })
     }
 
@@ -1862,6 +1951,36 @@ mod tests {
         assert!(diagnostic.contains("updates=0"));
         assert!(diagnostic.contains("args=unavailable"));
         assert!(diagnostic.contains("args-unavailable"));
+    }
+
+    #[test]
+    fn bash_requested_timeout_bounds_the_outer_watchdog() {
+        let mut phase = RunPhase::Starting;
+        let mut tools = ActiveTools::new();
+        let start = Instant::now();
+        assert!(observe_pi_activity(
+            &pi_bash_start_with_timeout("call-timeout-1", "cargo test | tail -n 30", 300),
+            &mut phase,
+            &mut tools,
+            start,
+        ));
+        let state = tools.single().expect("active bash tool");
+        assert_eq!(state.requested_timeout_secs, Some(300));
+        assert_eq!(
+            active_tool_hard_limit(state, Duration::from_secs(DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS)),
+            Duration::from_secs(300 + TOOL_TIMEOUT_GRACE_SECS),
+        );
+        // Buffered pipelines are not treated as dead merely because Pi sees
+        // no stdout updates before the command's own timeout.
+        assert!(tools
+            .stalest_stalled(start + Duration::from_secs(300), Duration::from_secs(60))
+            .is_none());
+        assert!(tools
+            .first_hard_limit_exceeded(start + Duration::from_secs(314), Duration::from_secs(1500))
+            .is_none());
+        assert!(tools
+            .first_hard_limit_exceeded(start + Duration::from_secs(315), Duration::from_secs(1500))
+            .is_some());
     }
 
     #[test]
