@@ -14,6 +14,7 @@ const CONTAINER_EXEC_ARG: &str = "__lazyteam-container-exec";
 const SIGNAL_PROBE_ARG: &str = "__lazyteam-sandbox-signal-probe";
 const SPEC_ENV: &str = "LAZYTEAM_SANDBOX_SPEC";
 const UID_ISOLATION_ENV: &str = "LAZYTEAM_SANDBOX_UID";
+const SANDBOX_PI_SHARED_GID: u32 = 19_999;
 const SANDBOX_UID_MIN: u32 = 20_000;
 const SANDBOX_UID_MAX: u32 = 59_999;
 const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".pytest_cache", ".venv"];
@@ -282,14 +283,23 @@ impl AgentSandbox {
             set_private_dir(dir).await?;
         }
         tokio::fs::create_dir_all(&pi_config_dir).await?;
-        // Sandboxed Pi runs under a per-workspace uid. Node's fs.existsSync()
-        // uses access(2)-style checks that ignore CAP_DAC_OVERRIDE for a
-        // non-root real uid, so a 0700 parent makes an existing auth.json look
-        // absent even though direct reads work. Pi then creates "{}" and
-        // silently erases the queued credential. Grant execute-only traversal
-        // to other sandbox uids; auth.json itself remains 0600 and Landlock
-        // still limits visibility to this worker's Pi config path.
-        set_traversable_private_dir(&pi_config_dir).await?;
+        if trusted_container_daemon {
+            // Task sandboxes use distinct real UIDs for signal isolation, but
+            // Pi authentication is worker-scoped state shared by those tasks.
+            // Give only a dedicated supplementary group write/traverse access;
+            // the directory stays non-listable and Landlock still confines the
+            // path to this worker. The setgid bit keeps Pi's atomic replacements
+            // in the same group instead of silently recreating unreadable files.
+            set_shared_pi_dir(&pi_config_dir).await?;
+            for name in ["auth.json", "models-store.json", "models.json"] {
+                let path = pi_config_dir.join(name);
+                if path.exists() {
+                    set_shared_pi_file(&path).await?;
+                }
+            }
+        } else {
+            set_private_dir(&pi_config_dir).await?;
+        }
         let host_path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
         let mut path = if container_rootfs.is_some() {
             OsString::from("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -499,9 +509,17 @@ impl AgentSandbox {
         object.insert(provider.to_string(), serde_json::json!({"type":"api_key","key":api_key}));
         let tmp_path = self.pi_config_dir.join(format!("auth.json.tmp-{}", uuid::Uuid::new_v4()));
         tokio::fs::write(&tmp_path, serde_json::to_vec_pretty(&root)?).await?;
-        set_private_file(&tmp_path).await?;
+        if self.trusted_container_daemon {
+            set_shared_pi_file(&tmp_path).await?;
+        } else {
+            set_private_file(&tmp_path).await?;
+        }
         tokio::fs::rename(&tmp_path, &auth_path).await?;
-        set_private_file(&auth_path).await?;
+        if self.trusted_container_daemon {
+            set_shared_pi_file(&auth_path).await?;
+        } else {
+            set_private_file(&auth_path).await?;
+        }
         Ok(())
     }
 
@@ -771,6 +789,11 @@ fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Resul
         // descendants inherit that uid and retain normal kill/wait semantics.
         apply_policy(&spec, true)?;
         enter_sandbox_uid(sandbox_uid)?;
+        // Files created by Pi under the worker-scoped credential directory
+        // inherit its setgid group and must remain writable by the next task's
+        // distinct sandbox UID. Other isolation still comes from per-task UID
+        // plus Landlock path confinement.
+        unsafe { libc::umask(0o007); }
         unsafe { std::env::set_var(UID_ISOLATION_ENV, sandbox_uid.to_string()); }
         return exec_sandboxed_program(program, args);
     }
@@ -1086,8 +1109,9 @@ fn enter_sandbox_uid(uid: u32) -> anyhow::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) } != 0 {
         bail!("enable keepcaps for sandbox uid switch failed: {}", std::io::Error::last_os_error());
     }
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-        bail!("clear sandbox supplementary groups failed: {}", std::io::Error::last_os_error());
+    let shared_groups = [SANDBOX_PI_SHARED_GID as libc::gid_t];
+    if unsafe { libc::setgroups(shared_groups.len(), shared_groups.as_ptr()) } != 0 {
+        bail!("set sandbox supplementary groups failed: {}", std::io::Error::last_os_error());
     }
     if unsafe { libc::setresgid(uid, uid, uid) } != 0 {
         bail!("set sandbox gid {uid} failed: {}", std::io::Error::last_os_error());
@@ -1112,7 +1136,10 @@ fn enter_sandbox_uid(uid: u32) -> anyhow::Result<()> {
         bail!("disable keepcaps after sandbox uid switch failed: {}", std::io::Error::last_os_error());
     }
     // Preserve only DAC override across exec so the isolated uid can use the
-    // already-Landlock-confined shared caches/config and its workspace. No
+    // already-Landlock-confined shared caches/config and its workspace. Pi's
+    // worker-scoped credential store additionally uses SANDBOX_PI_SHARED_GID,
+    // so access(2)-style checks agree with the intended filesystem policy.
+    // No
     // CAP_KILL, CAP_SYS_ADMIN, CAP_SETUID, or CAP_SETGID survives into the agent.
     if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, 1, 0, 0) } != 0 {
         bail!("raise sandbox ambient CAP_DAC_OVERRIDE failed: {}", std::io::Error::last_os_error());
@@ -1724,14 +1751,32 @@ async fn set_private_dir(path: &Path) -> anyhow::Result<()> {
 async fn set_private_dir(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(unix)]
-async fn set_traversable_private_dir(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o711)).await?;
+async fn set_shared_pi_dir(path: &Path) -> anyhow::Result<()> {
+    use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::PermissionsExt}};
+    let c_path = CString::new(path.as_os_str().as_bytes()).context("Pi config path contains NUL")?;
+    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, SANDBOX_PI_SHARED_GID) } != 0 {
+        bail!("set Pi config shared group failed: {}", std::io::Error::last_os_error());
+    }
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2730)).await?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-async fn set_traversable_private_dir(_path: &Path) -> anyhow::Result<()> { Ok(()) }
+async fn set_shared_pi_dir(_path: &Path) -> anyhow::Result<()> { Ok(()) }
+
+#[cfg(unix)]
+async fn set_shared_pi_file(path: &Path) -> anyhow::Result<()> {
+    use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::PermissionsExt}};
+    let c_path = CString::new(path.as_os_str().as_bytes()).context("Pi credential path contains NUL")?;
+    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, SANDBOX_PI_SHARED_GID) } != 0 {
+        bail!("set Pi credential shared group failed: {}", std::io::Error::last_os_error());
+    }
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn set_shared_pi_file(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(unix)]
 async fn set_private_file(path: &Path) -> anyhow::Result<()> {
@@ -1832,18 +1877,6 @@ mod tests {
         assert!((SANDBOX_UID_MIN..=SANDBOX_UID_MAX).contains(&uid_a));
         assert!((SANDBOX_UID_MIN..=SANDBOX_UID_MAX).contains(&uid_b));
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn pi_config_dir_allows_traversal_but_not_listing() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("lazyteam-pi-config-mode-{}", uuid::Uuid::new_v4()));
-        tokio::fs::create_dir_all(&root).await.unwrap();
-        set_traversable_private_dir(&root).await.unwrap();
-        let mode = tokio::fs::metadata(&root).await.unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o711);
-        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[test]
