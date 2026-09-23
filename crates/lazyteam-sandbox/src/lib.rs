@@ -247,23 +247,14 @@ impl AgentSandbox {
             path = std::env::join_paths(paths).context("compose agent PATH with managed Rust")?;
         }
 
-        if let Some(program) = resolve_program(pi_bin, &host_path) {
-            if let Ok(target) = std::fs::canonicalize(&program) {
-                let runtime_root = common_ancestor(&program, &target).filter(|root| path_depth(root) >= 3)
-                    .or_else(|| program.parent().map(Path::to_path_buf));
-                if let Some(root) = runtime_root {
-                    read_only.insert(root.clone());
-                    if container_rootfs.is_some() {
-                        container_read_only.insert(root.clone());
-                        if let Some(bin) = program.parent() {
-                            let mut paths = vec![bin.to_path_buf()];
-                            paths.extend(std::env::split_paths(&path));
-                            path = std::env::join_paths(paths).context("compose agent container PATH")?;
-                        }
-                    }
-                }
-            }
-        }
+        allowlist_runtime_program(
+            pi_bin,
+            &host_path,
+            &mut path,
+            &mut read_only,
+            &mut container_read_only,
+            container_rootfs.as_deref(),
+        )?;
 
         let host_cargo_bin = container_rootfs.is_none().then(|| std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -329,6 +320,28 @@ impl AgentSandbox {
 
     pub fn reviewer_workspace(&self, review_id: uuid::Uuid) -> PathBuf {
         self.state_dir.join("agent-review-workspaces").join(review_id.to_string())
+    }
+
+    /// Allowlist one more agent runtime binary (e.g. OpenCode) under the
+    /// identical read-only policy `prepare` applied to the Pi binary. The
+    /// sandbox boundary itself is unchanged; only the executable lookup
+    /// gains one entry so both backends run fully sandboxed.
+    pub fn allowlist_agent_binary(&mut self, binary: &str) -> anyhow::Result<()> {
+        let host_path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
+        let mut read_only: BTreeSet<PathBuf> = self.read_only.iter().cloned().collect();
+        let mut container_read_only: BTreeSet<PathBuf> =
+            self.container_read_only.iter().cloned().collect();
+        allowlist_runtime_program(
+            binary,
+            &host_path,
+            &mut self.path,
+            &mut read_only,
+            &mut container_read_only,
+            self.container_rootfs.as_deref(),
+        )?;
+        self.read_only = read_only.into_iter().collect();
+        self.container_read_only = container_read_only.into_iter().collect();
+        Ok(())
     }
 
     pub fn diagnostic_summary(&self) -> &'static str {
@@ -1397,6 +1410,41 @@ fn resolve_program(program: &str, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
+}
+
+/// Expose one agent runtime binary to the sandbox under the exact same
+/// read-only policy as every other runtime: resolve it against the host
+/// PATH, then allowlist the common ancestor of the link path and its
+/// canonical target (so symlinked installs such as npm/node shims resolve
+/// to their real runtime root). `prepare` applies this to the Pi binary;
+/// workers apply it again for the OpenCode binary so both backends execute
+/// inside the identical filesystem boundary.
+fn allowlist_runtime_program(
+    program: &str,
+    host_path: &OsStr,
+    path: &mut OsString,
+    read_only: &mut BTreeSet<PathBuf>,
+    container_read_only: &mut BTreeSet<PathBuf>,
+    container_rootfs: Option<&Path>,
+) -> anyhow::Result<()> {
+    if let Some(program) = resolve_program(program, host_path) {
+        if let Ok(target) = std::fs::canonicalize(&program) {
+            let runtime_root = common_ancestor(&program, &target).filter(|root| path_depth(root) >= 3)
+                .or_else(|| program.parent().map(Path::to_path_buf));
+            if let Some(root) = runtime_root {
+                read_only.insert(root.clone());
+                if container_rootfs.is_some() {
+                    container_read_only.insert(root.clone());
+                    if let Some(bin) = program.parent() {
+                        let mut paths = vec![bin.to_path_buf()];
+                        paths.extend(std::env::split_paths(path));
+                        *path = std::env::join_paths(paths).context("compose agent container PATH")?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn path_depth(path: &Path) -> usize { path.components().count() }

@@ -1723,6 +1723,484 @@ impl AgentRuntime for PiRuntime {
     }
 }
 
+/// OpenCode headless runtime.
+///
+/// Uses only the documented non-interactive, machine-readable interface;
+/// the TUI is never scraped:
+/// - execution: `opencode run --format json --model <provider>/<model>
+///   [--session <opaque-id>] <prompt>` streams newline-delimited JSON
+///   events on stdout and exits 0 once the run settles.
+/// - model catalog: `opencode models --format json` prints the catalog as
+///   JSON (a bare array or an object holding the array).
+/// - backend-supported session deletion: `opencode session delete <id>`.
+///
+/// OpenCode owns its opaque session ID: a fresh run (no resume ID) must
+/// report the created ID in its event stream and the run result carries it
+/// back through [`AgentRunResult::backend_session_id`] for binding; a retry
+/// passes `--session <bound-id>` to resume that exact session. IDs are
+/// never fabricated and never interpreted beyond transport.
+#[derive(Debug, Clone)]
+pub struct OpenCodeRuntime {
+    pub binary: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub session_dir: Option<PathBuf>,
+    pub sandbox: AgentSandbox,
+}
+
+const DEFAULT_OPENCODE_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+const DEFAULT_OPENCODE_STALL_SECS: u64 = 30 * 60;
+const DEFAULT_OPENCODE_DELETE_TIMEOUT_SECS: u64 = 60;
+
+fn opencode_timeout() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_OPENCODE_TIMEOUT_SECS",
+        DEFAULT_OPENCODE_TIMEOUT_SECS,
+        1,
+        12 * 60 * 60,
+    )
+}
+
+fn opencode_stall_window() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_OPENCODE_STALL_SECS",
+        DEFAULT_OPENCODE_STALL_SECS,
+        1,
+        6 * 60 * 60,
+    )
+}
+
+fn opencode_delete_timeout() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_OPENCODE_DELETE_TIMEOUT_SECS",
+        DEFAULT_OPENCODE_DELETE_TIMEOUT_SECS,
+        1,
+        600,
+    )
+}
+
+/// The exact Host-selected model in OpenCode's `provider/model` form.
+/// Both halves must be present and non-blank; anything else is an error so
+/// a misconfigured selection can never silently fall back to a default.
+fn opencode_model_id(provider: Option<&str>, model: Option<&str>) -> anyhow::Result<String> {
+    let provider = provider.unwrap_or("").trim();
+    let model = model.unwrap_or("").trim();
+    if provider.is_empty() || model.is_empty() {
+        bail!("OpenCode requires the exact Host provider and model; refusing silent fallback");
+    }
+    Ok(format!("{provider}/{model}"))
+}
+
+/// Headless run argv (everything after the binary): fresh runs omit
+/// `--session` so OpenCode creates its opaque session; retries resume the
+/// exact bound ID. The prompt travels as one trailing argument.
+fn opencode_run_args(model_id: &str, resume_session_id: Option<&str>, prompt: &str) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--model".to_string(),
+        model_id.to_string(),
+    ];
+    if let Some(id) = resume_session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        args.push("--session".to_string());
+        args.push(id.to_string());
+    }
+    args.push(prompt.to_string());
+    args
+}
+
+/// Backend-supported session deletion argv (everything after the binary).
+fn opencode_session_delete_args(backend_session_id: &str) -> Vec<String> {
+    vec![
+        "session".to_string(),
+        "delete".to_string(),
+        backend_session_id.trim().to_string(),
+    ]
+}
+
+/// Opaque session identity carried by one machine-readable event. Accepts
+/// the `session.created` shape (`session.id`) as well as `sessionID` /
+/// `session_id` spellings, top-level or nested under `session`/`data`.
+/// Returns the raw string untouched: OpenCode owns the format.
+fn opencode_session_id(event: &Value) -> Option<String> {
+    const KEYS: [&str; 3] = ["id", "sessionID", "session_id"];
+    if let Some(obj) = event.get("session").and_then(Value::as_object) {
+        for key in KEYS {
+            if let Some(id) = obj.get(key).and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    if let Some(obj) = event.get("data").and_then(Value::as_object) {
+        if let Some(session) = obj.get("session").and_then(Value::as_object) {
+            for key in KEYS {
+                if let Some(id) = session.get(key).and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty()) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+        for key in ["sessionID", "session_id"] {
+            if let Some(id) = obj.get(key).and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    for key in ["sessionID", "session_id"] {
+        if let Some(id) = event.get(key).and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty()) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+/// True for prompt/user/transcript/system/tool/session bookkeeping events
+/// that must never contribute to the final assistant result.
+fn opencode_event_is_noise(event: &Value) -> bool {
+    if let Some(role) = event.get("role").and_then(Value::as_str) {
+        let role = role.trim().to_ascii_lowercase();
+        if role != "assistant" {
+            return true;
+        }
+    }
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+    ["user", "prompt", "transcript", "system", "tool", "session", "step", "usage", "auth", "permission"]
+        .iter()
+        .any(|marker| event_type.contains(marker))
+}
+
+fn opencode_push_text(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push(text.to_string());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        out.push(text.to_string());
+                    }
+                } else if let Some(nested) = item.get("content") {
+                    opencode_push_text(nested, out);
+                } else {
+                    opencode_push_text(item, out);
+                }
+            }
+        }
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    out.push(text.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Select only final assistant content from one machine-readable OpenCode
+/// event. Returns `None` for prompt/user/transcript/system/tool/session
+/// events and for assistant events without textual payload, so mixed
+/// transcripts can never leak non-assistant text into the result.
+fn opencode_assistant_text(event: &Value) -> Option<String> {
+    if opencode_event_is_noise(event) {
+        return None;
+    }
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+    let assistant_shape = event_type.is_empty()
+        || ["assistant", "text", "message", "output", "result", "final", "response", "answer", "completion"]
+            .iter()
+            .any(|marker| event_type.contains(marker));
+    if !assistant_shape {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for key in ["text", "content", "message", "output", "result"] {
+        if let Some(value) = event.get(key) {
+            opencode_push_text(value, &mut parts);
+        }
+    }
+    if parts.is_empty() {
+        if let Some(data) = event.get("data") {
+            opencode_push_text(data, &mut parts);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("\n"))
+}
+
+fn opencode_model_from_value(value: &Value) -> Option<AgentModel> {
+    let provider = value
+        .get("provider")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("providerID").and_then(Value::as_str))
+        .or_else(|| value.get("provider_id").and_then(Value::as_str))?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("modelID").and_then(Value::as_str))
+        .or_else(|| value.get("model").and_then(Value::as_str))?;
+    Some(AgentModel {
+        provider: provider.to_string(),
+        id: id.to_string(),
+        name: value.get("name").and_then(Value::as_str).map(str::to_string),
+        context_window: value
+            .get("contextWindow")
+            .and_then(Value::as_u64)
+            .or_else(|| value.get("context_window").and_then(Value::as_u64)),
+        reasoning: value.get("reasoning").and_then(Value::as_bool).unwrap_or(false),
+        cost: None,
+    })
+}
+
+fn opencode_models_from_value(value: &Value) -> Option<Vec<AgentModel>> {
+    if let Some(array) = value.as_array() {
+        return Some(array.iter().filter_map(opencode_model_from_value).collect());
+    }
+    for key in ["models", "data", "result"] {
+        if let Some(array) = value.get(key).and_then(Value::as_array) {
+            return Some(array.iter().filter_map(opencode_model_from_value).collect());
+        }
+    }
+    None
+}
+
+/// Kill and reap a child so timeout/stall/cancel paths never orphan
+/// processes. Safe to call on an already-exited child.
+async fn terminate_opencode_child(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// Drive an already-spawned headless `opencode run` child to completion:
+/// every stdout line is liveness; newline-delimited JSON events yield the
+/// opaque session ID and final assistant text. Stall (no output inside the
+/// window) and overall-deadline paths terminate the child before bailing,
+/// and dropping the future terminates it via `kill_on_drop`.
+async fn drive_opencode_run(
+    mut child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    resume_session_id: Option<String>,
+    timeout: Duration,
+    stall_window: Duration,
+) -> anyhow::Result<AgentRunResult> {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::warn!(target: "opencode", "{line}");
+        }
+    });
+    let deadline = Instant::now() + timeout;
+    let mut last_progress = Instant::now();
+    let mut session_id: Option<String> = None;
+    let mut assistant_parts: Vec<String> = Vec::new();
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            terminate_opencode_child(&mut child).await;
+            bail!("OpenCode run timed out after {}s", timeout.as_secs());
+        }
+        let stall_at = last_progress + stall_window;
+        let wait_until = stall_at.min(deadline);
+        match tokio::time::timeout_at(wait_until, lines.next_line()).await {
+            Err(_) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    terminate_opencode_child(&mut child).await;
+                    bail!("OpenCode run timed out after {}s", timeout.as_secs());
+                }
+                terminate_opencode_child(&mut child).await;
+                bail!(
+                    "OpenCode produced no observable progress for {}s (limit {}s)",
+                    now.saturating_duration_since(last_progress).as_secs(),
+                    stall_window.as_secs(),
+                );
+            }
+            Ok(Err(error)) => {
+                terminate_opencode_child(&mut child).await;
+                bail!("OpenCode output unreadable: {error:#}");
+            }
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(line))) => {
+                last_progress = Instant::now();
+                let event: Value = match serde_json::from_str(&line) {
+                    Ok(event) => event,
+                    Err(_) => {
+                        tracing::debug!(target: "opencode", raw = %line, "non-json OpenCode output");
+                        continue;
+                    }
+                };
+                if session_id.is_none() {
+                    session_id = opencode_session_id(&event);
+                }
+                if let Some(text) = opencode_assistant_text(&event) {
+                    assistant_parts.push(text);
+                }
+            }
+        }
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        bail!("OpenCode run exited with {status}");
+    }
+    let summary = assistant_parts.join("\n").trim().to_string();
+    match (resume_session_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty()), session_id) {
+        (Some(resumed), observed) => {
+            // Retry resumed the exact backend-owned ID: keep it, preferring
+            // the ID OpenCode itself reported when present.
+            Ok(AgentRunResult {
+                summary,
+                backend_session_id: Some(observed.unwrap_or(resumed)),
+            })
+        }
+        (None, Some(created)) => Ok(AgentRunResult { summary, backend_session_id: Some(created) }),
+        (None, None) => bail!("OpenCode run did not report its opaque backend session ID"),
+    }
+}
+
+impl OpenCodeRuntime {
+    /// Build the sandboxed headless command without spawning it, so argv
+    /// selection (exact model, resume identity) is unit-testable. The
+    /// child always runs inside the same [`AgentSandbox`] boundary as Pi
+    /// with the sandbox's pinned Git dead-ends; no Host Git credential is
+    /// ever added here or by the caller.
+    pub(crate) fn run_command(
+        &self,
+        workspace: &Path,
+        prompt: &str,
+        backend_session_id: Option<&str>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let model_id = opencode_model_id(self.provider.as_deref(), self.model.as_deref())?;
+        let mut command = self.sandbox.command(&self.binary, workspace, self.session_dir.as_deref())?;
+        command.args(opencode_run_args(&model_id, backend_session_id, prompt));
+        command.current_dir(workspace).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
+        Ok(command)
+    }
+
+    async fn run_headless(
+        &self,
+        workspace: &Path,
+        prompt: &str,
+        backend_session_id: Option<&str>,
+    ) -> anyhow::Result<AgentRunResult> {
+        let mut command = self.run_command(workspace, prompt, backend_session_id)?;
+        let mut child = command.spawn().with_context(|| format!("spawn {} run --format json", self.binary))?;
+        let stdout = child.stdout.take().context("OpenCode stdout missing")?;
+        let stderr = child.stderr.take().context("OpenCode stderr missing")?;
+        drive_opencode_run(
+            child,
+            stdout,
+            stderr,
+            backend_session_id.map(str::to_string),
+            opencode_timeout(),
+            opencode_stall_window(),
+        )
+        .await
+    }
+
+    /// Build the sandboxed backend-supported session deletion command
+    /// without spawning it, so argv selection is unit-testable.
+    pub(crate) fn session_delete_command(&self, backend_session_id: &str) -> anyhow::Result<tokio::process::Command> {
+        let id = backend_session_id.trim();
+        if id.is_empty() {
+            bail!("OpenCode session ID must not be empty");
+        }
+        let mut command = self.sandbox.command(&self.binary, self.sandbox.probe_workspace(), None)?;
+        command.args(opencode_session_delete_args(id));
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
+        Ok(command)
+    }
+
+    /// Delete one backend-owned session through OpenCode's supported
+    /// session deletion inside the agent sandbox. Bounded: the child is
+    /// terminated on timeout and reaped on every path.
+    pub async fn delete_session(&self, backend_session_id: &str) -> anyhow::Result<()> {
+        let id = backend_session_id.trim().to_string();
+        let mut command = self.session_delete_command(&id)?;
+        Self::run_session_delete(&mut command, &id, opencode_delete_timeout()).await
+    }
+
+    pub(crate) async fn run_session_delete(
+        command: &mut tokio::process::Command,
+        session_id: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        // The command is built with `kill_on_drop`, so a timed-out output
+        // future drops (and therefore terminates) the child: no orphans.
+        let output = tokio::time::timeout(timeout, command.output()).await;
+        let output = match output {
+            Ok(output) => output.with_context(|| "spawn OpenCode session deletion".to_string())?,
+            Err(_) => bail!("OpenCode session deletion timed out after {}s", timeout.as_secs()),
+        };
+        if !output.status.success() {
+            let detail: String = String::from_utf8_lossy(&output.stderr).trim().chars().take(500).collect();
+            if detail.is_empty() {
+                bail!("OpenCode session deletion for {session_id} exited with {}", output.status);
+            }
+            bail!("OpenCode session deletion for {session_id} exited with {}: {detail}", output.status);
+        }
+        Ok(())
+    }
+
+    async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
+        let mut command = self.sandbox.command(&self.binary, self.sandbox.probe_workspace(), None)?;
+        command.arg("models").arg("--format").arg("json");
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .context("OpenCode model catalog probe timed out")?
+            .context("run OpenCode model catalog probe")?;
+        if !output.status.success() {
+            bail!(
+                "OpenCode model catalog probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim().chars().take(500).collect::<String>()
+            );
+        }
+        let value: Value = serde_json::from_slice(&output.stdout).context("parse OpenCode model catalog")?;
+        opencode_models_from_value(&value).context("OpenCode model catalog held no model list")
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for OpenCodeRuntime {
+    fn kind(&self) -> &'static str { "opencode" }
+
+    async fn capabilities(&self) -> AgentCapabilities {
+        match self.probe_models().await {
+            Ok(models) => AgentCapabilities {
+                model_discovery: true,
+                login_mode: AgentLoginMode::Remote,
+                providers: vec![],
+                models,
+                probe_error: None,
+            },
+            Err(error) => AgentCapabilities {
+                model_discovery: true,
+                login_mode: AgentLoginMode::Remote,
+                providers: vec![],
+                models: vec![],
+                probe_error: Some(format!("opencode model catalog: {error:#}")),
+            },
+        }
+    }
+
+    async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+        self.run_headless(workspace, prompt, backend_session_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2261,5 +2739,328 @@ mod tests {
         let workspace = Path::new("/tmp");
         let resumed = runtime.run(workspace, "prompt", Some("task-derived-id")).await.unwrap();
         assert_eq!(resumed.backend_session_id, Option::<String>::None);
+    }
+
+    #[test]
+    fn opencode_model_id_requires_exact_host_selection() {
+        assert_eq!(
+            opencode_model_id(Some("anthropic"), Some("claude-sonnet")).unwrap(),
+            "anthropic/claude-sonnet"
+        );
+        // Any missing or blank half errors: no silent fallback to a default.
+        assert!(opencode_model_id(None, Some("claude-sonnet")).is_err());
+        assert!(opencode_model_id(Some("anthropic"), None).is_err());
+        assert!(opencode_model_id(None, None).is_err());
+        assert!(opencode_model_id(Some("  "), Some("claude-sonnet")).is_err());
+        assert!(opencode_model_id(Some("anthropic"), Some("")).is_err());
+    }
+
+    #[test]
+    fn opencode_run_argv_is_headless_and_resumes_exact_id() {
+        let fresh = opencode_run_args("host-provider/host-model", None, "do the thing");
+        assert_eq!(
+            fresh,
+            vec!["run", "--format", "json", "--model", "host-provider/host-model", "do the thing"]
+        );
+        // Machine-readable output, never the TUI.
+        assert!(!fresh.iter().any(|arg| arg.eq_ignore_ascii_case("tui")));
+        let resume = opencode_run_args("host-provider/host-model", Some("ses_opaque_123"), "continue");
+        let resumed: Vec<&String> = resume.windows(2).filter(|pair| pair[0] == "--session").map(|pair| &pair[1]).collect();
+        assert_eq!(resumed, vec!["ses_opaque_123"]);
+        // Blank resume IDs behave exactly like fresh runs: OpenCode creates.
+        assert_eq!(
+            opencode_run_args("host-provider/host-model", Some("   "), "continue"),
+            opencode_run_args("host-provider/host-model", None, "continue"),
+        );
+    }
+
+    #[test]
+    fn opencode_session_delete_argv_uses_supported_subcommand() {
+        assert_eq!(
+            opencode_session_delete_args("ses_opaque_123"),
+            vec!["session", "delete", "ses_opaque_123"]
+        );
+    }
+
+    #[test]
+    fn opencode_final_output_ignores_prompt_user_transcript_events() {
+        // Mixed-event fixture: prompt/user/transcript/system/tool/session
+        // bookkeeping must never leak into the final assistant result.
+        let noise = vec![
+            json!({"type": "user", "text": "do the thing"}),
+            json!({"type": "prompt", "text": "system prompt text"}),
+            json!({"type": "transcript", "text": "old transcript"}),
+            json!({"type": "system", "text": "system note"}),
+            json!({"role": "user", "type": "message", "content": [{"text": "user content"}]}),
+            json!({"type": "tool_execution_start", "toolName": "bash"}),
+            json!({"type": "session.created", "session": {"id": "ses_mixed_1"}, "text": "not assistant text"}),
+            json!({"type": "step_start"}),
+        ];
+        for event in &noise {
+            assert!(opencode_assistant_text(event).is_none(), "leaked noise: {event}");
+        }
+        // The session identity is still observable on the noise event.
+        assert_eq!(opencode_session_id(&noise[6]).as_deref(), Some("ses_mixed_1"));
+        let assistant = vec![
+            json!({"type": "text", "text": "first"}),
+            json!({"type": "message", "role": "assistant", "content": [{"text": "second"}]}),
+            json!({"type": "assistant", "content": "third"}),
+            json!({"type": "result", "data": {"text": "fourth"}}),
+        ];
+        let collected: Vec<String> = assistant.iter().filter_map(opencode_assistant_text).collect();
+        assert_eq!(collected, vec!["first", "second", "third", "fourth"]);
+    }
+
+    #[test]
+    fn opencode_session_id_accepts_documented_spellings() {
+        assert_eq!(
+            opencode_session_id(&json!({"type": "session.created", "session": {"id": "ses_a"}})).as_deref(),
+            Some("ses_a")
+        );
+        assert_eq!(
+            opencode_session_id(&json!({"sessionID": "ses_b"})).as_deref(),
+            Some("ses_b")
+        );
+        assert_eq!(
+            opencode_session_id(&json!({"data": {"session": {"session_id": "ses_c"}}})).as_deref(),
+            Some("ses_c")
+        );
+        assert!(opencode_session_id(&json!({"type": "text", "text": "hi"})).is_none());
+        assert!(opencode_session_id(&json!({"session": {"id": "   "}})).is_none());
+    }
+
+    #[test]
+    fn opencode_models_parse_tolerantly() {
+        let bare = json!([{"provider": "acme", "id": "cheap-1", "name": "Cheap"}]);
+        let models = opencode_models_from_value(&bare).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider, "acme");
+        assert_eq!(models[0].id, "cheap-1");
+        let wrapped = json!({"models": [{"providerID": "acme", "modelID": "cheap-2"}]});
+        let models = opencode_models_from_value(&wrapped).unwrap();
+        assert_eq!(models[0].id, "cheap-2");
+        assert!(opencode_models_from_value(&json!({"ok": true})).is_none());
+    }
+
+    /// Spawn a fake headless backend directly (no sandbox, no model call)
+    /// for driver tests: stdout is the machine-readable event stream.
+    async fn spawn_opencode_fake(script: &str) -> (tokio::process::Child, tokio::process::ChildStdout, tokio::process::ChildStderr) {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn fake opencode backend");
+        let stdout = child.stdout.take().expect("fake stdout");
+        let stderr = child.stderr.take().expect("fake stderr");
+        (child, stdout, stderr)
+    }
+
+    #[tokio::test]
+    async fn opencode_fresh_run_returns_created_opaque_session() {
+        let (child, stdout, stderr) = spawn_opencode_fake(
+            r#"printf '%s\n' '{"type":"session.created","session":{"id":"ses_opaque_fresh"}}' '{"type":"user","text":"ignore me"}' '{"type":"prompt","text":"ignore me"}' '{"type":"assistant","text":"did the work"}' '{"type":"text","text":"cleanly"}'"#,
+        )
+        .await;
+        let result = drive_opencode_run(child, stdout, stderr, None, Duration::from_secs(30), Duration::from_secs(30)).await.unwrap();
+        assert_eq!(result.backend_session_id.as_deref(), Some("ses_opaque_fresh"));
+        assert_eq!(result.summary, "did the work\ncleanly");
+        assert!(!result.summary.contains("ignore me"));
+    }
+
+    #[tokio::test]
+    async fn opencode_fresh_run_without_session_id_fails_instead_of_fabricating() {
+        let (child, stdout, stderr) = spawn_opencode_fake(
+            r#"printf '%s\n' '{"type":"text","text":"no identity here"}'"#,
+        )
+        .await;
+        let error = drive_opencode_run(child, stdout, stderr, None, Duration::from_secs(30), Duration::from_secs(30))
+            .await
+            .expect_err("fresh runs must report the created session ID");
+        assert!(error.to_string().contains("opaque backend session ID"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn opencode_retry_resumes_exact_session_id() {
+        // Output omits any session event: the bound ID is still resumed.
+        let (child, stdout, stderr) = spawn_opencode_fake(
+            r#"printf '%s\n' '{"type":"assistant","text":"continued"}'"#,
+        )
+        .await;
+        let result = drive_opencode_run(
+            child,
+            stdout,
+            stderr,
+            Some("ses_opaque_123".to_string()),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.backend_session_id.as_deref(), Some("ses_opaque_123"));
+        assert_eq!(result.summary, "continued");
+    }
+
+    #[tokio::test]
+    async fn opencode_failed_runs_report_exit_status() {
+        let (child, stdout, stderr) =
+            spawn_opencode_fake(r#"printf '%s\n' '{"type":"text","text":"partial"}'; exit 3"#).await;
+        let error = drive_opencode_run(child, stdout, stderr, None, Duration::from_secs(30), Duration::from_secs(30))
+            .await
+            .expect_err("non-zero exits must fail");
+        assert!(error.to_string().contains("exited"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn opencode_stalled_child_is_terminated_without_orphans() {
+        let started = Instant::now();
+        let (child, stdout, stderr) = spawn_opencode_fake("sleep 30").await;
+        let error = drive_opencode_run(child, stdout, stderr, None, Duration::from_secs(60), Duration::from_secs(1))
+            .await
+            .expect_err("stalled children must fail");
+        assert!(error.to_string().contains("no observable progress"), "{error}");
+        // Bounded: the stall window fires instead of waiting out the sleep,
+        // and the driver reaps the child before returning, so no orphan
+        // process survives the stall path.
+        assert!(started.elapsed() < Duration::from_secs(25), "stall path must stay bounded");
+    }
+
+    #[tokio::test]
+    async fn opencode_overall_timeout_terminates_chatty_child() {
+        let started = Instant::now();
+        let (child, stdout, stderr) =
+            spawn_opencode_fake(r#"while true; do echo '{"type":"ping"}'; sleep 1; done"#).await;
+        let error = drive_opencode_run(child, stdout, stderr, None, Duration::from_secs(2), Duration::from_secs(60))
+            .await
+            .expect_err("overall deadline must fire despite chatter");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(25), "timeout path must stay bounded");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_cancel_terminates_the_child() {
+        let pid_file = std::env::temp_dir().join(format!("lazyteam-opencode-cancel-{}", Uuid::new_v4().simple()));
+        let script = format!("echo $$ > '{}'; sleep 30", pid_file.display());
+        let (child, stdout, stderr) = spawn_opencode_fake(&script).await;
+        let driver = tokio::spawn(drive_opencode_run(
+            child,
+            stdout,
+            stderr,
+            None,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        ));
+        // Wait for the fake to record its PID, then cancel the driver: the
+        // future is dropped, so `kill_on_drop` must terminate the child.
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid: i32 = tokio::fs::read_to_string(&pid_file).await.unwrap().trim().parse().unwrap();
+        driver.abort();
+        let _ = driver.await;
+        let mut dead = false;
+        for _ in 0..100 {
+            // kill(pid, 0) succeeds while the process lives; ESRCH means gone.
+            // A zombie (reaped by init, not us) still answers 0, so accept
+            // either disappearance or zombie state as "terminated".
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| stat.contains(") Z"))
+                .unwrap_or(true);
+            if !alive || zombie {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(dead, "cancelled OpenCode child {pid} must not survive as a running process");
+    }
+
+    #[tokio::test]
+    async fn opencode_delete_invokes_supported_subcommand() {
+        let root = std::env::temp_dir().join(format!("lazyteam-opencode-delete-{}", Uuid::new_v4().simple()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let seen = root.join("seen");
+        // Fake backend records its argv and succeeds only for the supported
+        // `session delete <id>` shape.
+        let script = format!(
+            "if [ \"$1\" = session ] && [ \"$2\" = delete ] && [ \"$3\" = ses_gone ]; then echo ok > '{}'; exit 0; fi; exit 7",
+            seen.display()
+        );
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(&script).arg("fake-opencode").arg("session").arg("delete").arg("ses_gone");
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
+        OpenCodeRuntime::run_session_delete(&mut command, "ses_gone", Duration::from_secs(30)).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&seen).await.unwrap(), "ok\n");
+        let mut failing = tokio::process::Command::new("sh");
+        failing.arg("-c").arg("exit 7");
+        failing.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        failing.kill_on_drop(true);
+        let error = OpenCodeRuntime::run_session_delete(&mut failing, "ses_gone", Duration::from_secs(30))
+            .await
+            .expect_err("failed deletions must surface");
+        assert!(error.to_string().contains("ses_gone"), "{error}");
+        let mut hanging = tokio::process::Command::new("sh");
+        hanging.arg("-c").arg("sleep 30");
+        hanging.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        hanging.kill_on_drop(true);
+        let error = OpenCodeRuntime::run_session_delete(&mut hanging, "ses_gone", Duration::from_secs(1))
+            .await
+            .expect_err("hung deletions must time out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn opencode_commands_use_the_agent_sandbox_without_host_git() {
+        let root = std::env::temp_dir().join(format!("lazyteam-opencode-sandbox-{}", Uuid::new_v4().simple()));
+        let workspace = root.join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let sandbox = AgentSandbox::prepare(&root, "pi", None).await.unwrap();
+        let runtime = OpenCodeRuntime {
+            binary: "opencode".to_string(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            session_dir: Some(root.join("sessions")),
+            sandbox,
+        };
+        // Command construction performs no spawn: assert argv selection and
+        // that no Host Git credential material is introduced. The sandbox
+        // itself pins Git to dead-ends (see AgentSandbox::command).
+        let run = runtime.run_command(&workspace, "prompt", Some("ses_abc")).unwrap();
+        let argv: Vec<String> = run.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        // argv[0] is the sandbox launcher entrypoint, argv[1] the backend
+        // binary; everything after is the headless opencode invocation.
+        assert_eq!(argv[0], "__lazyteam-sandbox-exec");
+        assert_eq!(argv[1], "opencode");
+        assert_eq!(
+            argv[2..],
+            ["run", "--format", "json", "--model", "host-provider/host-model", "--session", "ses_abc", "prompt"]
+        );
+        let run_env: Vec<(String, String)> = run
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned())))
+            .collect();
+        assert!(run_env.iter().all(|(_, value)| !value.contains("lazyteam.example")), "no broker URLs leak");
+        assert!(run_env.iter().all(|(_, value)| !value.contains("ltc_")), "no lease capabilities leak");
+        let delete = runtime.session_delete_command("ses_abc").unwrap();
+        let argv: Vec<String> = delete.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(argv.iter().any(|arg| arg == "__lazyteam-sandbox-exec"), "deletion runs through the sandbox launcher");
+        assert_eq!(argv[argv.len() - 3..], ["session", "delete", "ses_abc"]);
+        assert!(runtime.session_delete_command("   ").is_err());
+        assert!(runtime.run_command(&workspace, "prompt", None).is_ok(), "sandbox construction itself needs no model call");
+        let unconfigured = OpenCodeRuntime { provider: None, model: None, ..runtime };
+        assert!(unconfigured.run_command(&workspace, "prompt", None).is_err(), "missing Host selection must not silently fall back");
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }
