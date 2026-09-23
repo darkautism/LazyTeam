@@ -280,8 +280,18 @@ fn is_oauth_worker_path(path: &str) -> bool {
     false
 }
 
+fn is_worker_delivery_ack_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/workers/") else { return false; };
+    let parts: Vec<&str> = rest.split('/').collect();
+    (parts.len() == 4 && parts[1] == "agent-auth" && parts[3] == "ack")
+        || (parts.len() == 5
+            && parts[1] == "models"
+            && parts[2] == "refresh"
+            && parts[4] == "ack")
+}
+
 fn is_worker_runtime_path(path: &str) -> bool {
-    if is_oauth_worker_path(path) { return true; }
+    if is_oauth_worker_path(path) || is_worker_delivery_ack_path(path) { return true; }
     (path.starts_with("/api/workers/")
         && (path.ends_with("/heartbeat")
             || path.ends_with("/claim")
@@ -549,6 +559,14 @@ mod tests {
         // The Host paste-submit endpoint stays admin-gated by middleware.
         assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/input"));
         assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login"));
+    }
+
+    #[test]
+    fn worker_delivery_ack_paths_bypass_admin() {
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/agent-auth/11111111-1111-1111-1111-111111111111/ack"));
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/models/refresh/11111111-1111-1111-1111-111111111111/ack"));
+        assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/provider-key/11111111-1111-1111-1111-111111111111/ack"));
+        assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/models/refresh"));
     }
 
     #[test]
