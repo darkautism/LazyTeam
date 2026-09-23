@@ -1455,6 +1455,7 @@ try {{
     // cache/control-plane follow-up and must never downgrade that successful
     // login to failed.
     best_effort_after_oauth_complete(async {
+        runtime.sandbox.repair_pi_state_permissions().await?;
         runtime.force_refresh_models(&claim.provider).await?;
         let capabilities = runtime.capabilities().await;
         report_capabilities(client, server, credential, worker_id, &capabilities).await?;

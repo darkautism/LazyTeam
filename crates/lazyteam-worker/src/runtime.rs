@@ -1667,7 +1667,7 @@ console.log("ok");"#
             }
             Ok::<(), anyhow::Error>(())
         }).await.context("Pi credential store helper timed out")??;
-        self.sandbox.repair_pi_auth_permissions().await?;
+        self.sandbox.repair_pi_state_permissions().await?;
         Ok(())
     }
 
@@ -1752,16 +1752,26 @@ try {{
 console.log("ok");"#
         );
         let sandbox = self.sandbox.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+        let refresh_result = match tokio::time::timeout(std::time::Duration::from_secs(20), async move {
             let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
             command.arg("--input-type=module").arg("--eval").arg(script);
+            command.kill_on_drop(true);
             command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = command.output().await.context("run Pi forced model catalog refresh")?;
             if !output.status.success() {
                 bail!("Pi model catalog refresh failed: {}", String::from_utf8_lossy(&output.stderr).trim());
             }
             Ok(())
-        }).await.context("Pi model catalog refresh timed out")?
+        }).await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::Error::new(error).context("Pi model catalog refresh timed out")),
+        };
+        let permissions_result = self.sandbox.repair_pi_state_permissions().await;
+        match (refresh_result, permissions_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {

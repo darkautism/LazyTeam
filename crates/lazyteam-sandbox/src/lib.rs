@@ -504,15 +504,17 @@ impl AgentSandbox {
         }
     }
 
-    pub async fn repair_pi_auth_permissions(&self) -> anyhow::Result<()> {
-        let auth_path = self.pi_config_dir.join("auth.json");
-        if !auth_path.exists() {
-            return Ok(());
-        }
-        if self.trusted_container_daemon {
-            set_shared_pi_file(&auth_path).await?;
-        } else {
-            set_private_file(&auth_path).await?;
+    pub async fn repair_pi_state_permissions(&self) -> anyhow::Result<()> {
+        for name in ["auth.json", "models-store.json", "models.json"] {
+            let path = self.pi_config_dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            if self.trusted_container_daemon {
+                set_shared_pi_file(&path).await?;
+            } else {
+                set_private_file(&path).await?;
+            }
         }
         Ok(())
     }
@@ -1830,6 +1832,91 @@ mod tests {
         assert!(shared_pi_metadata(SANDBOX_PI_SHARED_GID, 0o0730));
         assert!(!shared_pi_metadata(SANDBOX_PI_SHARED_GID, 0o0700));
         assert!(!shared_pi_metadata(SANDBOX_PI_SHARED_GID + 1, 0o2730));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repair_pi_state_permissions_keeps_untrusted_files_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lazyteam-pi-state-test-{}", uuid::Uuid::new_v4()));
+        let pi_config_dir = root.join("pi-agent");
+        std::fs::create_dir_all(&pi_config_dir).unwrap();
+        for name in ["auth.json", "models-store.json", "models.json"] {
+            let path = pi_config_dir.join(name);
+            std::fs::write(&path, b"{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        let sandbox = AgentSandbox {
+            state_dir: root.clone(),
+            pi_config_dir: pi_config_dir.clone(),
+            home_dir: root.join("home"),
+            cargo_home: root.join("cargo"),
+            cargo_target_dir: root.join("target"),
+            tmp_dir: root.join("tmp"),
+            probe_dir: root.join("probe"),
+            namespace_root_base: root.join("roots"),
+            read_only: Vec::new(),
+            path: OsString::new(),
+            rustup_home: None,
+            container_rootfs: None,
+            container_read_only: Vec::new(),
+            pi_package_dir: None,
+            trusted_container_daemon: false,
+            sandbox_uid_dir: root.join("uids"),
+            launcher_exe: root.join("launcher"),
+        };
+        sandbox.repair_pi_state_permissions().await.unwrap();
+        for name in ["auth.json", "models-store.json", "models.json"] {
+            let mode = std::fs::metadata(pi_config_dir.join(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} must remain private outside trusted worker mode");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repair_pi_state_permissions_shares_trusted_sandbox_files() {
+        use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::{MetadataExt, PermissionsExt}}};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("lazyteam-pi-shared-test-{}", uuid::Uuid::new_v4()));
+        let pi_config_dir = root.join("pi-agent");
+        std::fs::create_dir_all(&pi_config_dir).unwrap();
+        for name in ["auth.json", "models-store.json"] {
+            let path = pi_config_dir.join(name);
+            std::fs::write(&path, b"{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(c_path.as_ptr(), 20_000, SANDBOX_PI_SHARED_GID) }, 0);
+        }
+        let sandbox = AgentSandbox {
+            state_dir: root.clone(),
+            pi_config_dir: pi_config_dir.clone(),
+            home_dir: root.join("home"),
+            cargo_home: root.join("cargo"),
+            cargo_target_dir: root.join("target"),
+            tmp_dir: root.join("tmp"),
+            probe_dir: root.join("probe"),
+            namespace_root_base: root.join("roots"),
+            read_only: Vec::new(),
+            path: OsString::new(),
+            rustup_home: None,
+            container_rootfs: None,
+            container_read_only: Vec::new(),
+            pi_package_dir: None,
+            trusted_container_daemon: true,
+            sandbox_uid_dir: root.join("uids"),
+            launcher_exe: root.join("launcher"),
+        };
+        sandbox.repair_pi_state_permissions().await.unwrap();
+        for name in ["auth.json", "models-store.json"] {
+            let metadata = std::fs::metadata(pi_config_dir.join(name)).unwrap();
+            assert_eq!(metadata.uid(), 20_000, "repair must not steal file ownership from the sandbox UID");
+            assert_eq!(metadata.gid(), SANDBOX_PI_SHARED_GID);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
