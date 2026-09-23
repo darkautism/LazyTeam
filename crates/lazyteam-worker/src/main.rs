@@ -78,7 +78,7 @@ struct WorkerRuntimeConfig {
     #[serde(default)]
     paused: bool,
     #[serde(default)]
-    model_refresh_provider: Option<String>,
+    model_refresh: Option<AgentModelRefreshDelivery>,
 }
 
 fn default_runtime_slots() -> u32 { 1 }
@@ -88,6 +88,12 @@ struct AgentAuthDelivery {
     id: Uuid,
     provider: String,
     api_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentModelRefreshDelivery {
+    id: Uuid,
+    provider: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,8 +370,9 @@ async fn async_main() -> anyhow::Result<()> {
             ).await;
         }
     }
-    if let Some(provider) = runtime_config.model_refresh_provider.take() {
-        info!(provider = %provider, "forced model catalog refresh requested during startup");
+    if let Some(refresh) = runtime_config.model_refresh.take() {
+        let provider = refresh.provider.clone();
+        info!(provider = %provider, refresh_request = %refresh.id, "forced model catalog refresh requested during startup");
         match probe_runtime.force_refresh_models(&provider).await {
             Ok(()) => {
                 agent_capabilities = probe_runtime.capabilities().await;
@@ -378,6 +385,9 @@ async fn async_main() -> anyhow::Result<()> {
                 agent_capabilities.probe_error = Some(format!("model catalog refresh for {provider} failed: {error:#}"));
                 let _ = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await;
             }
+        }
+        if let Err(error) = ack_model_refresh(&client, &server, &worker_credential, worker_id, refresh.id).await {
+            warn!(%error, provider = %provider, refresh_request = %refresh.id, "model refresh ACK failed; request will be retried");
         }
     }
     let mut next_capability_probe = Instant::now() + Duration::from_secs(60);
@@ -473,8 +483,9 @@ async fn async_main() -> anyhow::Result<()> {
             Ok(config) => runtime_config = config,
             Err(error) => warn!(%error, "worker runtime config refresh failed; using last known config"),
         }
-        if let Some(provider) = runtime_config.model_refresh_provider.take() {
-            info!(provider = %provider, "forced model catalog refresh requested");
+        if let Some(refresh) = runtime_config.model_refresh.take() {
+            let provider = refresh.provider.clone();
+            info!(provider = %provider, refresh_request = %refresh.id, "forced model catalog refresh requested");
             match probe_runtime.force_refresh_models(&provider).await {
                 Ok(()) => {
                     agent_capabilities = probe_runtime.capabilities().await;
@@ -487,6 +498,9 @@ async fn async_main() -> anyhow::Result<()> {
                     agent_capabilities.probe_error = Some(format!("model catalog refresh for {provider} failed: {error:#}"));
                     let _ = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await;
                 }
+            }
+            if let Err(error) = ack_model_refresh(&client, &server, &worker_credential, worker_id, refresh.id).await {
+                warn!(%error, provider = %provider, refresh_request = %refresh.id, "model refresh ACK failed; request will be retried");
             }
             next_capability_probe = Instant::now() + Duration::from_secs(60);
         }
@@ -879,6 +893,21 @@ async fn poll_agent_auth(client: &Client, server: &str, credential: &str, worker
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/agent-auth")), credential).send().await?;
     if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
     Ok(Some(ensure_success(response).await?.json().await?))
+}
+
+async fn ack_model_refresh(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    request_id: Uuid,
+) -> anyhow::Result<()> {
+    let response = worker_auth(
+        client.post(format!("{server}/api/workers/{worker_id}/models/refresh/{request_id}/ack")),
+        credential,
+    ).send().await?;
+    ensure_success(response).await?;
+    Ok(())
 }
 
 async fn claim_oauth_login(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<Option<AgentOAuthClaim>> {

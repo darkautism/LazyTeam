@@ -47,7 +47,7 @@ pub(crate) struct AppState {
     pub(crate) git_credential_key: Option<[u8; 32]>,
     pub(crate) git_root: PathBuf,
     pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, PendingAgentAuth>>>,
-    pub(crate) model_refresh_requests: Arc<Mutex<HashMap<Uuid, String>>>,
+    pub(crate) model_refresh_requests: Arc<Mutex<HashMap<Uuid, std::collections::VecDeque<PendingModelRefresh>>>>,
     pub(crate) oauth_login_states: Arc<Mutex<HashMap<Uuid, AgentOAuthLoginState>>>,
     pub(crate) interactive_sandboxes: crate::interactive_sandbox::InteractiveSandboxManager,
 }
@@ -56,6 +56,12 @@ pub(crate) struct PendingAgentAuth {
     id: Uuid,
     provider: String,
     api_key: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingModelRefresh {
+    id: Uuid,
+    provider: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -415,7 +421,7 @@ struct WorkerRuntimeConfig {
     managed_capabilities: BTreeSet<String>,
     installed_capabilities: BTreeSet<String>,
     paused: bool,
-    model_refresh_provider: Option<String>,
+    model_refresh: Option<AgentModelRefreshDelivery>,
 }
 
 #[derive(Deserialize)]
@@ -443,8 +449,15 @@ struct AgentModelRefreshInput {
     provider: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AgentModelRefreshDelivery {
+    id: Uuid,
+    provider: String,
+}
+
 #[derive(Debug, Serialize)]
 struct AgentModelRefreshQueued {
+    id: Uuid,
     provider: String,
     queued: bool,
 }
@@ -592,6 +605,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/oauth-login/{request_id}/event", post(report_worker_oauth_login_event))
         .route("/api/workers/{id}/oauth-login/{request_id}/input", get(claim_worker_oauth_login_input))
         .route("/api/workers/{id}/models/refresh", post(queue_worker_model_refresh))
+        .route("/api/workers/{id}/models/refresh/{request_id}/ack", post(ack_worker_model_refresh))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
         .route("/api/workers/{id}/heartbeat", post(worker_heartbeat))
@@ -1205,7 +1219,10 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
     require_worker(&state.db, id, &headers).await?;
     let row = sqlx::query("SELECT * FROM workers WHERE id=?").bind(id.to_string()).fetch_one(&state.db).await.map_err(db_error)?;
     let worker = worker_from_row(&row)?;
-    let model_refresh_provider = state.model_refresh_requests.lock().await.remove(&id);
+    let model_refresh = state.model_refresh_requests.lock().await
+        .get(&id)
+        .and_then(|queue| queue.front())
+        .map(|request| AgentModelRefreshDelivery { id: request.id, provider: request.provider.clone() });
     Ok(Json(WorkerRuntimeConfig {
         role: worker.role,
         agent: worker.agent,
@@ -1213,7 +1230,7 @@ async fn worker_runtime_config(Path(id): Path<Uuid>, State(state): State<Arc<App
         managed_capabilities: worker.managed_capabilities,
         installed_capabilities: worker.installed_capabilities,
         paused: matches!(worker.state, WorkerState::Draining),
-        model_refresh_provider,
+        model_refresh,
     }))
 }
 
@@ -1453,8 +1470,32 @@ async fn queue_worker_model_refresh(
     if !candidate.configured {
         return Err((StatusCode::CONFLICT, "provider authentication must be configured before refreshing its model catalog".into()));
     }
-    state.model_refresh_requests.lock().await.insert(id, provider.to_string());
-    Ok(Json(AgentModelRefreshQueued { provider: provider.to_string(), queued: true }))
+    let request = PendingModelRefresh { id: Uuid::new_v4(), provider: provider.to_string() };
+    let response = AgentModelRefreshQueued { id: request.id, provider: request.provider.clone(), queued: true };
+    state.model_refresh_requests.lock().await.entry(id).or_default().push_back(request);
+    Ok(Json(response))
+}
+
+async fn ack_worker_model_refresh(
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let mut requests = state.model_refresh_requests.lock().await;
+    let mut remove_worker_queue = false;
+    if let Some(queue) = requests.get_mut(&id) {
+        if queue.front().is_some_and(|request| request.id == request_id) {
+            queue.pop_front();
+            remove_worker_queue = queue.is_empty();
+        } else if queue.iter().any(|request| request.id == request_id) {
+            return Err((StatusCode::CONFLICT, "model refresh ACK is out of order".into()));
+        }
+    }
+    if remove_worker_queue {
+        requests.remove(&id);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn update_worker_capabilities(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>, headers: HeaderMap, Json(capabilities): Json<AgentCapabilities>) -> Result<StatusCode, ApiError> {
@@ -4791,6 +4832,79 @@ mod tests {
             paste_prompt: None,
             paste_placeholder: None,
         }
+    }
+
+    #[tokio::test]
+    async fn model_refresh_delivery_waits_for_ack_and_preserves_order() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let worker_id = Uuid::new_v4();
+        seed_oauth_worker(&db, &worker_id, &now, "oauth-cred").await;
+        let catalog = serde_json::json!({
+            "model_discovery": true,
+            "providers": [
+                {"id": "key-only", "name": "Key Only", "configured": true, "api_key_label": "API key"}
+            ],
+            "models": []
+        }).to_string();
+        sqlx::query("UPDATE workers SET agent_capabilities=? WHERE id=?")
+            .bind(catalog)
+            .bind(worker_id.to_string())
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+
+        let Json(first) = queue_worker_model_refresh(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentModelRefreshInput { provider: "key-only".into() }),
+        ).await.unwrap();
+        let Json(second) = queue_worker_model_refresh(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentModelRefreshInput { provider: "key-only".into() }),
+        ).await.unwrap();
+
+        {
+            let requests = state.model_refresh_requests.lock().await;
+            let queue = requests.get(&worker_id).unwrap();
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue.front().unwrap().id, first.id);
+            assert_eq!(queue.back().unwrap().id, second.id);
+        }
+
+        let Json(config) = worker_runtime_config(
+            Path(worker_id),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        assert_eq!(config.model_refresh.as_ref().unwrap().id, first.id);
+        assert_eq!(state.model_refresh_requests.lock().await.get(&worker_id).unwrap().len(), 2);
+
+        let err = ack_worker_model_refresh(
+            Path((worker_id, second.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        ack_worker_model_refresh(
+            Path((worker_id, first.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        let Json(config) = worker_runtime_config(
+            Path(worker_id),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        assert_eq!(config.model_refresh.as_ref().unwrap().id, second.id);
+
+        ack_worker_model_refresh(
+            Path((worker_id, second.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        assert!(!state.model_refresh_requests.lock().await.contains_key(&worker_id));
     }
 
     #[tokio::test]
