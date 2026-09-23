@@ -462,6 +462,15 @@ async fn async_main() -> anyhow::Result<()> {
                     error!(%error, provider = %provider, credential_update = %update.id, "failed to store provider API key");
                 } else {
                     info!(provider = %provider, credential_update = %update.id, "provider API key stored in isolated Pi config");
+                    if let Err(error) = ack_agent_auth(
+                        &client,
+                        &server,
+                        &worker_credential,
+                        worker_id,
+                        update.id,
+                    ).await {
+                        warn!(%error, provider = %provider, credential_update = %update.id, "provider credential ACK failed; delivery will be retried");
+                    }
                     agent_capabilities = probe_runtime.capabilities().await;
                     if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                         warn!(%error, "agent capability refresh after provider credential update failed");
@@ -893,6 +902,21 @@ async fn poll_agent_auth(client: &Client, server: &str, credential: &str, worker
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/agent-auth")), credential).send().await?;
     if response.status() == StatusCode::NO_CONTENT { return Ok(None); }
     Ok(Some(ensure_success(response).await?.json().await?))
+}
+
+async fn ack_agent_auth(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    request_id: Uuid,
+) -> anyhow::Result<()> {
+    let response = worker_auth(
+        client.post(format!("{server}/api/workers/{worker_id}/agent-auth/{request_id}/ack")),
+        credential,
+    ).send().await?;
+    ensure_success(response).await?;
+    Ok(())
 }
 
 async fn ack_model_refresh(

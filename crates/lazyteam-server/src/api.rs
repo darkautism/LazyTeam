@@ -1,4 +1,4 @@
-use std::{collections::{BTreeSet, HashMap, HashSet}, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::{BTreeSet, HashMap, HashSet, VecDeque}, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -46,12 +46,13 @@ pub(crate) struct AppState {
     pub(crate) oauth_password: Option<String>,
     pub(crate) git_credential_key: Option<[u8; 32]>,
     pub(crate) git_root: PathBuf,
-    pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, PendingAgentAuth>>>,
-    pub(crate) model_refresh_requests: Arc<Mutex<HashMap<Uuid, std::collections::VecDeque<PendingModelRefresh>>>>,
+    pub(crate) agent_auth_updates: Arc<Mutex<HashMap<Uuid, VecDeque<PendingAgentAuth>>>>,
+    pub(crate) model_refresh_requests: Arc<Mutex<HashMap<Uuid, VecDeque<PendingModelRefresh>>>>,
     pub(crate) oauth_login_states: Arc<Mutex<HashMap<Uuid, AgentOAuthLoginState>>>,
     pub(crate) interactive_sandboxes: crate::interactive_sandbox::InteractiveSandboxManager,
 }
 
+#[derive(Clone)]
 pub(crate) struct PendingAgentAuth {
     id: Uuid,
     provider: String,
@@ -599,6 +600,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/config", get(worker_runtime_config))
         .route("/api/workers/{id}/provider-key", post(queue_worker_provider_key))
         .route("/api/workers/{id}/agent-auth", get(worker_agent_auth))
+        .route("/api/workers/{id}/agent-auth/{request_id}/ack", post(ack_worker_agent_auth))
         .route("/api/workers/{id}/oauth-login", get(worker_oauth_login_state).post(start_worker_oauth_login))
         .route("/api/workers/{id}/oauth-login/input", post(submit_worker_oauth_login_input))
         .route("/api/workers/{id}/oauth-login/claim", get(claim_worker_oauth_login))
@@ -1259,7 +1261,7 @@ async fn queue_worker_provider_key(
         api_key: input.api_key,
     };
     let response = AgentAuthQueued { id: update.id, provider: update.provider.clone(), queued: true };
-    state.agent_auth_updates.lock().await.insert(id, update);
+    state.agent_auth_updates.lock().await.entry(id).or_default().push_back(update);
     Ok(Json(response))
 }
 
@@ -1269,7 +1271,10 @@ async fn worker_agent_auth(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     require_worker(&state.db, id, &headers).await?;
-    let update = state.agent_auth_updates.lock().await.remove(&id);
+    let update = state.agent_auth_updates.lock().await
+        .get(&id)
+        .and_then(|queue| queue.front())
+        .cloned();
     match update {
         Some(update) => Ok(Json(AgentAuthDelivery {
             id: update.id,
@@ -1278,6 +1283,28 @@ async fn worker_agent_auth(
         }).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+async fn ack_worker_agent_auth(
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let mut updates = state.agent_auth_updates.lock().await;
+    let mut remove_worker_queue = false;
+    if let Some(queue) = updates.get_mut(&id) {
+        if queue.front().is_some_and(|update| update.id == request_id) {
+            queue.pop_front();
+            remove_worker_queue = queue.is_empty();
+        } else if queue.iter().any(|update| update.id == request_id) {
+            return Err((StatusCode::CONFLICT, "provider credential ACK is out of order".into()));
+        }
+    }
+    if remove_worker_queue {
+        updates.remove(&id);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn bounded_oauth_text(value: Option<String>, max: usize) -> Option<String> {
@@ -4833,6 +4860,69 @@ mod tests {
             paste_placeholder: None,
         }
     }
+
+    #[tokio::test]
+    async fn provider_key_delivery_waits_for_ack_and_preserves_order() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let worker_id = Uuid::new_v4();
+        seed_oauth_worker(&db, &worker_id, &now, "oauth-cred").await;
+        let state = waiting_state(db.clone());
+
+        let Json(first) = queue_worker_provider_key(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentApiKeyInput { provider: "key-only".into(), api_key: "secret-a".into() }),
+        ).await.unwrap();
+        let Json(second) = queue_worker_provider_key(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentApiKeyInput { provider: "key-only".into(), api_key: "secret-b".into() }),
+        ).await.unwrap();
+
+        {
+            let updates = state.agent_auth_updates.lock().await;
+            let queue = updates.get(&worker_id).unwrap();
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue.front().unwrap().id, first.id);
+            assert_eq!(queue.back().unwrap().id, second.id);
+        }
+
+        let response = worker_agent_auth(
+            Path(worker_id),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.agent_auth_updates.lock().await.get(&worker_id).unwrap().len(), 2);
+
+        let err = ack_worker_agent_auth(
+            Path((worker_id, second.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        ack_worker_agent_auth(
+            Path((worker_id, first.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        {
+            let updates = state.agent_auth_updates.lock().await;
+            let queue = updates.get(&worker_id).unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue.front().unwrap().id, second.id);
+        }
+
+        ack_worker_agent_auth(
+            Path((worker_id, second.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        assert!(!state.agent_auth_updates.lock().await.contains_key(&worker_id));
+    }
+
 
     #[tokio::test]
     async fn model_refresh_delivery_waits_for_ack_and_preserves_order() {
