@@ -330,6 +330,10 @@ async fn async_main() -> anyhow::Result<()> {
         persist_server_url(&args.state_dir, &server).await?;
     }
 
+    if let Err(error) = reset_stale_oauth_login(&client, &server, &worker_credential, worker_id).await {
+        warn!(%error, "failed to reset stale OAuth login state during worker startup");
+    }
+
     if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
         warn!(%error, "initial agent capability report failed");
     }
@@ -711,6 +715,20 @@ async fn register(
         .context("server did not return a worker-specific credential")?
         .to_string();
     Ok(credential)
+}
+
+async fn reset_stale_oauth_login(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+) -> anyhow::Result<()> {
+    let response = worker_auth(
+        client.post(format!("{server}/api/workers/{worker_id}/oauth-login/reset-stale")),
+        credential,
+    ).send().await?;
+    ensure_success(response).await?;
+    Ok(())
 }
 
 async fn report_capabilities(client: &Client, server: &str, credential: &str, worker_id: Uuid, capabilities: &AgentCapabilities) -> anyhow::Result<()> {

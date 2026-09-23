@@ -268,6 +268,7 @@ fn host_allowed(host: &str, allowed: &[String]) -> bool {
 fn is_oauth_worker_path(path: &str) -> bool {
     // Worker-claimed Pi OAuth traffic:
     //   /api/workers/{id}/oauth-login/claim
+    //   /api/workers/{id}/oauth-login/reset-stale
     //   /api/workers/{id}/oauth-login/{request_id}/event
     //   /api/workers/{id}/oauth-login/{request_id}/input (worker polls the
     //   Host-relayed localhost-callback paste)
@@ -276,7 +277,12 @@ fn is_oauth_worker_path(path: &str) -> bool {
     // must stay admin-only, so it is deliberately not matched here.
     let Some(rest) = path.strip_prefix("/api/workers/") else { return false; };
     let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() == 3 && parts[1] == "oauth-login" && parts[2] == "claim" { return true; }
+    if parts.len() == 3
+        && parts[1] == "oauth-login"
+        && matches!(parts[2], "claim" | "reset-stale")
+    {
+        return true;
+    }
     if parts.len() == 4 && parts[1] == "oauth-login" && (parts[3] == "event" || parts[3] == "input") { return true; }
     if parts.len() == 6
         && parts[1] == "oauth-login"
@@ -562,6 +568,7 @@ mod tests {
         // handlers: claim, event reports, callback-input polls, and the exact
         // delivery ACK route must not require the admin token.
         assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/claim"));
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/reset-stale"));
         assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/event"));
         assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/input"));
         assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/input/22222222-2222-2222-2222-222222222222/ack"));

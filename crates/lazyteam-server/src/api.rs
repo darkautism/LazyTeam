@@ -609,6 +609,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/agent-auth/{request_id}/ack", post(ack_worker_agent_auth))
         .route("/api/workers/{id}/oauth-login", get(worker_oauth_login_state).post(start_worker_oauth_login))
         .route("/api/workers/{id}/oauth-login/input", post(submit_worker_oauth_login_input))
+        .route("/api/workers/{id}/oauth-login/reset-stale", post(reset_worker_stale_oauth_login))
         .route("/api/workers/{id}/oauth-login/claim", get(claim_worker_oauth_login))
         .route("/api/workers/{id}/oauth-login/{request_id}/event", post(report_worker_oauth_login_event))
         .route("/api/workers/{id}/oauth-login/{request_id}/input", get(claim_worker_oauth_login_input))
@@ -1370,6 +1371,30 @@ async fn worker_oauth_login_state(
         Some(login) => Ok(Json(login).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+async fn reset_worker_stale_oauth_login(
+    Path(id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
+    let mut logins = state.oauth_login_states.lock().await;
+    let Some(login) = logins.get_mut(&id) else { return Ok(StatusCode::NO_CONTENT); };
+    // queued has not been claimed by any process and is safe for this fresh
+    // daemon to pick up. Terminal states are already settled. Only a claimed
+    // nonterminal request can belong to the previous worker process.
+    if !matches!(login.status.as_str(), "queued" | "complete" | "failed") {
+        login.status = "failed".into();
+        login.message = Some("Worker restarted before OAuth login completed; start sign-in again.".into());
+        login.verification_uri = None;
+        login.user_code = None;
+        login.authorization_url = None;
+        login.paste_prompt = None;
+        login.paste_placeholder = None;
+        login.pending_input = None;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn claim_worker_oauth_login(
@@ -5064,6 +5089,78 @@ mod tests {
             Json(AgentApiKeyInput { provider: "nope".into(), api_key: "secret".into() }),
         ).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn worker_startup_resets_only_claimed_nonterminal_oauth() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let worker_id = Uuid::new_v4();
+        seed_oauth_worker(&db, &worker_id, &now, "oauth-cred").await;
+        let state = waiting_state(db.clone());
+
+        let Json(queued) = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+        ).await.unwrap();
+        reset_worker_stale_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
+        assert_eq!(current.id, queued.id);
+        assert_eq!(current.status, "queued", "unclaimed OAuth must survive worker startup");
+
+        claim_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        let _ = submit_worker_oauth_login_input(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthInputSubmit { input: "synthetic-callback".into() }),
+        ).await.unwrap();
+        assert!(state.oauth_login_states.lock().await.get(&worker_id).unwrap().pending_input.is_some());
+
+        reset_worker_stale_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
+        assert_eq!(current.status, "failed");
+        assert!(current.pending_input.is_none());
+        assert!(current.authorization_url.is_none());
+        assert!(current.message.as_deref().unwrap_or_default().contains("Worker restarted"));
+
+        let Json(restarted) = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+        ).await.unwrap();
+        assert_ne!(restarted.id, queued.id);
+        claim_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        report_worker_oauth_login_event(
+            Path((worker_id, restarted.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+            Json(oauth_event("complete")),
+        ).await.unwrap();
+        reset_worker_stale_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        let terminal = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
+        assert_eq!(terminal.id, restarted.id);
+        assert_eq!(terminal.status, "complete");
     }
 
     #[tokio::test]
