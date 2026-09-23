@@ -171,8 +171,12 @@ impl AgentSandbox {
             }
             None
         };
-        let trusted_container_daemon = container_rootfs.is_some()
-            && std::env::var_os("LAZYTEAM_TRUSTED_CONTAINER_DAEMON").is_some_and(|value| value == "1");
+        // Trust is a property of the worker daemon deployment, not of whether
+        // the optional nested rootfs mount namespace is available. The outer-
+        // container Landlock fallback still runs inside the same trusted worker
+        // container and can use a private PID namespace for safe child control.
+        let trusted_container_daemon = std::env::var_os("LAZYTEAM_TRUSTED_CONTAINER_DAEMON")
+            .is_some_and(|value| value == "1");
         let pi_config_dir = state_dir.join("pi-agent");
         let home_dir = state_dir.join("agent-home");
         let cargo_home = state_dir.join("agent-cache").join("cargo");
@@ -602,8 +606,8 @@ fn sandbox_exec(mut args: Vec<OsString>, enter_container: bool) -> anyhow::Resul
     // namespace so an agent may safely terminate/reap its own descendants
     // without gaining a PID that addresses the worker daemon or a sibling.
     #[cfg(target_os = "linux")]
-    if enter_container && spec.trusted_container_daemon {
-        return sandbox_exec_in_pid_namespace(program, args, &spec);
+    if spec.trusted_container_daemon {
+        return sandbox_exec_in_pid_namespace(program, args, &spec, enter_container);
     }
 
     if enter_container {
@@ -620,6 +624,7 @@ fn sandbox_exec_in_pid_namespace(
     program: OsString,
     args: Vec<OsString>,
     spec: &SandboxSpec,
+    enter_container: bool,
 ) -> anyhow::Result<()> {
     // CLONE_NEWPID applies to subsequently-created children. The original
     // helper remains outside the namespace as a trusted supervisor so the
@@ -643,10 +648,13 @@ fn sandbox_exec_in_pid_namespace(
         bail!("set agent pid namespace parent-death signal failed: {}", std::io::Error::last_os_error());
     }
 
-    // Perform mount/chroot work in this trusted namespace-init helper. The
-    // target applies Landlock (or its namespace fallback) before dropping its
-    // inherited namespace capabilities, so fail-closed fallback remains usable.
-    enter_agent_container(spec)?;
+    // Perform optional mount/chroot work in this trusted namespace-init helper.
+    // When the nested rootfs is unavailable we intentionally keep the existing
+    // outer-container Landlock filesystem policy, but still retain PID
+    // isolation so child signalling remains safe.
+    if enter_container {
+        enter_agent_container(spec)?;
+    }
     enable_agent_no_new_privs()?;
 
     let target_pid = unsafe { libc::fork() };
