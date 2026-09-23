@@ -1647,9 +1647,14 @@ console.log("ok");"#
         );
         let payload = serde_json::to_vec(&json!({"provider": provider, "key": api_key}))?;
         let sandbox = self.sandbox.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+        // Pi's proper-lockfile backend can legitimately wait up to 30s
+        // for an existing credential writer. Stay above that window, but make
+        // timeout cancellation kill the helper so a failed delivery cannot
+        // perform a delayed credential write after the worker starts retrying.
+        tokio::time::timeout(std::time::Duration::from_secs(35), async move {
             let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
             command.arg("--input-type=module").arg("--eval").arg(script);
+            command.kill_on_drop(true);
             command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
             let mut child = command.spawn().context("spawn Pi credential store helper")?;
             let mut stdin = child.stdin.take().context("Pi credential store helper stdin missing")?;
