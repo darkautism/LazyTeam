@@ -378,6 +378,25 @@ impl AgentSandbox {
                         }
                     }
                 }
+
+                // The image-bundled Pi entrypoint is a Node script outside the
+                // managed state tree. Nested Ubuntu rootfs mode therefore needs
+                // the Pi package tree and the Node interpreter admitted at their
+                // original absolute paths. Managed npm updates live under
+                // state/pi-runtime and are already covered by the stable runtime
+                // root above, so this only broadens the bundled fallback closure.
+                if container_rootfs.is_some() && !target.starts_with(&state_dir) {
+                    if let Some(package_root) = nearest_package_root(&target) {
+                        read_only.insert(package_root.clone());
+                        container_read_only.insert(package_root);
+                    }
+                    if let Some(node) = resolve_program("node", &host_path)
+                        .and_then(|path| std::fs::canonicalize(path).ok())
+                    {
+                        read_only.insert(node.clone());
+                        container_read_only.insert(node);
+                    }
+                }
             }
         }
 
@@ -1670,6 +1689,17 @@ fn resolve_program(program: &str, path: &OsStr) -> Option<PathBuf> {
 
 fn path_depth(path: &Path) -> usize { path.components().count() }
 
+fn nearest_package_root(target: &Path) -> Option<PathBuf> {
+    let mut current = target.parent();
+    while let Some(dir) = current {
+        if dir.join("package.json").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
 fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
     let mut common = PathBuf::new();
     for (a, b) in a.components().zip(b.components()) {
@@ -1890,6 +1920,18 @@ mod tests {
             Path::new("/opt/pi/lib/node_modules/pi/cli.js"),
         ).unwrap();
         assert_eq!(root, PathBuf::from("/opt/pi"));
+    }
+
+    #[test]
+    fn nearest_package_root_finds_node_package_without_admitting_parent_node_modules() {
+        let root = std::env::temp_dir().join(format!("lazyteam-package-root-{}", uuid::Uuid::new_v4()));
+        let package = root.join("node_modules").join("@scope").join("pi");
+        let target = package.join("dist").join("bundle").join("cli.js");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(package.join("package.json"), b"{}\n").unwrap();
+        std::fs::write(&target, b"#!/usr/bin/env node\n").unwrap();
+        assert_eq!(nearest_package_root(&target), Some(package));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

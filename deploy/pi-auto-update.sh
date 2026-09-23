@@ -25,12 +25,32 @@ current_version() {
 
 ensure_runtime_link() {
   mkdir -p "$RUNTIME_DIR/bin" "$RUNTIME_DIR/versions"
-  if [ ! -x "$RUNTIME_DIR/bin/pi" ]; then
-    [ -n "$BUNDLED_PI" ] && [ -x "$BUNDLED_PI" ] || return 1
+  [ -n "$BUNDLED_PI" ] && [ -x "$BUNDLED_PI" ] || return 1
+  bundled_target="$(readlink -f "$BUNDLED_PI" 2>/dev/null || true)"
+  [ -n "$bundled_target" ] && [ -x "$bundled_target" ] || bundled_target="$BUNDLED_PI"
+
+  target="$RUNTIME_DIR/bin/pi"
+  if [ ! -x "$target" ]; then
     tmp="$RUNTIME_DIR/bin/.pi-link.$$"
-    rm -f "$tmp" "$RUNTIME_DIR/bin/pi"
-    ln -s "$BUNDLED_PI" "$tmp"
-    mv -Tf "$tmp" "$RUNTIME_DIR/bin/pi"
+    rm -f "$tmp" "$target"
+    ln -s "$bundled_target" "$tmp"
+    mv -Tf "$tmp" "$target"
+    return 0
+  fi
+
+  # Older workers linked the managed entrypoint to /usr/local/bin/pi. That
+  # indirection escapes the nested Ubuntu rootfs even when the canonical Pi
+  # package is admitted read-only. Normalize only the bundled-runtime case;
+  # versioned managed installs under $RUNTIME_DIR remain untouched.
+  current_target="$(readlink -f "$target" 2>/dev/null || true)"
+  if [ -n "$current_target" ] && [ "$current_target" = "$bundled_target" ]; then
+    current_link="$(readlink "$target" 2>/dev/null || true)"
+    if [ "$current_link" != "$bundled_target" ]; then
+      tmp="$RUNTIME_DIR/bin/.pi-link.$$"
+      rm -f "$tmp"
+      ln -s "$bundled_target" "$tmp"
+      mv -Tf "$tmp" "$target"
+    fi
   fi
 }
 

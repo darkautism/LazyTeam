@@ -334,6 +334,23 @@ async fn async_main() -> anyhow::Result<()> {
         &mut agent_sandbox, &mut probe_runtime,
     ).await {
         Ok(()) => {
+            // A previous worker process may have left the Host in degraded state
+            // after a provisioning/sandbox failure. Successful startup proves the
+            // persisted rootfs is usable again even when the installed capability
+            // set itself did not change, so explicitly recover the control-plane
+            // state before attempting claims.
+            let tail = capability_build_log_tail(&args.state_dir).await;
+            if let Err(error) = report_capability_build(
+                &client,
+                &server,
+                &worker_credential,
+                worker_id,
+                &local_installed_capabilities,
+                "ready",
+                &tail,
+            ).await {
+                warn!(%error, "startup capability-ready recovery report failed");
+            }
             agent_capabilities = probe_runtime.capabilities().await;
             if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                 warn!(%error, "agent capability refresh after rootfs reconciliation failed");
