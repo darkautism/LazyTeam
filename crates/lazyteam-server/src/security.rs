@@ -270,13 +270,21 @@ fn is_oauth_worker_path(path: &str) -> bool {
     //   /api/workers/{id}/oauth-login/claim
     //   /api/workers/{id}/oauth-login/{request_id}/event
     //   /api/workers/{id}/oauth-login/{request_id}/input (worker polls the
-    //   Host-relayed localhost-callback paste; consume-once).
+    //   Host-relayed localhost-callback paste)
+    //   /api/workers/{id}/oauth-login/{request_id}/input/{input_id}/ack
     // The Host paste-submit endpoint (/api/workers/{id}/oauth-login/input)
     // must stay admin-only, so it is deliberately not matched here.
     let Some(rest) = path.strip_prefix("/api/workers/") else { return false; };
     let parts: Vec<&str> = rest.split('/').collect();
     if parts.len() == 3 && parts[1] == "oauth-login" && parts[2] == "claim" { return true; }
     if parts.len() == 4 && parts[1] == "oauth-login" && (parts[3] == "event" || parts[3] == "input") { return true; }
+    if parts.len() == 6
+        && parts[1] == "oauth-login"
+        && parts[3] == "input"
+        && parts[5] == "ack"
+    {
+        return true;
+    }
     false
 }
 
@@ -551,13 +559,16 @@ mod tests {
     #[test]
     fn pi_oauth_worker_paths_bypass_admin_but_host_relay_stays_admin() {
         // Worker-claimed Pi OAuth traffic authenticates per-worker in the
-        // handlers: claim, event reports, and consume-once callback-input
-        // polls must not require the admin token.
+        // handlers: claim, event reports, callback-input polls, and the exact
+        // delivery ACK route must not require the admin token.
         assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/claim"));
         assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/event"));
         assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/input"));
-        // The Host paste-submit endpoint stays admin-gated by middleware.
+        assert!(is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/input/22222222-2222-2222-2222-222222222222/ack"));
+        // The Host paste-submit endpoint and malformed ACK lookalikes stay
+        // admin-gated by middleware.
         assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/input"));
+        assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login/11111111-1111-1111-1111-111111111111/input/ack"));
         assert!(!is_worker_runtime_path("/api/workers/00000000-0000-0000-0000-000000000000/oauth-login"));
     }
 

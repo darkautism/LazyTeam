@@ -91,10 +91,16 @@ pub(crate) struct AgentOAuthLoginState {
     #[serde(skip_serializing_if = "Option::is_none")]
     paste_placeholder: Option<String>,
     /// Single-use pasted redirect URL/code from the Host. In-memory only,
-    /// never serialized to UI responses, logs, or Host durable storage;
-    /// consumed once by the worker's isolated Pi auth exchange.
+    /// never serialized to UI responses, logs, or Host durable storage.
+    /// Delivery is acknowledged only after the worker writes it to Pi stdin.
     #[serde(skip_serializing)]
-    pending_input: Option<String>,
+    pending_input: Option<PendingOAuthInput>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOAuthInput {
+    id: Uuid,
+    input: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,8 +123,8 @@ struct AgentOAuthEventInput {
 #[derive(Debug, Deserialize)]
 struct AgentOAuthInputSubmit { input: String }
 
-#[derive(Debug, Serialize)]
-struct AgentOAuthInputDelivery { input: String }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentOAuthInputDelivery { id: Uuid, input: String }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(crate) struct HostSettings {
@@ -606,6 +612,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/oauth-login/claim", get(claim_worker_oauth_login))
         .route("/api/workers/{id}/oauth-login/{request_id}/event", post(report_worker_oauth_login_event))
         .route("/api/workers/{id}/oauth-login/{request_id}/input", get(claim_worker_oauth_login_input))
+        .route("/api/workers/{id}/oauth-login/{request_id}/input/{input_id}/ack", post(ack_worker_oauth_login_input))
         .route("/api/workers/{id}/models/refresh", post(queue_worker_model_refresh))
         .route("/api/workers/{id}/models/refresh/{request_id}/ack", post(ack_worker_model_refresh))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
@@ -1452,7 +1459,7 @@ async fn submit_worker_oauth_login_input(
     if !matches!(login.status.as_str(), "awaiting_authorization" | "awaiting_callback" | "running" | "waiting_user") {
         return Err((StatusCode::CONFLICT, format!("OAuth login is {} and is not waiting for input", login.status)));
     }
-    login.pending_input = Some(pasted);
+    login.pending_input = Some(PendingOAuthInput { id: Uuid::new_v4(), input: pasted });
     if login.status != "awaiting_callback" {
         login.status = "awaiting_callback".into();
     }
@@ -1460,22 +1467,38 @@ async fn submit_worker_oauth_login_input(
     Ok(Json(login.clone()))
 }
 
-/// Worker poll for Host-relayed OAuth callback input. Consume-once: a stored
-/// paste is returned exactly once, then cleared, so a retried poll cannot
-/// replay a single-use authorization code.
+/// Worker poll for Host-relayed OAuth callback input. Delivery is
+/// at-least-once until the worker ACKs successful handoff to Pi stdin.
 async fn claim_worker_oauth_login_input(
     Path((id, request_id)): Path<(Uuid, Uuid)>,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     require_worker(&state.db, id, &headers).await?;
+    let logins = state.oauth_login_states.lock().await;
+    let login = logins.get(&id).ok_or((StatusCode::NOT_FOUND, "OAuth login not found".into()))?;
+    if login.id != request_id { return Err((StatusCode::CONFLICT, "OAuth login request was replaced".into())); }
+    match login.pending_input.as_ref() {
+        Some(input) => Ok(Json(AgentOAuthInputDelivery { id: input.id, input: input.input.clone() }).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+async fn ack_worker_oauth_login_input(
+    Path((id, request_id, input_id)): Path<(Uuid, Uuid, Uuid)>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_worker(&state.db, id, &headers).await?;
     let mut logins = state.oauth_login_states.lock().await;
     let login = logins.get_mut(&id).ok_or((StatusCode::NOT_FOUND, "OAuth login not found".into()))?;
     if login.id != request_id { return Err((StatusCode::CONFLICT, "OAuth login request was replaced".into())); }
-    match login.pending_input.take() {
-        Some(input) => Ok(Json(AgentOAuthInputDelivery { input }).into_response()),
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    if login.pending_input.as_ref().is_some_and(|input| input.id == input_id) {
+        login.pending_input = None;
+    } else if login.pending_input.is_some() {
+        return Err((StatusCode::CONFLICT, "OAuth callback input was replaced".into()));
     }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn queue_worker_model_refresh(
@@ -5081,14 +5104,26 @@ mod tests {
         let raw = serde_json::to_value(&updated).unwrap();
         assert!(raw.get("pending_input").is_none(), "pasted code must never serialize to Host UI");
         assert!(!raw.to_string().contains("code=abc"), "pasted code must never leak into UI responses");
-        // The worker consumes the paste exactly once; replays see nothing.
+        // The worker can refetch the same paste until it ACKs the
+        // successful handoff to Pi stdin.
         let first = claim_worker_oauth_login_input(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         let body = axum::body::to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
-        let delivery: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(delivery.get("input").and_then(|v| v.as_str()), Some("http://localhost:1455/auth/callback?code=abc&state=xyz"));
+        let delivery: AgentOAuthInputDelivery = serde_json::from_slice(&body).unwrap();
+        assert_eq!(delivery.input, "http://localhost:1455/auth/callback?code=abc&state=xyz");
         let second = claim_worker_oauth_login_input(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
-        assert_eq!(second.status(), StatusCode::NO_CONTENT);
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(second.into_body(), 1024 * 1024).await.unwrap();
+        let redelivery: AgentOAuthInputDelivery = serde_json::from_slice(&body).unwrap();
+        assert_eq!(redelivery.id, delivery.id);
+        assert_eq!(redelivery.input, delivery.input);
+        ack_worker_oauth_login_input(
+            Path((worker_id, login.id, delivery.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+        ).await.unwrap();
+        let consumed = claim_worker_oauth_login_input(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
+        assert_eq!(consumed.status(), StatusCode::NO_CONTENT);
         // A replaced login request cannot consume another request's paste.
         let err = claim_worker_oauth_login_input(Path((worker_id, Uuid::new_v4())), State(state.clone()), worker_headers("oauth-cred")).await.unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);

@@ -119,8 +119,8 @@ struct PiOAuthWireEvent {
     #[serde(default)] selection: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct AgentOAuthInputDelivery { input: String }
+#[derive(Debug, Clone, Deserialize)]
+struct AgentOAuthInputDelivery { id: Uuid, input: String }
 
 #[derive(Debug, Deserialize)]
 struct WorkerCleanup {
@@ -984,7 +984,7 @@ async fn poll_oauth_callback_input(
     worker_id: Uuid,
     request_id: Uuid,
     timeout: Duration,
-) -> Option<String> {
+) -> Option<AgentOAuthInputDelivery> {
     let deadline = Instant::now() + timeout;
     loop {
         if Instant::now() >= deadline { return None; }
@@ -995,8 +995,8 @@ async fn poll_oauth_callback_input(
             Ok(response) if response.status() == StatusCode::OK => {
                 match response.json::<AgentOAuthInputDelivery>().await {
                     Ok(delivery) if !delivery.input.trim().is_empty() => {
-                        info!(oauth_request = %request_id, input_chars = delivery.input.chars().count(), "received Host-relayed OAuth callback paste");
-                        return Some(delivery.input);
+                        info!(oauth_request = %request_id, input_delivery = %delivery.id, input_chars = delivery.input.chars().count(), "received Host-relayed OAuth callback paste");
+                        return Some(delivery);
                     }
                     Ok(_) => {}
                     Err(error) => warn!(%error, "failed to parse relayed OAuth callback input"),
@@ -1007,6 +1007,24 @@ async fn poll_oauth_callback_input(
         }
         sleep(Duration::from_secs(2)).await;
     }
+}
+
+async fn ack_oauth_callback_input(
+    client: &Client,
+    server: &str,
+    credential: &str,
+    worker_id: Uuid,
+    request_id: Uuid,
+    input_id: Uuid,
+) -> anyhow::Result<()> {
+    let response = worker_auth(
+        client.post(format!(
+            "{server}/api/workers/{worker_id}/oauth-login/{request_id}/input/{input_id}/ack"
+        )),
+        credential,
+    ).send().await?;
+    ensure_success(response).await?;
+    Ok(())
 }
 
 /// Paste waiter injected into the Pi OAuth helper script (plain JS, single
@@ -1047,25 +1065,28 @@ struct OAuthDriverOutcome {
 /// after reporting; stdin write failures are tolerated because the helper
 /// may already have moved on via its local callback. Pasted values are only
 /// ever written to helper stdin; only their lengths reach logs.
-async fn drive_oauth_wire_loop<R, W, F, Fut, S>(
+async fn drive_oauth_wire_loop<R, W, F, Fut, S, A, AFut>(
     reader: R,
     mut stdin: W,
     report: F,
     start_poll: S,
+    ack_input: A,
 ) -> OAuthDriverOutcome
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
     F: Fn(AgentOAuthEventReport) -> Fut,
     Fut: std::future::Future<Output = ()>,
-    S: Fn() -> tokio::task::JoinHandle<Option<String>>,
+    S: Fn() -> tokio::task::JoinHandle<Option<AgentOAuthInputDelivery>>,
+    A: Fn(Uuid) -> AFut,
+    AFut: std::future::Future<Output = ()>,
 {
     enum Step {
         Line(Option<String>),
-        Input(Option<String>),
+        Input(Option<AgentOAuthInputDelivery>),
     }
     let mut lines = BufReader::new(reader).lines();
-    let mut pending: Option<tokio::task::JoinHandle<Option<String>>> = None;
+    let mut pending: Option<tokio::task::JoinHandle<Option<AgentOAuthInputDelivery>>> = None;
     let mut completed = false;
     let mut failed_reported = false;
     loop {
@@ -1180,9 +1201,11 @@ where
             Step::Input(input) => {
                 pending = None;
                 match input {
-                    Some(pasted) => {
-                        if let Err(error) = write_oauth_paste(&mut stdin, &pasted).await {
-                            warn!(%error, paste_chars = pasted.chars().count(), "failed to forward relayed OAuth paste to Pi helper");
+                    Some(delivery) => {
+                        if let Err(error) = write_oauth_paste(&mut stdin, &delivery.input).await {
+                            warn!(%error, input_delivery = %delivery.id, paste_chars = delivery.input.chars().count(), "failed to forward relayed OAuth paste to Pi helper");
+                        } else {
+                            ack_input(delivery.id).await;
                         }
                     }
                     None => {
@@ -1297,6 +1320,9 @@ try {{
     let poll_client = client.clone();
     let poll_server = server.to_string();
     let poll_credential = credential.to_string();
+    let ack_client = client.clone();
+    let ack_server = server.to_string();
+    let ack_credential = credential.to_string();
     let OAuthDriverOutcome { completed, failed_reported } = drive_oauth_wire_loop(
         stdout,
         stdin,
@@ -1325,6 +1351,23 @@ try {{
                 claim.id,
                 Duration::from_secs(600),
             ))
+        },
+        |input_id| {
+            let ack_client = ack_client.clone();
+            let ack_server = ack_server.clone();
+            let ack_credential = ack_credential.clone();
+            async move {
+                if let Err(error) = ack_oauth_callback_input(
+                    &ack_client,
+                    &ack_server,
+                    &ack_credential,
+                    worker_id,
+                    claim.id,
+                    input_id,
+                ).await {
+                    warn!(%error, oauth_request = %claim.id, input_delivery = %input_id, "OAuth callback input ACK failed; delivery may be retried");
+                }
+            }
         },
     )
     .await;
@@ -2941,7 +2984,8 @@ mod tests {
         stdin_view: tokio::io::DuplexStream,
         reports: Arc<tokio::sync::Mutex<Vec<AgentOAuthEventReport>>>,
         poll_aborted: Arc<AtomicBool>,
-        input_tx: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+        input_tx: Option<tokio::sync::oneshot::Sender<Option<AgentOAuthInputDelivery>>>,
+        acked: Arc<tokio::sync::Mutex<Vec<Uuid>>>,
         outcome: tokio::task::JoinHandle<OAuthDriverOutcome>,
     }
 
@@ -2951,10 +2995,12 @@ mod tests {
             let (helper_stdin, stdin_view) = tokio::io::duplex(4096);
             let reports = Arc::new(tokio::sync::Mutex::new(Vec::new()));
             let poll_aborted = Arc::new(AtomicBool::new(false));
-            let (input_tx, input_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+            let (input_tx, input_rx) = tokio::sync::oneshot::channel::<Option<AgentOAuthInputDelivery>>();
             let input_cell = Arc::new(tokio::sync::Mutex::new(Some(input_rx)));
+            let acked = Arc::new(tokio::sync::Mutex::new(Vec::new()));
             let worker_reports = reports.clone();
             let worker_aborted = poll_aborted.clone();
+            let worker_acked = acked.clone();
             let outcome = tokio::spawn(drive_oauth_wire_loop(
                 feed_read,
                 helper_stdin,
@@ -2980,6 +3026,12 @@ mod tests {
                         }
                     })
                 },
+                move |input_id| {
+                    let worker_acked = worker_acked.clone();
+                    async move {
+                        worker_acked.lock().await.push(input_id);
+                    }
+                },
             ));
             Self {
                 feed,
@@ -2987,6 +3039,7 @@ mod tests {
                 reports,
                 poll_aborted,
                 input_tx: Some(input_tx),
+                acked,
                 outcome,
             }
         }
@@ -3011,12 +3064,31 @@ mod tests {
             .expect("reports must arrive");
         }
 
-        fn answer_poll(&mut self, value: Option<String>) {
+        fn answer_poll(&mut self, value: Option<String>) -> Option<Uuid> {
+            let id = value.as_ref().map(|_| Uuid::new_v4());
+            let delivery = value.map(|input| AgentOAuthInputDelivery {
+                id: id.expect("delivery id exists for pasted input"),
+                input,
+            });
             self.input_tx
                 .take()
                 .expect("single manual_code prompt per login")
-                .send(value)
+                .send(delivery)
                 .expect("poll task must be waiting");
+            id
+        }
+
+        async fn wait_for_ack(&self, expected: Uuid) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if self.acked.lock().await.contains(&expected) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("input delivery ACK must arrive");
         }
 
         async fn read_stdin_bytes(&mut self, count: usize) -> Vec<u8> {
@@ -3106,9 +3178,10 @@ mod tests {
         let mut driver = GatedDriver::spawn();
         driver.feed_line(&wire_prompt()).await;
         driver.wait_for_reports(1).await;
-        driver.answer_poll(Some(paste.to_string()));
+        let delivery_id = driver.answer_poll(Some(paste.to_string())).expect("paste delivery id");
         let stdin_bytes = driver.read_stdin_bytes(paste.len() + 1).await;
         assert_eq!(stdin_bytes, format!("{paste}\n").into_bytes());
+        driver.wait_for_ack(delivery_id).await;
         let (outcome, kinds, _, _) = driver.finish().await;
         assert!(!outcome.completed);
         assert!(!outcome.failed_reported);
