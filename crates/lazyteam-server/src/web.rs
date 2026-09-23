@@ -336,6 +336,16 @@ mod tests {
     }
 
     #[test]
+    fn model_refresh_button_is_in_flight_scoped_and_reenabled() {
+        assert!(INDEX.contains("providerModelRefreshInFlight"));
+        assert!(INDEX.contains("providerModelRefreshInFlight===refreshKey"));
+        assert!(INDEX.contains("providerModelRefreshInFlight=null"));
+        assert!(INDEX.contains("configuringWorkerId===w.id"));
+        assert!(INDEX.contains("$('#worker-config-provider').value===provider"));
+        assert!(INDEX.contains("button.disabled=false"));
+    }
+
+    #[test]
     fn remote_oauth_url_and_paste_completion_are_surfaced() {
         // Pi's browser OAuth redirects to worker-local localhost, so the
         // Host UI must surface the real authorization URL in a copyable
