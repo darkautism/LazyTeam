@@ -1675,17 +1675,23 @@ console.log(JSON.stringify(providers));"#
 
     pub async fn force_refresh_models(&self, provider: &str) -> anyhow::Result<()> {
         let index = self.pi_module_index()?;
+        let dist = index.parent().context("Pi public module missing dist parent")?;
         let import_url = serde_json::to_string(&format!("file://{}", index.display()))?;
+        let auth_storage_url = serde_json::to_string(&format!(
+            "file://{}",
+            dist.join("core").join("auth-storage.js").display()
+        ))?;
         let provider = serde_json::to_string(provider)?;
         let script = format!(
             r#"import {{ ModelRuntime }} from {import_url};
+import {{ ReadOnlyAuthStorage }} from {auth_storage_url};
 const dir=process.env.PI_CODING_AGENT_DIR;
 const provider={provider};
 const controller=new AbortController();
 const timeout=setTimeout(()=>controller.abort(),15000);
 try {{
   const rt=await ModelRuntime.create({{
-    authPath:dir+"/auth.json",
+    credentials:new ReadOnlyAuthStorage(dir+"/auth.json"),
     modelsPath:dir+"/models.json",
     modelsStorePath:dir+"/models-store.json",
     allowModelNetwork:false,
