@@ -297,7 +297,12 @@ impl AgentSandbox {
                     set_shared_pi_file(&path).await?;
                 }
             }
-        } else {
+        } else if !shared_pi_dir_marker(&pi_config_dir).await? {
+            // Auxiliary diagnostics can prepare the same persisted worker state
+            // without inheriting the entrypoint-only trusted-daemon environment.
+            // Never downgrade an already shared credential directory to 0700:
+            // doing so strands the next per-task UID outside the worker-scoped
+            // auth store and Pi can recreate auth.json as an empty object.
             set_private_dir(&pi_config_dir).await?;
         }
         let host_path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
@@ -1751,13 +1756,37 @@ async fn set_private_dir(path: &Path) -> anyhow::Result<()> {
 async fn set_private_dir(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(unix)]
+fn shared_pi_metadata(gid: u32, mode: u32) -> bool {
+    gid == SANDBOX_PI_SHARED_GID && mode & 0o070 == 0o030
+}
+
+#[cfg(unix)]
+async fn shared_pi_dir_marker(path: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::{fs::MetadataExt, fs::PermissionsExt};
+    let metadata = tokio::fs::metadata(path).await?;
+    Ok(shared_pi_metadata(metadata.gid(), metadata.permissions().mode()))
+}
+
+#[cfg(not(unix))]
+async fn shared_pi_dir_marker(_path: &Path) -> anyhow::Result<bool> { Ok(false) }
+
+#[cfg(unix)]
 async fn set_shared_pi_dir(path: &Path) -> anyhow::Result<()> {
-    use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::PermissionsExt}};
+    use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::{MetadataExt, PermissionsExt}}};
     let c_path = CString::new(path.as_os_str().as_bytes()).context("Pi config path contains NUL")?;
     if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, SANDBOX_PI_SHARED_GID) } != 0 {
         bail!("set Pi config shared group failed: {}", std::io::Error::last_os_error());
     }
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2730)).await?;
+    let metadata = tokio::fs::metadata(path).await?;
+    let mode = metadata.permissions().mode();
+    if metadata.gid() != SANDBOX_PI_SHARED_GID || mode & 0o2000 == 0 || !shared_pi_metadata(metadata.gid(), mode) {
+        bail!(
+            "Pi config shared permissions did not persist (gid={}, mode={:o}); worker container requires CAP_FSETID",
+            metadata.gid(),
+            mode & 0o7777,
+        );
+    }
     Ok(())
 }
 
@@ -1791,6 +1820,18 @@ async fn set_private_file(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_pi_marker_survives_missing_setgid_but_rejects_private_dir() {
+        assert!(shared_pi_metadata(SANDBOX_PI_SHARED_GID, 0o2730));
+        // A deployment missing CAP_FSETID may have already lost setgid.
+        // The marker must still prevent an auxiliary diagnostic from
+        // downgrading the worker-scoped directory to 0700.
+        assert!(shared_pi_metadata(SANDBOX_PI_SHARED_GID, 0o0730));
+        assert!(!shared_pi_metadata(SANDBOX_PI_SHARED_GID, 0o0700));
+        assert!(!shared_pi_metadata(SANDBOX_PI_SHARED_GID + 1, 0o2730));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -13,6 +13,7 @@ output="$(
     --cap-drop ALL \
     --cap-add CHOWN \
     --cap-add DAC_OVERRIDE \
+    --cap-add FSETID \
     --cap-add SYS_ADMIN \
     --cap-add SYS_CHROOT \
     --cap-add SETGID \

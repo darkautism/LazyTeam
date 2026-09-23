@@ -23,6 +23,7 @@ services:
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
+      - FSETID
       - SYS_ADMIN
       - SYS_CHROOT
       - SETGID
