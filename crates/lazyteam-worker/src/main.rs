@@ -440,9 +440,13 @@ async fn async_main() -> anyhow::Result<()> {
                             let report = AgentOAuthEventReport {
                                 kind: "failed".into(), message: Some(error.to_string()), verification_uri: None, user_code: None, authorization_url: None, paste_prompt: None, paste_placeholder: None,
                             };
-                            let _ = report_oauth_event(
-                                &oauth_client, &oauth_server, &oauth_credential, worker_id, oauth_request, &report,
-                            ).await;
+                            if retry_oauth_terminal_report(oauth_request, "failed", || {
+                                report_oauth_event(
+                                    &oauth_client, &oauth_server, &oauth_credential, worker_id, oauth_request, &report,
+                                )
+                            }).await.is_err() {
+                                warn!(oauth_request = %oauth_request, event_kind = "failed", "terminal OAuth report exhausted retries");
+                            }
                         }
                         result
                     }));
@@ -958,6 +962,29 @@ async fn claim_oauth_login(client: &Client, server: &str, credential: &str, work
     Ok(Some(ensure_success(response).await?.json().await?))
 }
 
+async fn retry_oauth_terminal_report<F, Fut>(
+    request_id: Uuid,
+    kind: &str,
+    mut operation: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == ATTEMPTS => return Err(error),
+            Err(_) => {
+                warn!(oauth_request = %request_id, event_kind = kind, attempt, "terminal OAuth report failed; retrying");
+                sleep(Duration::from_millis(250 * attempt as u64)).await;
+            }
+        }
+    }
+    unreachable!("terminal OAuth retry loop always returns")
+}
+
 async fn report_oauth_event(
     client: &Client,
     server: &str,
@@ -1358,15 +1385,29 @@ try {{
             let report_server = report_server.clone();
             let report_credential = report_credential.clone();
             async move {
-                let _ = report_oauth_event(
-                    &report_client,
-                    &report_server,
-                    &report_credential,
-                    worker_id,
-                    claim.id,
-                    &event,
-                )
-                .await;
+                if matches!(event.kind.as_str(), "complete" | "failed") {
+                    if retry_oauth_terminal_report(claim.id, &event.kind, || {
+                        report_oauth_event(
+                            &report_client,
+                            &report_server,
+                            &report_credential,
+                            worker_id,
+                            claim.id,
+                            &event,
+                        )
+                    }).await.is_err() {
+                        warn!(oauth_request = %claim.id, event_kind = %event.kind, "terminal OAuth report exhausted retries");
+                    }
+                } else {
+                    let _ = report_oauth_event(
+                        &report_client,
+                        &report_server,
+                        &report_credential,
+                        worker_id,
+                        claim.id,
+                        &event,
+                    ).await;
+                }
             }
         },
         || {
@@ -1403,7 +1444,11 @@ try {{
         let report = AgentOAuthEventReport {
             kind: "failed".into(), message: Some(format!("Pi OAuth helper exited with {status}")), verification_uri: None, user_code: None, authorization_url: None, paste_prompt: None, paste_placeholder: None,
         };
-        let _ = report_oauth_event(client, server, credential, worker_id, claim.id, &report).await;
+        if retry_oauth_terminal_report(claim.id, "failed", || {
+            report_oauth_event(client, server, credential, worker_id, claim.id, &report)
+        }).await.is_err() {
+            warn!(oauth_request = %claim.id, event_kind = "failed", "terminal OAuth report exhausted retries");
+        }
     }
     if !completed { anyhow::bail!("Pi OAuth login did not complete successfully"); }
     // Pi's complete event is the credential commit point. Anything below is
@@ -3219,6 +3264,22 @@ mod tests {
         assert!(!outcome.completed);
         assert!(!outcome.failed_reported);
         assert_eq!(kinds, vec!["awaiting_input"]);
+    }
+
+    #[tokio::test]
+    async fn oauth_terminal_report_retries_until_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        retry_oauth_terminal_report(Uuid::new_v4(), "complete", move || {
+            let counter = counter.clone();
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt < 3 { anyhow::bail!("synthetic transport failure"); }
+                Ok(())
+            }
+        }).await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

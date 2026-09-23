@@ -5256,8 +5256,9 @@ mod tests {
         let mut done = oauth_event("complete");
         done.message = Some("Pi stored the OAuth credential in this worker's isolated auth store.".into());
         report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(done)).await.unwrap();
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(oauth_event("complete"))).await.unwrap();
         let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
-        assert_eq!(current.status, "complete");
+        assert_eq!(current.status, "complete", "duplicate terminal complete reports must be idempotent");
         let raw = serde_json::to_value(&current).unwrap().to_string();
         assert!(!raw.contains("access"), "no OAuth tokens in Host UI state");
         assert!(!raw.contains("refresh"), "no OAuth tokens in Host UI state");
