@@ -241,6 +241,7 @@ pub struct AgentSandbox {
     rustup_home: Option<PathBuf>,
     container_rootfs: Option<PathBuf>,
     container_read_only: Vec<PathBuf>,
+    pi_entrypoint: Option<PathBuf>,
     pi_package_dir: Option<PathBuf>,
     trusted_container_daemon: bool,
     sandbox_uid_dir: PathBuf,
@@ -367,8 +368,10 @@ impl AgentSandbox {
             path = std::env::join_paths(paths).context("compose agent PATH with managed Rust")?;
         }
 
+        let mut pi_entrypoint = None;
         let mut pi_package_dir = None;
         if let Some(program) = resolve_program(pi_bin, &host_path) {
+            pi_entrypoint = Some(program.clone());
             // A managed Pi runtime uses a stable symlink under state/pi-runtime
             // and atomically switches that link after a fully installed update.
             // Admit the stable runtime root up front so a later daily update can
@@ -477,6 +480,7 @@ impl AgentSandbox {
             rustup_home,
             container_rootfs,
             container_read_only: container_read_only.into_iter().collect(),
+            pi_entrypoint,
             pi_package_dir,
             trusted_container_daemon,
             sandbox_uid_dir,
@@ -565,14 +569,15 @@ impl AgentSandbox {
         command.env("PATH", &self.path);
         command.env("HOME", &self.home_dir);
         command.env("PI_CODING_AGENT_DIR", &self.pi_config_dir);
-        if let Some(pi_package_dir) = &self.pi_package_dir {
-            // Pi's bundled Node code discovers assets with fs.existsSync().
-            // Per-task UIDs intentionally cannot traverse root-owned 0750
-            // package-parent directories via normal DAC checks, even though
-            // the package tree itself is Landlock-admitted and readable via
-            // the retained DAC override capability. Give Pi its already
-            // validated canonical package root explicitly so asset lookup
-            // never falls back to the bundle chunk directory.
+        if let Some(pi_package_dir) = current_pi_package_dir(
+            self.pi_entrypoint.as_deref(),
+            self.pi_package_dir.as_deref(),
+        ) {
+            // Resolve from the stable Pi entrypoint for every child. Managed
+            // daily updates atomically retarget pi-runtime/bin/pi while this
+            // worker keeps running; pinning the startup package root would
+            // make new Pi processes load the previous version's assets until
+            // a worker restart.
             command.env("PI_PACKAGE_DIR", pi_package_dir);
         }
         command.env("CARGO_HOME", &self.cargo_home);
@@ -1722,6 +1727,13 @@ fn resolve_program(program: &str, path: &OsStr) -> Option<PathBuf> {
 
 fn path_depth(path: &Path) -> usize { path.components().count() }
 
+fn current_pi_package_dir(entrypoint: Option<&Path>, fallback: Option<&Path>) -> Option<PathBuf> {
+    entrypoint
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .and_then(|target| nearest_package_root(&target))
+        .or_else(|| fallback.map(Path::to_path_buf))
+}
+
 fn nearest_package_root(target: &Path) -> Option<PathBuf> {
     let mut current = target.parent();
     while let Some(dir) = current {
@@ -1860,6 +1872,7 @@ mod tests {
             rustup_home: None,
             container_rootfs: None,
             container_read_only: Vec::new(),
+            pi_entrypoint: None,
             pi_package_dir: None,
             trusted_container_daemon: false,
             sandbox_uid_dir: root.join("uids"),
@@ -1904,6 +1917,7 @@ mod tests {
             rustup_home: None,
             container_rootfs: None,
             container_read_only: Vec::new(),
+            pi_entrypoint: None,
             pi_package_dir: None,
             trusted_container_daemon: true,
             sandbox_uid_dir: root.join("uids"),
@@ -2091,6 +2105,37 @@ mod tests {
         std::fs::write(package.join("package.json"), b"{}\n").unwrap();
         std::fs::write(&target, b"#!/usr/bin/env node\n").unwrap();
         assert_eq!(nearest_package_root(&target), Some(package));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_pi_package_dir_follows_atomic_entrypoint_switch() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("lazyteam-pi-switch-test-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut packages = Vec::new();
+        for version in ["v1", "v2"] {
+            let package = root.join("versions").join(version).join("node_modules").join("@scope").join("pi");
+            let cli = package.join("dist").join("cli.js");
+            std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+            std::fs::write(package.join("package.json"), b"{}\n").unwrap();
+            std::fs::write(&cli, b"#!/usr/bin/env node\n").unwrap();
+            packages.push((package, cli));
+        }
+        let entrypoint = bin.join("pi");
+        symlink(&packages[0].1, &entrypoint).unwrap();
+        let fallback = packages[0].0.clone();
+        assert_eq!(current_pi_package_dir(Some(&entrypoint), Some(&fallback)), Some(packages[0].0.clone()));
+
+        let replacement = bin.join(".pi-next");
+        symlink(&packages[1].1, &replacement).unwrap();
+        std::fs::rename(&replacement, &entrypoint).unwrap();
+        assert_eq!(current_pi_package_dir(Some(&entrypoint), Some(&fallback)), Some(packages[1].0.clone()));
+
+        std::fs::remove_file(&entrypoint).unwrap();
+        assert_eq!(current_pi_package_dir(Some(&entrypoint), Some(&fallback)), Some(fallback));
         let _ = std::fs::remove_dir_all(root);
     }
 
