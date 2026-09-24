@@ -2164,6 +2164,10 @@ fn opencode_providers_from_models(models: &[AgentModel]) -> Vec<AgentProvider> {
     providers.into_values().collect()
 }
 
+fn opencode_models_argv(refresh: bool) -> Vec<&'static str> {
+    if refresh { vec!["models", "--refresh", "--json"] } else { vec!["models", "--json"] }
+}
+
 fn opencode_model_from_value(value: &Value) -> Option<AgentModel> {
     let obj = value.as_object()?;
     let id = obj.get("id")?.as_str()?;
@@ -2328,9 +2332,7 @@ impl OpenCodeRuntime {
         let session_dir = self.session_dir.clone();
         tokio::time::timeout(Duration::from_secs(10), async move {
             let mut command = sandbox.command(&binary, sandbox.probe_workspace(), session_dir.as_deref())?;
-            command.arg("models");
-            if refresh { command.arg("--refresh"); }
-            command.args(["--format", "json"]);
+            for arg in opencode_models_argv(refresh) { command.arg(arg); }
             command.kill_on_drop(true);
             command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = command.output().await.context("run OpenCode model catalog probe")?;
@@ -3223,6 +3225,8 @@ export class ModelRuntime {
 
     #[test]
     fn opencode_model_catalog_parses_provider_qualified_ids() {
+        assert_eq!(opencode_models_argv(false), vec!["models", "--json"]);
+        assert_eq!(opencode_models_argv(true), vec!["models", "--refresh", "--json"]);
         let model = opencode_model_from_value(&json!({"provider": "host-provider", "id": "host-model"})).unwrap();
         assert_eq!(model.provider, "host-provider");
         assert_eq!(model.id, "host-model");
