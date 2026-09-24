@@ -2,6 +2,7 @@
 set -eu
 
 image="${1:-lazyteam-worker:release-candidate}"
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 state_volume="lazyteam-worker-smoke-state-$$"
 workspace_volume="lazyteam-worker-smoke-workspaces-$$"
 
@@ -100,20 +101,27 @@ while [ "$attempt" -le 2 ]; do
   attempt=$((attempt + 1))
 done
 
-# Headless implementation agents must be able to make an actual file edit
-# through LazyTeam's OpenCodeRuntime + AgentSandbox, not by calling the CLI
-# directly. This also exercises the build/auto permission policy.
+# Deterministically verify the headless implementation path without making
+# release publication depend on a free external model deciding to call write.
+# The real OpenCode binary/catalog were exercised above; this fake backend now
+# asserts LazyTeam passes build+auto+model flags, emits real JSON-stream shapes,
+# and must write through AgentSandbox into the probe workspace.
+docker run --rm \
+  -v "$state_volume:/app/state" \
+  -v "$script_dir/fake-opencode-smoke.sh:/source/fake-opencode:ro" \
+  --entrypoint sh \
+  "$image" -c 'cp /source/fake-opencode /app/state/fake-opencode && chmod 0755 /app/state/fake-opencode'
 set +e
-write_output="$(run_worker lazyteam-worker --opencode-run-diagnose)"
+write_output="$(run_worker lazyteam-worker --opencode-bin /app/state/fake-opencode --opencode-run-diagnose)"
 write_status=$?
 set -e
 printf '%s\n' "$write_output"
 if [ "$write_status" -ne 0 ]; then
   compact="$(printf '%s' "$write_output" | tail -c 4000 | tr '\r\n' '  ')"
-  echo "::error title=Worker OpenCode write smoke failed::$compact"
+  echo "::error title=Worker OpenCode deterministic write smoke failed::$compact"
   exit "$write_status"
 fi
-printf '%s\n' "$write_output" | grep -F 'OpenCode run diagnostic PASS model=opencode/' >/dev/null || {
-  echo "::error title=Worker OpenCode write smoke failed::runtime did not report a successful sandbox write"
+printf '%s\n' "$write_output" | grep -F 'OpenCode run diagnostic PASS model=opencode/smoke-free' >/dev/null || {
+  echo "::error title=Worker OpenCode deterministic write smoke failed::runtime did not report a successful sandbox write"
   exit 1
 }
