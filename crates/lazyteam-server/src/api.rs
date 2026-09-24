@@ -1453,11 +1453,21 @@ async fn report_worker_oauth_login_event(
         "complete" => {
             login.status = "complete".into();
             login.message = oauth_diagnostic(input.message, 512).or(Some("OAuth login completed.".into()));
+            login.verification_uri = None;
+            login.user_code = None;
+            login.authorization_url = None;
+            login.paste_prompt = None;
+            login.paste_placeholder = None;
             login.pending_input = None;
         }
         "failed" => {
             login.status = "failed".into();
             login.message = oauth_diagnostic(input.message, 1024).or(Some("OAuth login failed.".into()));
+            login.verification_uri = None;
+            login.user_code = None;
+            login.authorization_url = None;
+            login.paste_prompt = None;
+            login.paste_placeholder = None;
             login.pending_input = None;
         }
         _ => return Err((StatusCode::BAD_REQUEST, "unknown OAuth login event kind".into())),
@@ -5282,6 +5292,12 @@ mod tests {
         report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(oauth_event("complete"))).await.unwrap();
         let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
         assert_eq!(current.status, "complete", "duplicate terminal complete reports must be idempotent");
+        assert!(current.verification_uri.is_none());
+        assert!(current.user_code.is_none());
+        assert!(current.authorization_url.is_none());
+        assert!(current.paste_prompt.is_none());
+        assert!(current.paste_placeholder.is_none());
+        assert!(current.pending_input.is_none());
         let raw = serde_json::to_value(&current).unwrap().to_string();
         assert!(!raw.contains("access"), "no OAuth tokens in Host UI state");
         assert!(!raw.contains("refresh"), "no OAuth tokens in Host UI state");
@@ -5317,6 +5333,17 @@ mod tests {
         ).await.unwrap();
         let claimed = claim_worker_oauth_login(Path(worker_id), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
         assert_eq!(claimed.status(), StatusCode::OK);
+        let mut device = oauth_event("device_code");
+        device.verification_uri = Some("https://example.invalid/device".into());
+        device.user_code = Some("STALE-CODE".into());
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(device)).await.unwrap();
+        let mut auth_url = oauth_event("auth_url");
+        auth_url.authorization_url = Some("https://example.invalid/oauth".into());
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(auth_url)).await.unwrap();
+        let mut awaiting = oauth_event("awaiting_input");
+        awaiting.paste_prompt = Some("stale prompt".into());
+        awaiting.paste_placeholder = Some("stale placeholder".into());
+        report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(awaiting)).await.unwrap();
         let mut failed = oauth_event("failed");
         failed.message = Some(
             r#"OpenAI Codex token exchange response missing fields: {"access_token":"synth-host-access-1","refresh_token":"synth-host-refresh-2","expires_in":3600}"#.into(),
@@ -5324,6 +5351,12 @@ mod tests {
         report_worker_oauth_login_event(Path((worker_id, login.id)), State(state.clone()), worker_headers("oauth-cred"), Json(failed)).await.unwrap();
         let current = state.oauth_login_states.lock().await.get(&worker_id).cloned().unwrap();
         assert_eq!(current.status, "failed");
+        assert!(current.verification_uri.is_none());
+        assert!(current.user_code.is_none());
+        assert!(current.authorization_url.is_none());
+        assert!(current.paste_prompt.is_none());
+        assert!(current.paste_placeholder.is_none());
+        assert!(current.pending_input.is_none());
         let stored = current.message.clone().unwrap_or_default();
         assert!(!stored.contains("synth-host-access-1"), "{stored}");
         assert!(!stored.contains("synth-host-refresh-2"), "{stored}");

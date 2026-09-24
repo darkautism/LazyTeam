@@ -372,6 +372,13 @@ mod tests {
     }
 
     #[test]
+    fn terminal_oauth_hides_transient_authorization_controls() {
+        assert!(INDEX.contains("const active=oauthStateActive(state)"));
+        assert!(INDEX.contains("const href=active?safeOAuthHref"));
+        assert!(INDEX.contains("if(active&&state.user_code)"));
+    }
+
+    #[test]
     fn remote_oauth_url_and_paste_completion_are_surfaced() {
         // Pi's browser OAuth redirects to worker-local localhost, so the
         // Host UI must surface the real authorization URL in a copyable
