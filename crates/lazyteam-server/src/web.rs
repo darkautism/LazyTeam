@@ -343,6 +343,11 @@ mod tests {
         assert!(INDEX.contains("providerModelRefreshInFlight=null"));
         assert!(INDEX.contains("configuringWorkerId===w.id"));
         assert!(INDEX.contains("$('#worker-config-provider').value===provider"));
+        assert!(INDEX.contains("$('#worker-config-provider').value=''"));
+        assert!(INDEX.contains("$('#worker-config-model').value=''"));
+        assert!(INDEX.contains("renderAgentCatalog(w,true)"));
+        assert!(INDEX.contains("function workerAgentDraftChanged()"));
+        assert!(INDEX.contains("Save agent backend first"));
         assert!(INDEX.contains("button.disabled=false"));
     }
 
