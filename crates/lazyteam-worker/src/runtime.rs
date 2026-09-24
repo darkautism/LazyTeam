@@ -2165,25 +2165,23 @@ fn opencode_providers_from_models(models: &[AgentModel]) -> Vec<AgentProvider> {
 }
 
 fn opencode_models_argv(refresh: bool) -> Vec<&'static str> {
-    if refresh { vec!["models", "--refresh", "--json"] } else { vec!["models", "--json"] }
+    if refresh { vec!["models", "--refresh"] } else { vec!["models"] }
 }
 
-fn opencode_model_from_value(value: &Value) -> Option<AgentModel> {
-    let obj = value.as_object()?;
-    let id = obj.get("id")?.as_str()?;
-    let provider = match obj.get("provider").and_then(Value::as_str) {
-        Some(provider) => provider.to_string(),
-        None => id.split_once('/')?.0.to_string(),
-    };
-    if provider.trim().is_empty() || id.trim().is_empty() {
+fn opencode_model_from_line(line: &str) -> Option<AgentModel> {
+    let line = line.trim();
+    let (provider, model) = line.split_once('/')?;
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() || provider.chars().any(char::is_whitespace) || model.chars().any(char::is_whitespace) {
         return None;
     }
     Some(AgentModel {
-        provider,
-        id: id.to_string(),
-        name: obj.get("name").and_then(Value::as_str).map(str::to_string),
-        context_window: obj.get("contextWindow").and_then(Value::as_u64),
-        reasoning: obj.get("reasoning").and_then(Value::as_bool).unwrap_or(false),
+        provider: provider.to_string(),
+        id: model.to_string(),
+        name: None,
+        context_window: None,
+        reasoning: false,
         cost: None,
     })
 }
@@ -2342,13 +2340,8 @@ impl OpenCodeRuntime {
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
-            let value: Value = serde_json::from_slice(&output.stdout).context("parse OpenCode model catalog output")?;
-            let items = match &value {
-                Value::Array(items) => items.clone(),
-                Value::Object(map) => map.get("models").and_then(Value::as_array).cloned().unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            Ok(items.iter().filter_map(opencode_model_from_value).collect())
+            let stdout = String::from_utf8(output.stdout).context("OpenCode model catalog output is not UTF-8")?;
+            Ok(stdout.lines().filter_map(opencode_model_from_line).collect())
         })
         .await
         .context("OpenCode capability probe timed out")?
@@ -3224,19 +3217,23 @@ export class ModelRuntime {
     }
 
     #[test]
-    fn opencode_model_catalog_parses_provider_qualified_ids() {
-        assert_eq!(opencode_models_argv(false), vec!["models", "--json"]);
-        assert_eq!(opencode_models_argv(true), vec!["models", "--refresh", "--json"]);
-        let model = opencode_model_from_value(&json!({"provider": "host-provider", "id": "host-model"})).unwrap();
+    fn opencode_model_catalog_parses_cli_lines() {
+        assert_eq!(opencode_models_argv(false), vec!["models"]);
+        assert_eq!(opencode_models_argv(true), vec!["models", "--refresh"]);
+        let model = opencode_model_from_line("host-provider/host-model").unwrap();
         assert_eq!(model.provider, "host-provider");
         assert_eq!(model.id, "host-model");
-        let qualified = opencode_model_from_value(&json!({"id": "other-provider/other-model"})).unwrap();
-        assert_eq!(qualified.provider, "other-provider");
-        assert_eq!(qualified.id, "other-provider/other-model");
-        let providers = opencode_providers_from_models(&[model, qualified]);
-        assert_eq!(providers.iter().map(|provider| provider.id.as_str()).collect::<Vec<_>>(), vec!["host-provider", "other-provider"]);
+        let bunny = opencode_model_from_line("opencode/space-bunny-free").unwrap();
+        assert_eq!(bunny.provider, "opencode");
+        assert_eq!(bunny.id, "space-bunny-free");
+        let nested = opencode_model_from_line("openrouter/anthropic/claude-sonnet").unwrap();
+        assert_eq!(nested.provider, "openrouter");
+        assert_eq!(nested.id, "anthropic/claude-sonnet");
+        let providers = opencode_providers_from_models(&[model, bunny, nested]);
+        assert_eq!(providers.iter().map(|provider| provider.id.as_str()).collect::<Vec<_>>(), vec!["host-provider", "opencode", "openrouter"]);
         assert!(providers.iter().all(|provider| provider.configured));
-        assert!(opencode_model_from_value(&json!({"id": "unqualified"})).is_none());
+        assert!(opencode_model_from_line("Models cache refreshed").is_none());
+        assert!(opencode_model_from_line("unqualified").is_none());
     }
 
 
@@ -3254,7 +3251,7 @@ if [ "$1" = "session" ] && [ "$2" = "delete" ]; then
   exit 0
 fi
 if [ "$1" = "models" ]; then
-  echo '[{"provider":"host-provider","id":"host-model"}]'
+  echo 'host-provider/host-model'
   exit 0
 fi
 session=""
@@ -3336,7 +3333,7 @@ echo '{"role":"assistant","text":"final for '"$session"'"}'
             assert_eq!(resumed.backend_session_id, Option::<String>::None);
             assert_eq!(resumed.summary, "final for ses_fake_created");
 
-            // Capabilities use the machine-readable catalog, not TUI output.
+            // Capabilities use the documented one-model-per-line CLI catalog, not TUI output.
             let capabilities = runtime.capabilities().await;
             assert!(capabilities.probe_error.is_none());
             assert!(capabilities.models.iter().any(|m| m.provider == "host-provider" && m.id == "host-model"));
