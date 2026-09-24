@@ -104,7 +104,11 @@ struct PendingOAuthInput {
 }
 
 #[derive(Debug, Deserialize)]
-struct AgentOAuthStartInput { provider: String }
+struct AgentOAuthStartInput {
+    provider: String,
+    #[serde(default)]
+    restart: bool,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AgentOAuthClaim { id: Uuid, provider: String }
@@ -1350,7 +1354,7 @@ async fn start_worker_oauth_login(
     }
     let mut logins = state.oauth_login_states.lock().await;
     if let Some(existing) = logins.get(&id) {
-        if !matches!(existing.status.as_str(), "complete" | "failed") {
+        if !matches!(existing.status.as_str(), "complete" | "failed") && !input.restart {
             return Err((StatusCode::CONFLICT, format!("OAuth login is already {}", existing.status)));
         }
     }
@@ -5065,14 +5069,14 @@ mod tests {
         let err = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "key-only".into() }),
+            Json(AgentOAuthStartInput { provider: "key-only".into(), restart: false }),
         ).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         // A provider with neither capability supports neither login.
         let err = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "bare".into() }),
+            Json(AgentOAuthStartInput { provider: "bare".into(), restart: false }),
         ).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         // An OAuth-only provider has no API-key capability.
@@ -5102,7 +5106,7 @@ mod tests {
         let Json(queued) = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into(), restart: false }),
         ).await.unwrap();
         reset_worker_stale_oauth_login(
             Path(worker_id),
@@ -5139,7 +5143,7 @@ mod tests {
         let Json(restarted) = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into(), restart: false }),
         ).await.unwrap();
         assert_ne!(restarted.id, queued.id);
         claim_worker_oauth_login(
@@ -5173,7 +5177,7 @@ mod tests {
         let Json(login) = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into(), restart: false }),
         ).await.unwrap();
         assert_eq!(login.status, "queued");
         assert!(login.message.as_deref().unwrap_or_default().contains("authorization URL"));
@@ -5182,10 +5186,29 @@ mod tests {
         let err = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into(), restart: false }),
         ).await.unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert_eq!(state.oauth_login_states.lock().await.get(&worker_id).unwrap().id, login.id);
+        // An explicit user restart is different from an accidental duplicate:
+        // it replaces the active request with a fresh queue entry. Old request
+        // events stay rejected by the request-id check below.
+        let Json(restarted) = start_worker_oauth_login(
+            Path(worker_id),
+            State(state.clone()),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into(), restart: true }),
+        ).await.unwrap();
+        assert_eq!(restarted.status, "queued");
+        assert_ne!(restarted.id, login.id);
+        let err = report_worker_oauth_login_event(
+            Path((worker_id, login.id)),
+            State(state.clone()),
+            worker_headers("oauth-cred"),
+            Json(oauth_event("failed")),
+        ).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        // Continue the bridge checks using the replacement request.
+        let login = restarted;
         // The worker claims the queued request; the Host must not claim completion yet.
         let claimed = claim_worker_oauth_login(Path(worker_id), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
         assert_eq!(claimed.status(), StatusCode::OK);
@@ -5269,7 +5292,7 @@ mod tests {
         let Json(restarted) = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into(), restart: false }),
         ).await.unwrap();
         assert_eq!(restarted.status, "queued");
         assert_ne!(restarted.id, login.id);
@@ -5290,7 +5313,7 @@ mod tests {
         let Json(login) = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into(), restart: false }),
         ).await.unwrap();
         let claimed = claim_worker_oauth_login(Path(worker_id), State(state.clone()), worker_headers("oauth-cred")).await.unwrap();
         assert_eq!(claimed.status(), StatusCode::OK);
@@ -5316,7 +5339,7 @@ mod tests {
         let Json(login) = start_worker_oauth_login(
             Path(worker_id),
             State(state.clone()),
-            Json(AgentOAuthStartInput { provider: "openai-codex".into() }),
+            Json(AgentOAuthStartInput { provider: "openai-codex".into(), restart: false }),
         ).await.unwrap();
         let mut progress = oauth_event("progress");
         progress.message = Some(r#"token refresh failed: {"refresh_token":"synth-host-refresh-3"}"#.into());

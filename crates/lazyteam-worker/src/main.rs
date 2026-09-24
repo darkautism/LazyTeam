@@ -1019,9 +1019,14 @@ async fn report_oauth_event(
 }
 
 /// Poll the Host for a relayed localhost-callback paste (the user-pasted
-/// final redirect URL or authorization code). Returns `None` on timeout.
+/// final redirect URL or authorization code). Returns `None` on timeout or
+/// when the Host says this request was explicitly replaced/restarted.
 /// Only lengths are logged: the pasted single-use code is auth material
 /// that must never appear in logs, prompts, or Host durable state.
+fn oauth_callback_poll_request_gone(status: StatusCode) -> bool {
+    matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND)
+}
+
 async fn poll_oauth_callback_input(
     client: Client,
     server: String,
@@ -1046,6 +1051,14 @@ async fn poll_oauth_callback_input(
                     Ok(_) => {}
                     Err(error) => warn!(%error, "failed to parse relayed OAuth callback input"),
                 }
+            }
+            // An explicit user restart replaces the Host request ID. Stop
+            // waiting immediately so the old Pi helper gets stdin shutdown
+            // through the normal no-input path and the worker can claim the
+            // freshly queued OAuth request instead of sitting here for 600s.
+            Ok(response) if oauth_callback_poll_request_gone(response.status()) => {
+                info!(oauth_request = %request_id, status = %response.status(), "OAuth callback request is no longer active; stopping old paste poll");
+                return None;
             }
             Ok(_) => {}
             Err(error) => warn!(%error, "OAuth callback input poll failed"),
@@ -3217,6 +3230,14 @@ mod tests {
 
     fn wire_prompt() -> String {
         serde_json::json!({"kind": "prompt", "prompt": {"type": "manual_code", "message": "paste it", "placeholder": "http://localhost:1455/auth/callback"}}).to_string()
+    }
+
+    #[test]
+    fn replaced_oauth_callback_poll_is_terminal() {
+        assert!(oauth_callback_poll_request_gone(StatusCode::CONFLICT));
+        assert!(oauth_callback_poll_request_gone(StatusCode::NOT_FOUND));
+        assert!(!oauth_callback_poll_request_gone(StatusCode::NO_CONTENT));
+        assert!(!oauth_callback_poll_request_gone(StatusCode::INTERNAL_SERVER_ERROR));
     }
 
     #[tokio::test]

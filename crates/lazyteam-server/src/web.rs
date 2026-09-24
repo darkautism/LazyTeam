@@ -361,6 +361,17 @@ mod tests {
     }
 
     #[test]
+    fn active_oauth_can_be_explicitly_restarted_without_double_clicks() {
+        assert!(INDEX.contains("oauthStateActive(current)"));
+        assert!(INDEX.contains("JSON.stringify({provider,restart})"));
+        assert!(INDEX.contains("oauthStartInFlight"));
+        assert!(INDEX.contains("button.disabled=true"));
+        assert!(INDEX.contains("button.disabled=false"));
+        assert!(INDEX.contains("oauthPollGeneration"));
+        assert!(INDEX.contains("'Restart':'Sign in'"));
+    }
+
+    #[test]
     fn remote_oauth_url_and_paste_completion_are_surfaced() {
         // Pi's browser OAuth redirects to worker-local localhost, so the
         // Host UI must surface the real authorization URL in a copyable
