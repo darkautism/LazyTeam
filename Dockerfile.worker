@@ -17,10 +17,11 @@ RUN cargo build --release -p lazyteam-worker
 
 FROM node:22-bookworm-slim
 ARG PI_CODING_AGENT_VERSION=0.87.1
+ARG OPENCODE_VERSION=1.18.31
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash build-essential ca-certificates coreutils curl findutils git gosu grep gzip openssh-client pkg-config procps sed tar util-linux \
-    && npm install --global "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
+    && npm install --global "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" "opencode-ai@${OPENCODE_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /app/state/home /app/workspaces \
@@ -38,6 +39,7 @@ ENV LAZYTEAM_HOME=/app/state/home
 ENV LAZYTEAM_WORKER_STATE_DIR=/app/state
 ENV LAZYTEAM_WORKSPACE_DIR=/app/workspaces
 ENV LAZYTEAM_PI_BIN=pi
+ENV LAZYTEAM_OPENCODE_BIN=opencode
 ENV LAZYTEAM_PI_AUTO_UPDATE=1
 ENV LAZYTEAM_PI_UPDATE_INTERVAL_SECS=86400
 ENV LAZYTEAM_UBUNTU_BASE_ARCHIVE=/opt/lazyteam/ubuntu-rootfs.tar.gz

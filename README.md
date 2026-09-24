@@ -63,7 +63,7 @@ https://lazyteam.example.com/mcp
 
 Connect that URL in ChatGPT as an MCP server and log in with your OAuth password when asked. Local administration (creating projects, generating worker join codes) happens on the server itself at `http://127.0.0.1:8787/ui` with your admin token — that dashboard is never exposed to the internet.
 
-Published images are `ghcr.io/darkautism/lazyteam:latest` (server) and `ghcr.io/darkautism/lazyteam-worker:latest` (worker, bundled with Pi `@earendil-works/pi-coding-agent@0.87.1` as an offline fallback), both for `linux/amd64` and `linux/arm64`.
+Published images are `ghcr.io/darkautism/lazyteam:latest` (server) and `ghcr.io/darkautism/lazyteam-worker:latest` (worker, bundled with Pi `@earendil-works/pi-coding-agent@0.87.1` and OpenCode `opencode-ai@1.18.31`), both for `linux/amd64` and `linux/arm64`.
 
 ### 2. Add a worker
 

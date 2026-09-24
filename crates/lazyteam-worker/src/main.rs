@@ -364,7 +364,7 @@ async fn async_main() -> anyhow::Result<()> {
             ).await {
                 warn!(%error, "startup capability-ready recovery report failed");
             }
-            agent_capabilities = probe_runtime.capabilities().await;
+            agent_capabilities = probe_selected_capabilities(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
             if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                 warn!(%error, "agent capability refresh after rootfs reconciliation failed");
             }
@@ -380,9 +380,9 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(refresh) = runtime_config.model_refresh.take() {
         let provider = refresh.provider.clone();
         info!(provider = %provider, refresh_request = %refresh.id, "forced model catalog refresh requested during startup");
-        match probe_runtime.force_refresh_models(&provider).await {
-            Ok(()) => {
-                agent_capabilities = probe_runtime.capabilities().await;
+        match refresh_selected_models(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox, &provider).await {
+            Ok(capabilities) => {
+                agent_capabilities = capabilities;
                 if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                     warn!(%error, "agent capability report after startup model refresh failed");
                 }
@@ -417,7 +417,7 @@ async fn async_main() -> anyhow::Result<()> {
                 Ok(Err(error)) => warn!(%error, "Pi OAuth login failed"),
                 Err(error) => warn!(%error, "Pi OAuth login task panicked or was cancelled"),
             }
-            agent_capabilities = probe_runtime.capabilities().await;
+            agent_capabilities = probe_selected_capabilities(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
             let _ = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await;
             next_capability_probe = Instant::now() + Duration::from_secs(60);
         }
@@ -482,7 +482,7 @@ async fn async_main() -> anyhow::Result<()> {
                     ).await {
                         warn!(%error, provider = %provider, credential_update = %update.id, "provider credential ACK failed; delivery will be retried");
                     }
-                    agent_capabilities = probe_runtime.capabilities().await;
+                    agent_capabilities = probe_selected_capabilities(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
                     if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                         warn!(%error, "agent capability refresh after provider credential update failed");
                     }
@@ -493,22 +493,32 @@ async fn async_main() -> anyhow::Result<()> {
             Err(error) => warn!(%error, "provider credential poll failed"),
         }
         if Instant::now() >= next_capability_probe {
-            agent_capabilities = probe_runtime.capabilities().await;
+            agent_capabilities = probe_selected_capabilities(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
             if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                 warn!(%error, "agent capability refresh failed");
             }
             next_capability_probe = Instant::now() + Duration::from_secs(60);
         }
         match fetch_runtime_config(&client, &server, &worker_credential, worker_id).await {
-            Ok(config) => runtime_config = config,
+            Ok(config) => {
+                let backend_changed = config.agent.agent_type != runtime_config.agent.agent_type;
+                runtime_config = config;
+                if backend_changed {
+                    agent_capabilities = probe_selected_capabilities(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
+                    if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
+                        warn!(%error, backend = %runtime_config.agent.agent_type, "agent capability report after backend switch failed");
+                    }
+                    next_capability_probe = Instant::now() + Duration::from_secs(60);
+                }
+            }
             Err(error) => warn!(%error, "worker runtime config refresh failed; using last known config"),
         }
         if let Some(refresh) = runtime_config.model_refresh.take() {
             let provider = refresh.provider.clone();
             info!(provider = %provider, refresh_request = %refresh.id, "forced model catalog refresh requested");
-            match probe_runtime.force_refresh_models(&provider).await {
-                Ok(()) => {
-                    agent_capabilities = probe_runtime.capabilities().await;
+            match refresh_selected_models(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox, &provider).await {
+                Ok(capabilities) => {
+                    agent_capabilities = capabilities;
                     if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                         warn!(%error, "agent capability report after forced model refresh failed");
                     }
@@ -545,11 +555,11 @@ async fn async_main() -> anyhow::Result<()> {
         }
         if !can_claim_work(&runtime_config.agent, &agent_capabilities) {
             if agent_capabilities.models.is_empty() {
-                tracing::debug!(active = active_jobs.len(), "worker has no usable Pi models yet; not claiming new work");
+                tracing::debug!(active = active_jobs.len(), "worker has no usable agent models yet; not claiming new work");
             } else if !host_agent_selection_ready(&runtime_config.agent) {
                 tracing::debug!(active = active_jobs.len(), "worker has no Host provider/model selection yet; not claiming new work");
             } else {
-                tracing::debug!(active = active_jobs.len(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "Host provider/model selection unavailable in Pi catalog; not claiming new work");
+                tracing::debug!(active = active_jobs.len(), provider = ?runtime_config.agent.provider, model = ?runtime_config.agent.model, "Host provider/model selection unavailable in agent catalog; not claiming new work");
             }
             sleep(Duration::from_secs(if active_jobs.is_empty() { 3 } else { 1 })).await;
             continue;
@@ -1480,6 +1490,56 @@ try {{
         Ok(())
     }).await;
     Ok(())
+}
+
+async fn probe_selected_capabilities(
+    agent: &AgentConfig,
+    pi_runtime: &PiRuntime,
+    opencode_bin: &str,
+    sandbox: &AgentSandbox,
+) -> AgentCapabilities {
+    match agent.agent_type.as_str() {
+        "pi" => pi_runtime.capabilities().await,
+        "opencode" => OpenCodeRuntime {
+            binary: opencode_bin.to_string(),
+            provider: None,
+            model: None,
+            session_dir: None,
+            sandbox: sandbox.clone(),
+        }.capabilities().await,
+        other => AgentCapabilities {
+            model_discovery: true,
+            probe_error: Some(format!("unsupported agent backend {other}")),
+            ..AgentCapabilities::default()
+        },
+    }
+}
+
+async fn refresh_selected_models(
+    agent: &AgentConfig,
+    pi_runtime: &PiRuntime,
+    opencode_bin: &str,
+    sandbox: &AgentSandbox,
+    provider: &str,
+) -> anyhow::Result<AgentCapabilities> {
+    match agent.agent_type.as_str() {
+        "pi" => {
+            pi_runtime.force_refresh_models(provider).await?;
+            Ok(pi_runtime.capabilities().await)
+        }
+        "opencode" => {
+            let runtime = OpenCodeRuntime {
+                binary: opencode_bin.to_string(),
+                provider: None,
+                model: None,
+                session_dir: None,
+                sandbox: sandbox.clone(),
+            };
+            runtime.force_refresh_models().await?;
+            Ok(runtime.capabilities().await)
+        }
+        other => bail!("unsupported agent backend {other}"),
+    }
 }
 
 /// Build the slot runtime exclusively from the Host-owned agent selection.

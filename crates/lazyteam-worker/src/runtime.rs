@@ -2150,6 +2150,20 @@ fn opencode_backend_result(
     }
 }
 
+fn opencode_providers_from_models(models: &[AgentModel]) -> Vec<AgentProvider> {
+    let mut providers = BTreeMap::new();
+    for model in models {
+        providers.entry(model.provider.clone()).or_insert_with(|| AgentProvider {
+            id: model.provider.clone(),
+            name: model.provider.clone(),
+            configured: true,
+            api_key_label: None,
+            oauth_label: None,
+        });
+    }
+    providers.into_values().collect()
+}
+
 fn opencode_model_from_value(value: &Value) -> Option<AgentModel> {
     let obj = value.as_object()?;
     let id = obj.get("id")?.as_str()?;
@@ -2306,7 +2320,7 @@ impl OpenCodeRuntime {
         }
     }
 
-    async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
+    async fn probe_models_with_refresh(&self, refresh: bool) -> anyhow::Result<Vec<AgentModel>> {
         let sandbox = self.sandbox.clone();
         let binary = self.binary.clone();
         // Resolve the binary exactly like a run does: a session-scoped helper
@@ -2314,7 +2328,9 @@ impl OpenCodeRuntime {
         let session_dir = self.session_dir.clone();
         tokio::time::timeout(Duration::from_secs(10), async move {
             let mut command = sandbox.command(&binary, sandbox.probe_workspace(), session_dir.as_deref())?;
-            command.args(["models", "--format", "json"]);
+            command.arg("models");
+            if refresh { command.arg("--refresh"); }
+            command.args(["--format", "json"]);
             command.kill_on_drop(true);
             command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = command.output().await.context("run OpenCode model catalog probe")?;
@@ -2335,6 +2351,14 @@ impl OpenCodeRuntime {
         .await
         .context("OpenCode capability probe timed out")?
     }
+
+    async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
+        self.probe_models_with_refresh(false).await
+    }
+
+    pub async fn force_refresh_models(&self) -> anyhow::Result<()> {
+        self.probe_models_with_refresh(true).await.map(|_| ())
+    }
 }
 
 #[async_trait]
@@ -2346,7 +2370,7 @@ impl AgentRuntime for OpenCodeRuntime {
             Ok(models) => AgentCapabilities {
                 model_discovery: true,
                 login_mode: AgentLoginMode::Remote,
-                providers: Vec::new(),
+                providers: opencode_providers_from_models(&models),
                 models,
                 probe_error: None,
             },
@@ -3205,6 +3229,9 @@ export class ModelRuntime {
         let qualified = opencode_model_from_value(&json!({"id": "other-provider/other-model"})).unwrap();
         assert_eq!(qualified.provider, "other-provider");
         assert_eq!(qualified.id, "other-provider/other-model");
+        let providers = opencode_providers_from_models(&[model, qualified]);
+        assert_eq!(providers.iter().map(|provider| provider.id.as_str()).collect::<Vec<_>>(), vec!["host-provider", "other-provider"]);
+        assert!(providers.iter().all(|provider| provider.configured));
         assert!(opencode_model_from_value(&json!({"id": "unqualified"})).is_none());
     }
 

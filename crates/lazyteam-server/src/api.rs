@@ -1047,8 +1047,11 @@ async fn register_worker(State(state): State<Arc<AppState>>, Json(input): Json<R
     let credential_hash = hash_secret(&credential);
     let tags = input.tags;
     validate_user_tags(&tags)?;
-    if input.agent_type != "pi" {
+    if !matches!(input.agent_type.as_str(), "pi" | "opencode") {
         return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into()));
+    }
+    if input.role == AgentRole::Reviewer && input.agent_type != "pi" {
+        return Err((StatusCode::BAD_REQUEST, "OpenCode reviewer is not supported yet; use Pi for reviewer workers".into()));
     }
     let agent_capabilities = json(&input.agent_capabilities)?;
     // Re-registration (same worker id) refreshes identity, heartbeat, and capability
@@ -1137,8 +1140,19 @@ async fn update_worker(Path(id): Path<Uuid>, State(state): State<Arc<AppState>>,
         return Err((StatusCode::CONFLICT, format!("update/restart this worker with protocol {PROTOCOL_VERSION} before assigning the reviewer role")));
     }
     let agent_type = input.agent_type.unwrap_or_else(|| current.agent.agent_type.clone());
-    if agent_type != "pi" { return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into())); }
-    let (provider, model) = resolve_agent_selection(&current.agent, input.provider, input.model, input.clear_model.unwrap_or(false))?;
+    if !matches!(agent_type.as_str(), "pi" | "opencode") { return Err((StatusCode::BAD_REQUEST, "unsupported agent type".into())); }
+    if role == AgentRole::Reviewer && agent_type != "pi" {
+        return Err((StatusCode::BAD_REQUEST, "OpenCode reviewer is not supported yet; use Pi for reviewer workers".into()));
+    }
+    let backend_changed = agent_type != current.agent.agent_type;
+    if backend_changed && (input.provider.is_some() || input.model.is_some()) {
+        return Err((StatusCode::BAD_REQUEST, "switch agent backend first, wait for its model catalog, then select provider/model".into()));
+    }
+    let (provider, model) = if backend_changed {
+        (None, None)
+    } else {
+        resolve_agent_selection(&current.agent, input.provider, input.model, input.clear_model.unwrap_or(false))?
+    };
     if let (Some(provider), Some(model)) = (&provider, &model) {
         if !current.agent_capabilities.models.is_empty()
             && !current.agent_capabilities.models.iter().any(|candidate| &candidate.provider == provider && &candidate.id == model)
@@ -3345,6 +3359,42 @@ mod tests {
         assert!(resolve_agent_selection(&unselected, None, Some("only-model".into()), false).is_err());
     }
 
+
+    fn backend_update(agent_type: &str) -> UpdateWorker {
+        UpdateWorker {
+            name: None,
+            role: None,
+            tags: None,
+            managed_capabilities: None,
+            allowed_projects: None,
+            slots: None,
+            agent_type: Some(agent_type.into()),
+            provider: None,
+            model: None,
+            clear_model: None,
+            initial_prompt: None,
+            paused: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_worker_to_opencode_clears_pi_model_selection() {
+        let state = race_lease_test_state().await;
+        let worker = seed_real_race_worker(&state, AgentRole::Worker).await;
+        let Json(updated) = update_worker(Path(worker.id), State(state), Json(backend_update("opencode"))).await.unwrap();
+        assert_eq!(updated.agent.agent_type, "opencode");
+        assert_eq!(updated.agent.provider, None);
+        assert_eq!(updated.agent.model, None);
+    }
+
+    #[tokio::test]
+    async fn opencode_reviewer_is_rejected_until_reviewer_mcp_is_supported() {
+        let state = race_lease_test_state().await;
+        let reviewer = seed_real_race_worker(&state, AgentRole::Reviewer).await;
+        let error = update_worker(Path(reviewer.id), State(state), Json(backend_update("opencode"))).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("OpenCode reviewer is not supported yet"));
+    }
 
     async fn lease_test_state() -> Arc<AppState> {
         let db = SqlitePoolOptions::new()
