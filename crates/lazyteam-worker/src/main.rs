@@ -1637,6 +1637,10 @@ async fn process_cleanup(client: &Client, server: &str, credential: &str, worker
     Ok(())
 }
 
+fn lease_renew_status_is_transient(status: StatusCode) -> bool {
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+}
+
 async fn heartbeat(client: &Client, server: &str, credential: &str, worker_id: Uuid) -> anyhow::Result<()> {
     let response = worker_auth(client.post(format!("{server}/api/workers/{worker_id}/heartbeat")), credential).send().await?;
     ensure_success(response).await?;
@@ -1690,7 +1694,7 @@ async fn execute_review_assignment(
     let renew_credential = worker_credential.to_string();
     let renew_capability = assignment.lease_capability.clone();
     let renew = AbortOnDrop::new(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        let mut tick = tokio::time::interval_at(Instant::now() + Duration::from_secs(30), Duration::from_secs(30));
         loop {
             tick.tick().await;
             match lease_auth(
@@ -1701,6 +1705,10 @@ async fn execute_review_assignment(
                 Ok(response) if response.status().is_success() => {}
                 Ok(response) => {
                     let status = response.status();
+                    if lease_renew_status_is_transient(status) {
+                        warn!(%status, %review_id, "review lease renew temporarily rejected; keeping reviewer slot");
+                        continue;
+                    }
                     warn!(%status, %review_id, "review lease renew rejected; cancelling reviewer slot");
                     renew_slot.cancel(format!("review lease renew rejected with {status}"));
                     break;
@@ -1882,7 +1890,7 @@ async fn execute_assignment(
     let renew_credential = worker_credential.to_string();
     let renew_capability = assignment.lease_capability.clone();
     let renew = AbortOnDrop::new(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        let mut tick = tokio::time::interval_at(Instant::now() + Duration::from_secs(30), Duration::from_secs(30));
         loop {
             tick.tick().await;
             match lease_auth(
@@ -2500,6 +2508,15 @@ async fn persist_worker_credential(dir: &Path, credential: &str) -> anyhow::Resu
 mod tests {
     use super::*;
     use lazyteam_core::{host_selection_available, AgentModel};
+
+    #[test]
+    fn lease_renew_transient_statuses_do_not_kill_review_slot() {
+        assert!(lease_renew_status_is_transient(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(lease_renew_status_is_transient(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(lease_renew_status_is_transient(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!lease_renew_status_is_transient(StatusCode::UNAUTHORIZED));
+        assert!(!lease_renew_status_is_transient(StatusCode::CONFLICT));
+    }
 
     #[test]
     fn runtime_config_defaults_legacy_server_to_one_slot() {
