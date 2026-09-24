@@ -1964,6 +1964,7 @@ const DEFAULT_OPENCODE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_OPENCODE_STALL_SECS: u64 = 360;
 const OPENCODE_DELETE_TIMEOUT_SECS: u64 = 15;
 const OPENCODE_EXIT_GRACE_SECS: u64 = 5;
+const OPENCODE_STDERR_TAIL_BYTES: usize = 16 * 1024;
 
 fn opencode_timeout() -> Duration {
     bounded_duration_from_env(
@@ -2006,6 +2007,9 @@ fn opencode_run_argv(model: &str, backend_session_id: Option<&str>, prompt: &str
         "run".to_string(),
         "--format".to_string(),
         "json".to_string(),
+        "--agent".to_string(),
+        "build".to_string(),
+        "--auto".to_string(),
         "--model".to_string(),
         model.to_string(),
     ];
@@ -2015,6 +2019,16 @@ fn opencode_run_argv(model: &str, backend_session_id: Option<&str>, prompt: &str
     }
     argv.push(prompt.to_string());
     argv
+}
+
+fn append_bounded_tail(buffer: &mut String, line: &str, max_bytes: usize) {
+    if max_bytes == 0 { return; }
+    buffer.push_str(line);
+    buffer.push('\n');
+    if buffer.len() <= max_bytes { return; }
+    let mut start = buffer.len() - max_bytes;
+    while !buffer.is_char_boundary(start) { start += 1; }
+    buffer.drain(..start);
 }
 
 #[derive(Debug, Default)]
@@ -2067,6 +2081,12 @@ fn opencode_session_id_from_event(event: &Value) -> Option<String> {
 /// Only events with an explicit `assistant` role contribute; prompt, user,
 /// system, tool, and transcript shapes are never final output.
 fn opencode_assistant_text_from_event(event: &Value) -> Option<String> {
+    if event.get("type").and_then(Value::as_str) == Some("text") {
+        let part = event.get("part")?;
+        if part.get("type").and_then(Value::as_str) == Some("text") {
+            return part.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()).map(str::to_string);
+        }
+    }
     const NON_FINAL_TYPES: &[&str] = &[
         "prompt",
         "user",
@@ -2188,7 +2208,7 @@ fn opencode_model_from_line(line: &str) -> Option<AgentModel> {
 
 /// Concrete headless OpenCode runtime.
 ///
-/// Every run spawns `opencode run --format json --model <provider/model>`
+/// Every run spawns `opencode run --format json --agent build --auto --model <provider/model>`
 /// inside the existing [`AgentSandbox`] (which strips Host Git credentials
 /// and confines the filesystem), parses only the machine-readable JSON
 /// stream, and returns final-assistant-only text plus the backend-owned
@@ -2225,11 +2245,14 @@ impl OpenCodeRuntime {
         let mut child = command.spawn().with_context(|| format!("spawn {} headless run", self.binary))?;
         let stdout = child.stdout.take().context("OpenCode run stdout missing")?;
         let stderr = child.stderr.take().context("OpenCode run stderr missing")?;
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
+            let mut tail = String::new();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(target: "opencode", "{line}");
+                append_bounded_tail(&mut tail, &line, OPENCODE_STDERR_TAIL_BYTES);
             }
+            tail
         });
 
         let deadline = Instant::now() + timeout;
@@ -2288,8 +2311,15 @@ impl OpenCodeRuntime {
                 bail!("OpenCode run did not exit within {OPENCODE_EXIT_GRACE_SECS}s after output EOF");
             }
         };
+        let stderr_tail = stderr_task.await.unwrap_or_default();
         if !status.success() {
-            bail!("OpenCode headless run failed: {status}");
+            let stderr_tail = stderr_tail.trim();
+            let message = if stderr_tail.is_empty() {
+                format!("OpenCode headless run failed: {status}")
+            } else {
+                format!("OpenCode headless run failed: {status}; stderr: {stderr_tail}")
+            };
+            bail!("{message}");
         }
         Ok(AgentRunResult {
             summary: state.assistant_text,
@@ -3169,14 +3199,26 @@ export class ModelRuntime {
     #[test]
     fn opencode_argv_creates_and_resumes_headless_sessions() {
         let create = opencode_run_argv("host-provider/host-model", None, "do the task");
-        assert_eq!(create[..5], ["run", "--format", "json", "--model", "host-provider/host-model"]);
+        assert_eq!(create[..8], ["run", "--format", "json", "--agent", "build", "--auto", "--model", "host-provider/host-model"]);
         assert!(!create.iter().any(|arg| arg == "--session"), "create must not pass a session flag");
         assert_eq!(create.last().map(String::as_str), Some("do the task"));
 
         let resume = opencode_run_argv("host-provider/host-model", Some("ses_opaque_123"), "continue");
         let session_pos = resume.iter().position(|arg| arg == "--session").expect("resume passes --session");
         assert_eq!(resume[session_pos + 1], "ses_opaque_123");
-        assert_eq!(resume[3..5], ["--model".to_string(), "host-provider/host-model".to_string()]);
+        let model_pos = resume.iter().position(|arg| arg == "--model").expect("resume passes --model");
+        assert_eq!(resume[model_pos + 1], "host-provider/host-model");
+        assert!(resume.iter().any(|arg| arg == "--auto"));
+        assert_eq!(resume.iter().position(|arg| arg == "--agent").map(|pos| resume[pos + 1].as_str()), Some("build"));
+    }
+
+    #[test]
+    fn opencode_stderr_tail_is_bounded() {
+        let mut tail = String::new();
+        append_bounded_tail(&mut tail, "12345", 8);
+        append_bounded_tail(&mut tail, "67890", 8);
+        assert!(tail.len() <= 8);
+        assert!(tail.ends_with("67890\n"));
     }
 
     #[test]
@@ -3189,13 +3231,14 @@ export class ModelRuntime {
             json!({"type": "transcript", "role": "assistant", "text": "TRANSCRIPT MUST NOT LEAK"}),
             json!({"type": "tool_execution_start", "role": "assistant", "text": "TOOL MUST NOT LEAK"}),
             json!({"role": "assistant", "text": "final-a "}),
+            json!({"type": "text", "part": {"type": "text", "text": "final-stream "}}),
             json!({"message": {"role": "assistant", "content": [{"type": "text", "text": "final-b"}]}}),
             json!({"message": {"role": "user", "content": [{"type": "text", "text": "NESTED USER MUST NOT LEAK"}]}}),
         ] {
             apply_opencode_event(&mut state, &event);
         }
         assert_eq!(state.session_id.as_deref(), Some("ses_opaque_123"));
-        assert_eq!(state.assistant_text, "final-a final-b");
+        assert_eq!(state.assistant_text, "final-a final-stream final-b");
         for leaked in ["PROMPT", "USER", "TRANSCRIPT", "TOOL", "NESTED"] {
             assert!(!state.assistant_text.contains(leaked), "leaked {leaked}");
         }
@@ -3339,6 +3382,43 @@ echo '{"role":"assistant","text":"final for '"$session"'"}'
                 capabilities.models.iter().map(|model| format!("{}/{}", model.provider, model.id)).collect::<Vec<_>>()
             );
         }
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "staging-only: requires LAZYTEAM_REAL_OPENCODE_BIN, LAZYTEAM_REAL_OPENCODE_RUN_MODEL, and network access"]
+    async fn real_opencode_run_writes_through_agent_sandbox() {
+        let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::WARN).try_init();
+        let source = std::env::var_os("LAZYTEAM_REAL_OPENCODE_BIN")
+            .map(PathBuf::from)
+            .expect("set LAZYTEAM_REAL_OPENCODE_BIN to a real OpenCode binary");
+        let selector = std::env::var("LAZYTEAM_REAL_OPENCODE_RUN_MODEL")
+            .expect("set LAZYTEAM_REAL_OPENCODE_RUN_MODEL to provider/model");
+        let (provider, model) = selector.split_once('/').expect("provider/model selector");
+        let root = std::env::temp_dir().join(format!("lazyteam-real-opencode-run-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let session_dir = root.join("sessions").join("run");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&session_dir).await.unwrap();
+        let binary = session_dir.join("opencode");
+        tokio::fs::copy(&source, &binary).await.unwrap();
+        let mut perms = tokio::fs::metadata(&binary).await.unwrap().permissions();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            tokio::fs::set_permissions(&binary, perms).await.unwrap();
+        }
+        let mut runtime = opencode_test_runtime(&binary, session_dir).await;
+        runtime.provider = Some(provider.to_string());
+        runtime.model = Some(model.to_string());
+        let result = runtime.run(
+            &workspace,
+            "Create proof.txt containing exactly ok followed by a newline. Make the file now; do not just explain.",
+            None,
+        ).await.unwrap();
+        let proof = tokio::fs::read_to_string(workspace.join("proof.txt")).await.unwrap();
+        assert_eq!(proof, "ok\n");
+        assert!(!result.summary.trim().is_empty(), "real OpenCode run should return a final summary");
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 

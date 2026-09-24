@@ -63,6 +63,9 @@ struct Args {
     /// Probe OpenCode providers/models through the real worker sandbox and exit.
     #[arg(long)]
     opencode_capabilities_diagnose: bool,
+    /// Run a real OpenCode implementation write through AgentSandbox and exit.
+    #[arg(long)]
+    opencode_run_diagnose: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +252,45 @@ async fn async_main() -> anyhow::Result<()> {
     info!(rootfs = %agent_rootfs.display(), "agent Ubuntu rootfs + intuitive tooling + sandboxed Git ready");
     if args.sandbox_diagnose {
         println!("LazyTeam agent sandbox {}", agent_sandbox.diagnostic_summary());
+        return Ok(());
+    }
+    if args.opencode_run_diagnose {
+        let probe = OpenCodeRuntime {
+            binary: args.opencode_bin.clone(),
+            provider: None,
+            model: None,
+            session_dir: None,
+            sandbox: agent_sandbox.clone(),
+        };
+        probe.force_refresh_models().await?;
+        let capabilities = probe.capabilities().await;
+        if let Some(error) = capabilities.probe_error.as_deref() {
+            bail!("OpenCode capability diagnostic failed before run: {error}");
+        }
+        let selected = capabilities.models.iter()
+            .find(|model| model.provider == "opencode" && model.id == "space-bunny-free")
+            .or_else(|| capabilities.models.iter().find(|model| model.provider == "opencode" && model.id.contains("free")))
+            .context("OpenCode run diagnostic requires an available free opencode model")?;
+        let workspace = agent_sandbox.probe_workspace().to_path_buf();
+        let proof = workspace.join("opencode-write-proof.txt");
+        let _ = tokio::fs::remove_file(&proof).await;
+        let runtime = OpenCodeRuntime {
+            binary: args.opencode_bin.clone(),
+            provider: Some(selected.provider.clone()),
+            model: Some(selected.id.clone()),
+            session_dir: None,
+            sandbox: agent_sandbox.clone(),
+        };
+        let result = runtime.run(
+            &workspace,
+            "Create opencode-write-proof.txt containing exactly ok followed by a newline. Make the file now; do not just explain.",
+            None,
+        ).await?;
+        let contents = tokio::fs::read_to_string(&proof).await.context("OpenCode run diagnostic did not create proof file")?;
+        if contents != "ok\n" {
+            bail!("OpenCode run diagnostic wrote unexpected proof content: {contents:?}");
+        }
+        println!("OpenCode run diagnostic PASS model={}/{} summary={}", selected.provider, selected.id, result.summary.trim());
         return Ok(());
     }
     if args.opencode_capabilities_diagnose {

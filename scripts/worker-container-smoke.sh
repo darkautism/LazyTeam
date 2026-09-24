@@ -99,3 +99,21 @@ while [ "$attempt" -le 2 ]; do
   fi
   attempt=$((attempt + 1))
 done
+
+# Headless implementation agents must be able to make an actual file edit
+# through LazyTeam's OpenCodeRuntime + AgentSandbox, not by calling the CLI
+# directly. This also exercises the build/auto permission policy.
+set +e
+write_output="$(run_worker lazyteam-worker --opencode-run-diagnose)"
+write_status=$?
+set -e
+printf '%s\n' "$write_output"
+if [ "$write_status" -ne 0 ]; then
+  compact="$(printf '%s' "$write_output" | tail -c 4000 | tr '\r\n' '  ')"
+  echo "::error title=Worker OpenCode write smoke failed::$compact"
+  exit "$write_status"
+fi
+printf '%s\n' "$write_output" | grep -F 'OpenCode run diagnostic PASS model=opencode/' >/dev/null || {
+  echo "::error title=Worker OpenCode write smoke failed::runtime did not report a successful sandbox write"
+  exit 1
+}

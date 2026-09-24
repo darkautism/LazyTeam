@@ -27,6 +27,14 @@ jobs:
           "$real_bin" --version
           LAZYTEAM_REAL_OPENCODE_BIN="$real_bin" \
             cargo test -p lazyteam-worker real_opencode_catalog_refresh_works_through_agent_sandbox -- --ignored --nocapture
+          catalog="$($real_bin models --refresh)"
+          run_model="$(printf '%s\n' "$catalog" | grep -Fx 'opencode/space-bunny-free' | head -n 1 || true)"
+          if [ -z "$run_model" ]; then
+            run_model="$(printf '%s\n' "$catalog" | grep -E '^opencode/.*free.*$' | head -n 1 || true)"
+          fi
+          test -n "$run_model"
+          LAZYTEAM_REAL_OPENCODE_BIN="$real_bin" LAZYTEAM_REAL_OPENCODE_RUN_MODEL="$run_model" \
+            cargo test -p lazyteam-worker real_opencode_run_writes_through_agent_sandbox -- --ignored --nocapture
       - run: cargo test --workspace
       - run: python3 scripts/ui-regression.py
       - run: sh scripts/pi-auto-update-smoke.sh
