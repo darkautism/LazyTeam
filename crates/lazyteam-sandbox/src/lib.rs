@@ -12,6 +12,8 @@ use tokio::process::Command;
 const EXEC_ARG: &str = "__lazyteam-sandbox-exec";
 const CONTAINER_EXEC_ARG: &str = "__lazyteam-container-exec";
 const SIGNAL_PROBE_ARG: &str = "__lazyteam-sandbox-signal-probe";
+const PARENT_KILL_PROBE_ARG: &str = "__lazyteam-sandbox-parent-kill-probe";
+const PATH_ACCESS_PROBE_ARG: &str = "__lazyteam-sandbox-path-access-probe";
 const SPEC_ENV: &str = "LAZYTEAM_SANDBOX_SPEC";
 const UID_ISOLATION_ENV: &str = "LAZYTEAM_SANDBOX_UID";
 const SANDBOX_PI_SHARED_GID: u32 = 19_999;
@@ -525,6 +527,24 @@ impl AgentSandbox {
 
     pub fn command(&self, program: &str, workspace: &Path, session_dir: Option<&Path>) -> anyhow::Result<Command> {
         let workspace = canonical_dir(workspace).context("canonicalize agent workspace")?;
+        let session_dir = session_dir
+            .map(canonical_dir)
+            .transpose()
+            .context("canonicalize Pi session directory")?;
+        let sandbox_uid = if self.trusted_container_daemon {
+            let uid = sandbox_uid_for_workspace(&self.sandbox_uid_dir, &workspace)?;
+            // Mirrors are created by the trusted daemon, but Pi runs as this
+            // per-workspace uid. Normalize task-local ownership before exec so
+            // ordinary access(2), Git safe-directory checks, and Pi's edit
+            // tool agree with the sandbox identity without CAP_DAC workarounds.
+            set_sandbox_owned_tree(&workspace, uid)?;
+            if let Some(session_dir) = session_dir.as_deref() {
+                set_sandbox_owned_tree(session_dir, uid)?;
+            }
+            Some(uid)
+        } else {
+            None
+        };
         let mut read_write = vec![
             workspace.clone(),
             self.pi_config_dir.clone(),
@@ -533,8 +553,8 @@ impl AgentSandbox {
             self.cargo_target_dir.clone(),
             self.tmp_dir.clone(),
         ];
-        if let Some(session_dir) = session_dir {
-            read_write.push(canonical_dir(session_dir).context("canonicalize Pi session directory")?);
+        if let Some(session_dir) = session_dir.as_ref() {
+            read_write.push(session_dir.clone());
         }
         for device in ["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"] {
             if let Ok(path) = std::fs::canonicalize(device) {
@@ -544,11 +564,6 @@ impl AgentSandbox {
 
         let nested_read_only = workspace.join(".git");
         let nested_read_only = nested_read_only.exists().then_some(nested_read_only).into_iter().collect();
-        let sandbox_uid = if self.trusted_container_daemon {
-            Some(sandbox_uid_for_workspace(&self.sandbox_uid_dir, &workspace)?)
-        } else {
-            None
-        };
         let spec = SandboxSpec {
             read_only: self.read_only.clone(),
             read_write,
@@ -642,7 +657,28 @@ impl AgentSandbox {
             );
         }
 
+        // Catch the exact class of regression Pi/Node hits: chdir/stat
+        // can succeed under CAP_DAC_OVERRIDE while access(2)-style existence
+        // checks fail for the real per-task uid because a synthetic namespace
+        // ancestor is not searchable.
+        let session_probe = self.state_dir.join("sessions").join(".sandbox-path-probe");
+        tokio::fs::create_dir_all(&session_probe).await?;
+        set_private_dir(&session_probe).await?;
         let launcher = self.launcher_exe.to_str().context("sandbox launcher path is not UTF-8")?;
+        let mut command = self.command(launcher, &self.probe_dir, Some(&session_probe))?;
+        command
+            .arg(PATH_ACCESS_PROBE_ARG)
+            .arg(&self.probe_dir)
+            .arg(&session_probe);
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let output = command.output().await.context("probe sandbox access-style path visibility")?;
+        if !output.status.success() {
+            bail!(
+                "agent sandbox access-style path visibility probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
         let mut command = self.command(launcher, &self.probe_dir, None)?;
         command.arg(SIGNAL_PROBE_ARG);
         command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
@@ -652,6 +688,31 @@ impl AgentSandbox {
                 "agent sandbox process-isolation probe failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
+        }
+
+        if self.trusted_container_daemon {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut command = self.command(launcher, &self.probe_dir, None)?;
+            command.arg(PARENT_KILL_PROBE_ARG);
+            command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut child = command.spawn().context("spawn trusted parent kill probe")?;
+            let stdout = child.stdout.take().context("trusted parent kill probe stdout missing")?;
+            let mut lines = BufReader::new(stdout).lines();
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(3), lines.next_line())
+                .await
+                .context("trusted parent kill probe did not become ready")??
+                .unwrap_or_default();
+            if ready.trim() != "ready" {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+                bail!("trusted parent kill probe returned unexpected readiness marker");
+            }
+            if let Err(error) = child.start_kill() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+                bail!("trusted worker cannot terminate isolated sandbox child; CAP_KILL is required: {error}");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
+                .await
+                .context("isolated sandbox child did not exit after trusted parent kill")??;
         }
         Ok(())
     }
@@ -706,7 +767,54 @@ pub fn maybe_handle_entrypoint() -> Option<anyhow::Result<()>> {
     if mode == OsStr::new(SIGNAL_PROBE_ARG) {
         return Some(sandbox_signal_probe());
     }
+    if mode == OsStr::new(PARENT_KILL_PROBE_ARG) {
+        return Some(sandbox_parent_kill_probe());
+    }
+    if mode == OsStr::new(PATH_ACCESS_PROBE_ARG) {
+        return Some(sandbox_path_access_probe(args.collect()));
+    }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_parent_kill_probe() -> anyhow::Result<()> {
+    use std::io::Write;
+    println!("ready");
+    std::io::stdout().flush().context("flush trusted parent kill probe readiness")?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_parent_kill_probe() -> anyhow::Result<()> {
+    bail!("sandbox parent kill probe requires Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_path_access_probe(paths: Vec<OsString>) -> anyhow::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    if paths.is_empty() {
+        bail!("sandbox path access probe requires at least one path");
+    }
+    for path in paths {
+        let path = PathBuf::from(path);
+        let c_path = CString::new(path.as_os_str().as_bytes()).context("sandbox probe path contains NUL")?;
+        if unsafe { libc::access(c_path.as_ptr(), libc::R_OK | libc::W_OK | libc::X_OK) } != 0 {
+            bail!(
+                "access(2) cannot read/write/traverse sandbox path {} as uid {} gid {}: {}",
+                path.display(),
+                unsafe { libc::geteuid() },
+                unsafe { libc::getegid() },
+                std::io::Error::last_os_error(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_path_access_probe(_paths: Vec<OsString>) -> anyhow::Result<()> {
+    bail!("sandbox path access probe requires Linux")
 }
 
 #[cfg(target_os = "linux")]
@@ -1047,8 +1155,37 @@ fn prepare_container_mountpoint(rootfs: &Path, source: &Path) -> anyhow::Result<
         if let Some(parent) = destination.parent() { fs::create_dir_all(parent)?; }
         if !destination.exists() { fs::File::create(&destination)?; }
     }
+    make_container_bind_ancestors_searchable(rootfs, &destination)?;
     Ok(())
 }
+
+#[cfg(unix)]
+fn make_container_bind_ancestors_searchable(rootfs: &Path, destination: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut current = destination.parent();
+    while let Some(path) = current {
+        if path == rootfs {
+            break;
+        }
+        if !path.starts_with(rootfs) {
+            break;
+        }
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("stat container bind ancestor {}", path.display()))?;
+        if metadata.is_dir() {
+            let mode = metadata.permissions().mode();
+            // Search-only for unrelated UIDs: do not grant read/list or write.
+            if mode & 0o001 == 0 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o001))?;
+            }
+        }
+        current = path.parent();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_container_bind_ancestors_searchable(_rootfs: &Path, _destination: &Path) -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(target_os = "linux")]
 fn bind_into_container(rootfs: &Path, source: &Path, read_only: bool) -> anyhow::Result<()> {
@@ -1309,6 +1446,13 @@ fn apply_namespace_fs_policy(spec: &SandboxSpec) -> anyhow::Result<()> {
         bail!("mount sandbox tmpfs root failed: {}", std::io::Error::last_os_error());
     }
 
+    // Prepare every synthetic mountpoint before any read-only bind can
+    // cover one of its parents. This keeps access(2)-style path traversal
+    // repair confined to the tmpfs skeleton instead of trying to chmod an
+    // already read-only mounted subtree.
+    for source in spec.read_only.iter().chain(spec.read_write.iter()) {
+        prepare_container_mountpoint(&root, source)?;
+    }
     for source in &spec.read_only {
         bind_into_root(&root, source, true)?;
     }
@@ -1784,6 +1928,43 @@ async fn shared_pi_dir_marker(path: &Path) -> anyhow::Result<bool> {
 async fn shared_pi_dir_marker(_path: &Path) -> anyhow::Result<bool> { Ok(false) }
 
 #[cfg(unix)]
+fn set_sandbox_owned_tree(path: &Path, uid: u32) -> anyhow::Result<()> {
+    fn visit(path: &Path, uid: u32) -> anyhow::Result<()> {
+        use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::{MetadataExt, PermissionsExt}}};
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("stat sandbox-owned path {}", path.display()))?;
+        if metadata.uid() != uid || metadata.gid() != uid {
+            let c_path = CString::new(path.as_os_str().as_bytes()).context("sandbox-owned path contains NUL")?;
+            if unsafe { libc::lchown(c_path.as_ptr(), uid, uid) } != 0 {
+                bail!("set sandbox path owner failed for {}: {}", path.display(), std::io::Error::last_os_error());
+            }
+        }
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if metadata.is_dir() {
+            if metadata.permissions().mode() & 0o777 != 0o700 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            }
+            for entry in std::fs::read_dir(path)? {
+                visit(&entry?.path(), uid)?;
+            }
+        } else if metadata.is_file() {
+            let desired = 0o600 | (metadata.permissions().mode() & 0o100);
+            if metadata.permissions().mode() & 0o777 != desired {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(desired))?;
+            }
+        }
+        Ok(())
+    }
+
+    visit(path, uid)
+}
+
+#[cfg(not(unix))]
+fn set_sandbox_owned_tree(_path: &Path, _uid: u32) -> anyhow::Result<()> { Ok(()) }
+
+#[cfg(unix)]
 async fn set_shared_pi_dir(path: &Path) -> anyhow::Result<()> {
     use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::{MetadataExt, PermissionsExt}}};
     let c_path = CString::new(path.as_os_str().as_bytes()).context("Pi config path contains NUL")?;
@@ -1929,6 +2110,64 @@ mod tests {
             assert_eq!(metadata.uid(), 20_000, "repair must not steal file ownership from the sandbox UID");
             assert_eq!(metadata.gid(), SANDBOX_PI_SHARED_GID);
             assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_owned_tree_normalizes_current_uid_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        if uid != gid {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("lazyteam-owned-tree-test-{}", uuid::Uuid::new_v4()));
+        let sub = root.join("sub");
+        let file = sub.join("file");
+        let executable = sub.join("run");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::write(&executable, b"#!/bin/sh
+").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        set_sandbox_owned_tree(&root, uid).unwrap();
+
+        for dir in [&root, &sub] {
+            let metadata = std::fs::metadata(dir).unwrap();
+            assert_eq!(metadata.uid(), uid);
+            assert_eq!(metadata.gid(), uid);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&executable).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_bind_ancestors_gain_search_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lazyteam-bind-ancestor-test-{}", uuid::Uuid::new_v4()));
+        let rootfs = root.join("rootfs");
+        let parent = rootfs.join("app/state/agent-workspaces");
+        let destination = parent.join("task");
+        std::fs::create_dir_all(&destination).unwrap();
+        for path in [rootfs.join("app"), rootfs.join("app/state"), parent.clone()] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+
+        make_container_bind_ancestors_searchable(&rootfs, &destination).unwrap();
+
+        for path in [rootfs.join("app"), rootfs.join("app/state"), parent] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o001, 0o001, "{} must be searchable by the isolated uid", path.display());
+            assert_eq!(mode & 0o006, 0, "{} must not become readable/listable or writable to others", path.display());
         }
         std::fs::remove_dir_all(root).unwrap();
     }

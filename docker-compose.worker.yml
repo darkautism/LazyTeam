@@ -24,6 +24,9 @@ services:
       - CHOWN
       - DAC_OVERRIDE
       - FSETID
+      - FOWNER
+      # The trusted daemon owns sandbox lifecycle; agents themselves drop this.
+      - KILL
       - SYS_ADMIN
       - SYS_CHROOT
       - SETGID

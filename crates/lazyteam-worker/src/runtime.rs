@@ -16,6 +16,7 @@ const DEFAULT_WATCHDOG_MAX_MISSED_PROBES: u32 = 3;
 const DEFAULT_WATCHDOG_MAX_INACTIVE_PROBES: u32 = 3;
 const DEFAULT_WATCHDOG_TOOL_STALL_SECS: u64 = 10 * 60;
 const DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS: u64 = 25 * 60;
+const DEFAULT_WATCHDOG_MODEL_STALL_SECS: u64 = 6 * 60;
 const TOOL_TIMEOUT_GRACE_SECS: u64 = 15;
 const DEFAULT_REVIEW_SOFT_TOOL_BUDGET: u64 = 12;
 const DEFAULT_REVIEW_HARD_TOOL_BUDGET: u64 = 20;
@@ -80,6 +81,19 @@ fn watchdog_tool_hard_limit() -> Duration {
         60,
         DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS,
     )
+}
+
+fn watchdog_model_stall_window() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_HARNESS_MODEL_STALL_SECS",
+        DEFAULT_WATCHDOG_MODEL_STALL_SECS,
+        60,
+        15 * 60,
+    )
+}
+
+fn non_tool_phase_stalled(last_progress: Instant, now: Instant, window: Duration, has_active_tool: bool) -> bool {
+    !has_active_tool && now.saturating_duration_since(last_progress) >= window
 }
 
 fn tool_stalled(last_progress: Instant, now: Instant, window: Duration) -> bool {
@@ -1076,6 +1090,17 @@ fn format_tool_diagnostic(state: &ActiveToolState, now: Instant) -> String {
     )
 }
 
+async fn terminate_pi_child(child: &mut tokio::process::Child) -> anyhow::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    child.start_kill().context("signal Pi RPC child")?;
+    tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .context("Pi RPC child did not exit within 5s after termination signal")??;
+    Ok(())
+}
+
 async fn abort_pi_run(
     child: &mut tokio::process::Child,
     stdin: &mut tokio::process::ChildStdin,
@@ -1086,8 +1111,9 @@ async fn abort_pi_run(
         let _ = stdin.flush().await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    if let Err(error) = terminate_pi_child(child).await {
+        tracing::warn!(%error, "failed to terminate Pi RPC child during watchdog abort");
+    }
 }
 
 #[derive(Debug)]
@@ -1370,6 +1396,7 @@ impl PiRuntime {
         let max_inactive_probes = watchdog_max_inactive_probes();
         let tool_stall_window = watchdog_tool_stall_window();
         let tool_hard_limit = watchdog_tool_hard_limit();
+        let model_stall_window = watchdog_model_stall_window();
         let mut phase = RunPhase::Starting;
         let mut active_tools = ActiveTools::new();
         let mut next_probe_at = Instant::now() + probe_interval;
@@ -1377,6 +1404,7 @@ impl PiRuntime {
         let mut missed_probes = 0u32;
         let mut inactive_probes = 0u32;
         let mut probe_sequence = 0u64;
+        let mut last_meaningful_progress = Instant::now();
 
         loop {
             let wait_until = probe_deadline.unwrap_or(next_probe_at);
@@ -1439,8 +1467,10 @@ impl PiRuntime {
             // Tool progress is tied strictly to tool execution events.
             // Periodic `get_state` responses refresh liveness only and must
             // never refresh the tool stall clock (see `pi_state_probe_active`).
-            if observe_pi_activity(&event, &mut phase, &mut active_tools, Instant::now()) {
+            let now = Instant::now();
+            if observe_pi_activity(&event, &mut phase, &mut active_tools, now) {
                 inactive_probes = 0;
+                last_meaningful_progress = now;
             }
             if let Some(active) = pi_state_probe_active(&event, phase, active_tools.any()) {
                 if active {
@@ -1465,6 +1495,31 @@ impl PiRuntime {
                         bail!(reason);
                     }
                 }
+            }
+
+            let now = Instant::now();
+            if non_tool_phase_stalled(
+                last_meaningful_progress,
+                now,
+                model_stall_window,
+                active_tools.any(),
+            ) {
+                let stalled_for = now.saturating_duration_since(last_meaningful_progress);
+                tracing::warn!(
+                    session = session_name,
+                    phase = phase.as_str(),
+                    stalled_for_secs = stalled_for.as_secs(),
+                    stall_limit_secs = model_stall_window.as_secs(),
+                    "Pi model/provider phase produced no meaningful progress; aborting run"
+                );
+                let reason = format!(
+                    "Pi model/provider phase '{}' produced no meaningful progress for {}s (limit {}s)",
+                    phase.as_str(),
+                    stalled_for.as_secs(),
+                    model_stall_window.as_secs(),
+                );
+                abort_pi_run(&mut child, &mut stdin).await;
+                bail!(reason);
             }
 
             if phase == RunPhase::ToolRunning {
@@ -1526,11 +1581,11 @@ impl PiRuntime {
                     }
                 }
                 Some("extension_ui_request") => {
-                    let _ = child.kill().await;
+                    terminate_pi_child(&mut child).await?;
                     bail!("Pi requested interactive extension UI; worker tasks must be unattended");
                 }
                 Some("extension_error") if extension.is_some() => {
-                    let _ = child.kill().await;
+                    terminate_pi_child(&mut child).await?;
                     bail!("Pi reviewer MCP bridge failed to load");
                 }
                 Some("tool_execution_end") => {
@@ -1588,7 +1643,7 @@ impl PiRuntime {
                             .to_string();
                         break;
                     }
-                    let _ = child.kill().await;
+                    terminate_pi_child(&mut child).await?;
                     bail!("Pi failed to return final assistant text: {event}");
                 }
                 _ => {}
@@ -1599,8 +1654,9 @@ impl PiRuntime {
             let status = child.wait().await?;
             bail!("Pi RPC exited before agent_settled: {status}");
         }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        terminate_pi_child(&mut child)
+            .await
+            .context("terminate settled Pi RPC child")?;
         Ok(AgentRunResult { summary, backend_session_id: None })
     }
 
@@ -1889,6 +1945,19 @@ impl AgentRuntime for PiRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pi_child_termination_is_bounded_and_reaps() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), terminate_pi_child(&mut child))
+            .await
+            .expect("Pi child termination must be bounded")
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_some(), "terminated child must be reaped");
+    }
 
     #[test]
     fn reviewer_convergence_steers_on_completed_tool_budgets_only() {
@@ -2388,6 +2457,31 @@ mod tests {
         let second_tool_started = start + Duration::from_secs(29 * 60);
         let now = start + Duration::from_secs(45 * 60);
         assert!(!tool_stalled(second_tool_started, now, window));
+    }
+
+    #[test]
+    fn streaming_state_probe_does_not_mask_model_stall() {
+        let start = Instant::now();
+        let window = Duration::from_secs(DEFAULT_WATCHDOG_MODEL_STALL_SECS);
+        let probe = json!({
+            "type":"response",
+            "command":"get_state",
+            "success":true,
+            "data":{"isStreaming":true,"isCompacting":false,"pendingMessageCount":0}
+        });
+        assert_eq!(pi_state_probe_active(&probe, RunPhase::ModelStreaming, false), Some(true));
+        assert!(non_tool_phase_stalled(
+            start,
+            start + window,
+            window,
+            false,
+        ), "liveness responses must not keep a provider stream alive forever");
+        assert!(!non_tool_phase_stalled(
+            start,
+            start + window,
+            window,
+            true,
+        ), "active tools use their own stall/hard-limit clocks");
     }
 
     #[test]
