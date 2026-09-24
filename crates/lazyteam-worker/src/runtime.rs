@@ -2067,6 +2067,29 @@ mod tests {
     }
 
     #[test]
+    fn bounded_requested_timeout_is_capped_by_global_hard_limit() {
+        let now = Instant::now();
+        let state = ActiveToolState {
+            name: "bash".to_string(),
+            call_id: Some("call-timeout-cap-1".to_string()),
+            started_at: now,
+            last_progress_at: now,
+            update_count: 0,
+            args_available: true,
+            command_class: "cargo-test".to_string(),
+            program: Some("cargo".to_string()),
+            command_summary: "cargo test".to_string(),
+            fingerprint: "0123456789abcdef".to_string(),
+            requested_timeout_secs: Some(DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS),
+        };
+        // Requested timeout plus grace must never exceed the global hard limit.
+        assert_eq!(
+            active_tool_hard_limit(&state, Duration::from_secs(DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS)),
+            Duration::from_secs(DEFAULT_WATCHDOG_TOOL_HARD_LIMIT_SECS),
+        );
+    }
+
+    #[test]
     fn updating_bash_tool_counts_progress_for_stall_clock() {
         let mut phase = RunPhase::Starting;
         let mut tools = ActiveTools::new();
