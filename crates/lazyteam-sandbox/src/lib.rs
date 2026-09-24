@@ -2233,8 +2233,11 @@ mod tests {
                 libc::_exit(0);
             }
             let mut status = 0;
+            let started = std::time::Instant::now();
             assert_eq!(libc::waitpid(child, &mut status, 0), child);
             assert_eq!(status, 0, "uid-isolated signal seccomp child status={status}");
+            // Regression: child termination must complete within a bounded timeout, not hang.
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "sandbox child termination timed out");
             // Regression: the terminated child must be fully reaped; waiting again must fail.
             assert_eq!(libc::waitpid(child, &mut status, libc::WNOHANG), -1, "terminated sandbox child was not reaped");
         }
