@@ -2114,6 +2114,111 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Model-refresh regression (permissions side): Pi's catalog refresh
+    /// rewrites `models-store.json` with fresh content under a default umask,
+    /// so the worker must repair it back to the permissions the shared
+    /// sandbox UIDs expect — without touching credential contents.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_recreated_models_store_is_repaired_without_touching_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lazyteam-refresh-perms-test-{}", uuid::Uuid::new_v4()));
+        let pi_config_dir = root.join("pi-agent");
+        std::fs::create_dir_all(&pi_config_dir).unwrap();
+        let auth_before = br#"{"test-provider":{"type":"api_key","key":"secret-123"}}"#;
+        std::fs::write(pi_config_dir.join("auth.json"), auth_before).unwrap();
+        // Simulated post-refresh state: Pi replaced the models store with new
+        // content under a default umask instead of the shared worker mode.
+        std::fs::write(pi_config_dir.join("models-store.json"), br#"{"refreshed":true}"#).unwrap();
+        std::fs::write(pi_config_dir.join("models.json"), b"{}").unwrap();
+        for name in ["auth.json", "models-store.json", "models.json"] {
+            std::fs::set_permissions(pi_config_dir.join(name), std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let sandbox = AgentSandbox {
+            state_dir: root.clone(),
+            pi_config_dir: pi_config_dir.clone(),
+            home_dir: root.join("home"),
+            cargo_home: root.join("cargo"),
+            cargo_target_dir: root.join("target"),
+            tmp_dir: root.join("tmp"),
+            probe_dir: root.join("probe"),
+            namespace_root_base: root.join("roots"),
+            read_only: Vec::new(),
+            path: OsString::new(),
+            rustup_home: None,
+            container_rootfs: None,
+            container_read_only: Vec::new(),
+            pi_entrypoint: None,
+            pi_package_dir: None,
+            trusted_container_daemon: false,
+            sandbox_uid_dir: root.join("uids"),
+            launcher_exe: root.join("launcher"),
+        };
+        sandbox.repair_pi_state_permissions().await.unwrap();
+        for name in ["auth.json", "models-store.json", "models.json"] {
+            let mode = std::fs::metadata(pi_config_dir.join(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} must be private after refresh repair");
+        }
+        assert_eq!(std::fs::read(pi_config_dir.join("auth.json")).unwrap(), auth_before,
+            "repair must not mutate auth credential bytes");
+        assert_eq!(std::fs::read(pi_config_dir.join("models-store.json")).unwrap(), br#"{"refreshed":true}"#,
+            "repair must preserve refreshed catalog content");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // Trusted worker mode: the recreated store must be reshared for the
+        // per-task sandbox UIDs (group + mode) without stealing ownership or
+        // touching credentials. Requires root for chown.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::MetadataExt}};
+        let root = std::env::temp_dir().join(format!("lazyteam-refresh-shared-test-{}", uuid::Uuid::new_v4()));
+        let pi_config_dir = root.join("pi-agent");
+        std::fs::create_dir_all(&pi_config_dir).unwrap();
+        std::fs::write(pi_config_dir.join("auth.json"), auth_before).unwrap();
+        std::fs::write(pi_config_dir.join("models-store.json"), br#"{"refreshed":true}"#).unwrap();
+        for name in ["auth.json", "models-store.json"] {
+            let path = pi_config_dir.join(name);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            // Pi ran as the per-workspace sandbox UID and recreated the file
+            // outside the shared group.
+            let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(c_path.as_ptr(), 20_000, 20_000) }, 0);
+        }
+        let sandbox = AgentSandbox {
+            state_dir: root.clone(),
+            pi_config_dir: pi_config_dir.clone(),
+            home_dir: root.join("home"),
+            cargo_home: root.join("cargo"),
+            cargo_target_dir: root.join("target"),
+            tmp_dir: root.join("tmp"),
+            probe_dir: root.join("probe"),
+            namespace_root_base: root.join("roots"),
+            read_only: Vec::new(),
+            path: OsString::new(),
+            rustup_home: None,
+            container_rootfs: None,
+            container_read_only: Vec::new(),
+            pi_entrypoint: None,
+            pi_package_dir: None,
+            trusted_container_daemon: true,
+            sandbox_uid_dir: root.join("uids"),
+            launcher_exe: root.join("launcher"),
+        };
+        sandbox.repair_pi_state_permissions().await.unwrap();
+        for name in ["auth.json", "models-store.json"] {
+            let metadata = std::fs::metadata(pi_config_dir.join(name)).unwrap();
+            assert_eq!(metadata.uid(), 20_000, "repair must not steal recreated file from the sandbox UID");
+            assert_eq!(metadata.gid(), SANDBOX_PI_SHARED_GID, "recreated {name} must be reshared");
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o660, "recreated {name} must be group-usable");
+        }
+        assert_eq!(std::fs::read(pi_config_dir.join("auth.json")).unwrap(), auth_before,
+            "repair must not mutate auth credential bytes");
+        assert_eq!(std::fs::read(pi_config_dir.join("models-store.json")).unwrap(), br#"{"refreshed":true}"#,
+            "repair must preserve refreshed catalog content");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn sandbox_owned_tree_normalizes_current_uid_permissions() {

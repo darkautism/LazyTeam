@@ -5129,6 +5129,128 @@ mod tests {
         assert!(!state.model_refresh_requests.lock().await.contains_key(&worker_id));
     }
 
+    /// Model-refresh round-trip regression (server side).
+    ///
+    /// Host queue -> worker runtime-config delivery -> worker-authenticated
+    /// ACK through the real HTTP route shape (method + path + worker
+    /// credential check), not direct handler calls. Fails if ACK auth
+    /// regresses to allow unauthenticated use, if delivery consumes the
+    /// queue (no redelivery after a failed ACK), or if an ACK silently drops
+    /// later queued refreshes. Local in-memory SQLite only; no model call.
+    #[tokio::test]
+    async fn model_refresh_round_trip_over_http_requires_worker_auth_and_preserves_queue() {
+        let db = waiting_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        let worker_id = Uuid::new_v4();
+        seed_oauth_worker(&db, &worker_id, &now, "roundtrip-cred").await;
+        let catalog = serde_json::json!({
+            "model_discovery": true,
+            "providers": [
+                {"id": "key-only", "name": "Key Only", "configured": true, "api_key_label": "API key"}
+            ],
+            "models": []
+        }).to_string();
+        sqlx::query("UPDATE workers SET agent_capabilities=? WHERE id=?")
+            .bind(catalog)
+            .bind(worker_id.to_string())
+            .execute(&db).await.unwrap();
+        let state = waiting_state(db.clone());
+        let app = router().with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let queue_url = format!("{base}/api/workers/{worker_id}/models/refresh");
+        let config_url = format!("{base}/api/workers/{worker_id}/config");
+        let ack_url = |id: &str| format!("{base}/api/workers/{worker_id}/models/refresh/{id}/ack");
+
+        // Host queues two refreshes for the same provider.
+        let first: serde_json::Value = client.post(&queue_url)
+            .json(&serde_json::json!({"provider": "key-only"}))
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        let second: serde_json::Value = client.post(&queue_url)
+            .json(&serde_json::json!({"provider": "key-only"}))
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        let first_id = first.get("id").and_then(|v| v.as_str()).unwrap().to_string();
+        let second_id = second.get("id").and_then(|v| v.as_str()).unwrap().to_string();
+        assert_ne!(first_id, second_id);
+
+        // Delivery requires the worker credential: missing or wrong is 401
+        // and must not consume or reveal the queued request.
+        assert_eq!(client.get(&config_url).send().await.unwrap().status().as_u16(), 401);
+        assert_eq!(client.get(&config_url).header("x-lazyteam-worker-credential", "wrong-cred")
+            .send().await.unwrap().status().as_u16(), 401);
+        let delivered = |body: &serde_json::Value| body.get("model_refresh")
+            .and_then(|v| v.get("id")).and_then(|v| v.as_str()).map(str::to_string);
+        let config: serde_json::Value = client.get(&config_url)
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        assert_eq!(delivered(&config).as_deref(), Some(first_id.as_str()));
+        assert_eq!(config.get("model_refresh").and_then(|v| v.get("provider")).and_then(|v| v.as_str()), Some("key-only"));
+        // Delivery is a peek: polling again redelivers the same request.
+        let config: serde_json::Value = client.get(&config_url)
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        assert_eq!(delivered(&config).as_deref(), Some(first_id.as_str()));
+
+        // Out-of-order ACK is rejected and the head request is redelivered.
+        assert_eq!(client.post(&ack_url(&second_id))
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().status().as_u16(), 409);
+        let config: serde_json::Value = client.get(&config_url)
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        assert_eq!(delivered(&config).as_deref(), Some(first_id.as_str()));
+
+        // Unknown ACK ids are ignored without dropping queued refreshes.
+        let unknown = Uuid::new_v4().to_string();
+        assert_eq!(client.post(&ack_url(&unknown))
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().status().as_u16(), 204);
+        let config: serde_json::Value = client.get(&config_url)
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        assert_eq!(delivered(&config).as_deref(), Some(first_id.as_str()));
+
+        // ACK without the worker credential is 401 and keeps the request.
+        assert_eq!(client.post(&ack_url(&first_id)).send().await.unwrap().status().as_u16(), 401);
+        let config: serde_json::Value = client.get(&config_url)
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        assert_eq!(delivered(&config).as_deref(), Some(first_id.as_str()));
+
+        // ACK removes exactly the delivered request; the later queued
+        // refresh is preserved, not silently dropped.
+        assert_eq!(client.post(&ack_url(&first_id))
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().status().as_u16(), 204);
+        let config: serde_json::Value = client.get(&config_url)
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        assert_eq!(delivered(&config).as_deref(), Some(second_id.as_str()));
+        assert_eq!(client.post(&ack_url(&second_id))
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().status().as_u16(), 204);
+        let config: serde_json::Value = client.get(&config_url)
+            .header("x-lazyteam-worker-credential", "roundtrip-cred")
+            .send().await.unwrap().error_for_status().unwrap()
+            .json().await.unwrap();
+        assert!(config.get("model_refresh").is_none() || config.get("model_refresh").unwrap().is_null(),
+            "queue must be empty after all ACKs: {config}");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn provider_auth_endpoints_are_capability_gated() {
         let db = waiting_test_db().await;

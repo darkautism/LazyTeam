@@ -1792,28 +1792,7 @@ console.log(JSON.stringify(providers));"#
             dist.join("core").join("auth-storage.js").display()
         ))?;
         let provider = serde_json::to_string(provider)?;
-        let script = format!(
-            r#"import {{ ModelRuntime }} from {import_url};
-import {{ ReadOnlyAuthStorage }} from {auth_storage_url};
-const dir=process.env.PI_CODING_AGENT_DIR;
-const provider={provider};
-const controller=new AbortController();
-const timeout=setTimeout(()=>controller.abort(),15000);
-try {{
-  const rt=await ModelRuntime.create({{
-    credentials:new ReadOnlyAuthStorage(dir+"/auth.json"),
-    modelsPath:dir+"/models.json",
-    modelsStorePath:dir+"/models-store.json",
-    allowModelNetwork:false,
-    refreshOnCreate:false
-  }});
-  const result=await rt.refresh({{allowNetwork:true,force:true,providers:[provider],signal:controller.signal}});
-  if(result.aborted) throw new Error("model catalog refresh aborted");
-  const error=result.errors.get(provider);
-  if(error) throw error;
-}} finally {{ clearTimeout(timeout); }}
-console.log("ok");"#
-        );
+        let script = model_refresh_script(&import_url, &auth_storage_url, &provider);
         let sandbox = self.sandbox.clone();
         let refresh_result = match tokio::time::timeout(std::time::Duration::from_secs(20), async move {
             let mut command = sandbox.command("node", sandbox.probe_workspace(), None)?;
@@ -1882,6 +1861,39 @@ console.log(JSON.stringify(models));"#
             Ok(models)
         }).await.context("Pi capability probe timed out")?
     }
+}
+
+/// Node script executed for a forced provider model-catalog refresh.
+///
+/// Extracted as a pure builder so the refresh regression test runs the exact
+/// production script text against local fake Pi fixtures (no network, no paid
+/// model call). The script must keep using the read-only credential store:
+/// a writable `AuthStorage` here would let a refresh mutate or truncate the
+/// worker-scoped `auth.json`. `import_url`, `auth_storage_url`, and
+/// `provider_json` are pre-quoted JSON string literals.
+fn model_refresh_script(import_url: &str, auth_storage_url: &str, provider_json: &str) -> String {
+    format!(
+        r#"import {{ ModelRuntime }} from {import_url};
+import {{ ReadOnlyAuthStorage }} from {auth_storage_url};
+const dir=process.env.PI_CODING_AGENT_DIR;
+const provider={provider_json};
+const controller=new AbortController();
+const timeout=setTimeout(()=>controller.abort(),15000);
+try {{
+  const rt=await ModelRuntime.create({{
+    credentials:new ReadOnlyAuthStorage(dir+"/auth.json"),
+    modelsPath:dir+"/models.json",
+    modelsStorePath:dir+"/models-store.json",
+    allowModelNetwork:false,
+    refreshOnCreate:false
+  }});
+  const result=await rt.refresh({{allowNetwork:true,force:true,providers:[provider],signal:controller.signal}});
+  if(result.aborted) throw new Error("model catalog refresh aborted");
+  const error=result.errors.get(provider);
+  if(error) throw error;
+}} finally {{ clearTimeout(timeout); }}
+console.log("ok");"#
+    )
 }
 
 #[async_trait]
@@ -2995,6 +3007,119 @@ mod tests {
         let workspace = Path::new("/tmp");
         let resumed = runtime.run(workspace, "prompt", Some("task-derived-id")).await.unwrap();
         assert_eq!(resumed.backend_session_id, Option::<String>::None);
+    }
+
+    /// Model-refresh round-trip regression (worker side).
+    ///
+    /// Runs the exact production refresh script (`model_refresh_script`) with
+    /// plain `node` against local fake Pi fixtures: no network, no paid model
+    /// call. The refresh must use the read-only credential store, leave
+    /// `auth.json` byte-identical, and target the file-backed models store
+    /// whose permissions the worker repairs after every refresh.
+    #[tokio::test]
+    async fn model_refresh_uses_read_only_auth_and_preserves_credentials() {
+        let root = std::env::temp_dir().join(format!("lazyteam-refresh-regression-{}", Uuid::new_v4()));
+        let dist = root.join("pkg").join("dist");
+        let core = dist.join("core");
+        let pi_dir = root.join("pi-agent");
+        std::fs::create_dir_all(&core).unwrap();
+        std::fs::create_dir_all(&pi_dir).unwrap();
+
+        // Fake auth-storage module: the read-only store the refresh must use,
+        // plus the writable store production must never touch (tripwire).
+        std::fs::write(
+            core.join("auth-storage.js"),
+            r#"import fs from "node:fs";
+export class ReadOnlyAuthStorage {
+  constructor(path) { this.path = path; }
+  async modify() { throw new Error("ReadOnlyAuthStorage must not write during refresh"); }
+}
+export class AuthStorage {
+  constructor() {
+    fs.writeFileSync(process.env.LAZYTEAM_REFRESH_TRIPWIRE, "writable-store-used");
+    throw new Error("writable AuthStorage must not be used during refresh");
+  }
+}
+"#,
+        ).unwrap();
+        // Fake ModelRuntime: validates the read-only wiring, asserts the
+        // refresh arguments, and simulates Pi rewriting models-store.json
+        // with fresh (wrong) permissions like a real catalog refresh does.
+        std::fs::write(
+            dist.join("index.js"),
+            r#"import fs from "node:fs";
+import path from "node:path";
+export class ModelRuntime {
+  static async create(opts) {
+    if (opts.credentials?.constructor?.name !== "ReadOnlyAuthStorage") {
+      throw new Error("refresh must use ReadOnlyAuthStorage, got " + opts.credentials?.constructor?.name);
+    }
+    if (opts.allowModelNetwork !== false) throw new Error("refresh must set allowModelNetwork:false");
+    if (opts.refreshOnCreate !== false) throw new Error("refresh must set refreshOnCreate:false");
+    if (typeof opts.modelsStorePath !== "string" || !opts.modelsStorePath.endsWith("models-store.json")) {
+      throw new Error("refresh must use the file-backed modelsStorePath");
+    }
+    const dir = process.env.PI_CODING_AGENT_DIR;
+    return {
+      async refresh(args) {
+        if (args.allowNetwork !== true) throw new Error("refresh must set allowNetwork:true");
+        if (args.force !== true) throw new Error("refresh must set force:true");
+        const want = [process.env.LAZYTEAM_REFRESH_PROVIDER];
+        if (JSON.stringify(args.providers) !== JSON.stringify(want)) {
+          throw new Error("refresh scoped to wrong providers: " + JSON.stringify(args.providers));
+        }
+        const storePath = path.join(dir, "models-store.json");
+        fs.writeFileSync(storePath, JSON.stringify({ refreshed: true }));
+        fs.chmodSync(storePath, 0o644);
+        return { aborted: false, errors: new Map() };
+      }
+    };
+  }
+}
+"#,
+        ).unwrap();
+
+        let auth_before = br#"{"test-provider":{"type":"api_key","key":"secret-123"}}"#;
+        std::fs::write(pi_dir.join("auth.json"), auth_before).unwrap();
+        std::fs::write(pi_dir.join("models.json"), b"{}").unwrap();
+        let tripwire = root.join("writable-store-used");
+
+        let import_url = serde_json::to_string(&format!("file://{}", dist.join("index.js").display())).unwrap();
+        let auth_storage_url = serde_json::to_string(&format!("file://{}", core.join("auth-storage.js").display())).unwrap();
+        let provider_json = serde_json::to_string("test-provider").unwrap();
+        let script = model_refresh_script(&import_url, &auth_storage_url, &provider_json);
+
+        // Static shape: the regression fails loudly if refresh is rewired to
+        // a writable credential store or stops targeting the repaired file.
+        assert!(script.contains("ReadOnlyAuthStorage"), "refresh must use the read-only auth store");
+        assert!(!script.contains("new AuthStorage("), "refresh must not construct the writable auth store");
+        assert!(!script.contains("auth.modify"), "refresh must not write credentials");
+        assert!(script.contains("modelsStorePath"), "refresh must target the repaired models-store file");
+        assert!(script.contains("refreshOnCreate:false"), "refresh must not trigger create-time refresh");
+        assert!(script.contains("allowModelNetwork:false"), "refresh must not enable background model network");
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::process::Command::new("node")
+                .arg("--input-type=module")
+                .arg("--eval")
+                .arg(&script)
+                .env("PI_CODING_AGENT_DIR", &pi_dir)
+                .env("LAZYTEAM_REFRESH_PROVIDER", "test-provider")
+                .env("LAZYTEAM_REFRESH_TRIPWIRE", &tripwire)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        ).await.expect("model refresh fixture run timed out").expect("spawn node for refresh fixture");
+        assert!(output.status.success(), "refresh fixture failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+        assert!(!tripwire.exists(), "refresh touched the writable credential store");
+        let auth_after = std::fs::read(pi_dir.join("auth.json")).unwrap();
+        assert_eq!(auth_after, auth_before, "model refresh must not mutate auth credential bytes");
+        let store = std::fs::read(pi_dir.join("models-store.json")).unwrap();
+        assert!(String::from_utf8_lossy(&store).contains("refreshed"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
