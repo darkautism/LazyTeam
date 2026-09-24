@@ -348,6 +348,7 @@ mod tests {
         assert!(INDEX.contains("renderAgentCatalog(w,true)"));
         assert!(INDEX.contains("function workerAgentDraftChanged()"));
         assert!(INDEX.contains("Save agent backend first"));
+        assert!(INDEX.contains("draftAgent===persistedAgent"));
         assert!(INDEX.contains("button.disabled=false"));
     }
 
