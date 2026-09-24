@@ -12,6 +12,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+      # OpenCode sandbox tests re-exec the real worker binary as the sandbox
+      # launcher; cargo test only builds the libtest harness, not that binary.
+      - run: cargo build -p lazyteam-worker
       - run: cargo test --workspace
       - run: python3 scripts/ui-regression.py
       - run: sh scripts/pi-auto-update-smoke.sh

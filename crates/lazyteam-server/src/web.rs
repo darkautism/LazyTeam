@@ -149,7 +149,7 @@ mod tests {
         assert!(INDEX.contains("projectPill(p)"));
         assert!(INDEX.contains("taskCard(x,pm)"));
         assert!(INDEX.contains("white-space:nowrap"));
-        assert!(INDEX.contains("height:calc(1.35em * 3)"));
+        assert!(INDEX.contains("height:calc(1.4em * 3)"));
         assert!(!INDEX.contains("card-actions"));
         assert!(INDEX.contains("worker-pill"));
         assert!(INDEX.contains("reviewer-pill"));

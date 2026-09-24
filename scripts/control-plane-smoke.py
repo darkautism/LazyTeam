@@ -233,10 +233,13 @@ def main():
     expect(renew.status == 204, f"lease renew failed: {renew.status}")
 
     parent_ref = f"lazyteam/task-{parent['id'].replace('-', '')}"
+    parent_candidate, parent_base = create_broker_candidate(
+        assignment, worker_headers, assignment_capability, parent_ref, "parent-smoke.txt", "parent candidate\n"
+    )
     finish = request(
         f"/api/executions/{execution_id}/finish",
         method="POST",
-        obj={"result": {"status": "completed", "summary": "parent done", "commit_sha": "parent-candidate", "base_sha": "parent-base", "review_ref": parent_ref}},
+        obj={"result": {"status": "completed", "summary": "parent done", "commit_sha": parent_candidate, "base_sha": parent_base, "review_ref": parent_ref}},
         headers=lease_headers(worker_headers, assignment_capability),
     )
     expect(finish.status == 204, f"finish failed: {finish.status}")
@@ -300,10 +303,13 @@ def main():
     child_execution = child_assignment["execution"]["id"]
     child_capability = child_assignment["lease_capability"]
     child_ref = f"lazyteam/task-{child['id'].replace('-', '')}"
+    child_candidate, child_base = create_broker_candidate(
+        child_assignment, worker_headers, child_capability, child_ref, "child-smoke.txt", "child candidate\n"
+    )
     finish_child = request(
         f"/api/executions/{child_execution}/finish",
         method="POST",
-        obj={"result": {"status": "completed", "summary": "child done", "commit_sha": "child-candidate", "base_sha": "child-base", "review_ref": child_ref}},
+        obj={"result": {"status": "completed", "summary": "child done", "commit_sha": child_candidate, "base_sha": child_base, "review_ref": child_ref}},
         headers=lease_headers(worker_headers, child_capability),
     )
     expect(finish_child.status == 204, f"child finish failed: {finish_child.status}")
@@ -344,15 +350,19 @@ def main():
     expect(review_impl_assignment["task"]["id"] == review_task["id"], "wrong review implementation task claimed")
     review_execution = review_impl_assignment["execution"]["id"]
     review_impl_capability = review_impl_assignment["lease_capability"]
+    review_ref = f"lazyteam/task-{review_task['id'].replace('-', '')}"
+    review_candidate, review_base = create_broker_candidate(
+        review_impl_assignment, worker_headers, review_impl_capability, review_ref, "review-smoke.txt", "review candidate\n"
+    )
     review_finish = request(
         f"/api/executions/{review_execution}/finish",
         method="POST",
         obj={"result": {
             "status": "completed",
             "summary": "candidate ready",
-            "commit_sha": "candidate-sha",
-            "base_sha": "base-sha",
-            "review_ref": f"lazyteam/task-{review_task['id'].replace('-', '')}",
+            "commit_sha": review_candidate,
+            "base_sha": review_base,
+            "review_ref": review_ref,
         }},
         headers=lease_headers(worker_headers, review_impl_capability),
     )
@@ -387,7 +397,7 @@ def main():
     review_assignment = read_json(review_claim)
     expect(review_assignment["task"]["id"] == review_task["id"], "reviewer claimed wrong task")
     expect(review_assignment["review"]["execution_id"] == review_execution, "review was not pinned to implementation execution")
-    expect(review_assignment["checkout"]["commit_sha"] == "candidate-sha", "review checkout was not pinned to candidate SHA")
+    expect(review_assignment["checkout"]["commit_sha"] == review_candidate, "review checkout was not pinned to candidate SHA")
     expect(review_assignment["implementation_worker"]["id"] == worker_id, "review assignment lost implementation worker identity")
 
     raced_main = request(f"/api/tasks/{review_task['id']}/approve", method="POST", obj={})
@@ -639,10 +649,13 @@ def main():
     expect(delete_impl_claim.status == 200, "delete-review implementation claim failed")
     delete_impl = read_json(delete_impl_claim)
     delete_ref = f"lazyteam/task-{delete_review_task['id'].replace('-', '')}"
+    delete_candidate, delete_base = create_broker_candidate(
+        delete_impl, worker_headers, delete_impl["lease_capability"], delete_ref, "delete-review-smoke.txt", "delete review candidate\n"
+    )
     delete_impl_finish = request(
         f"/api/executions/{delete_impl['execution']['id']}/finish",
         method="POST",
-        obj={"result": {"status": "completed", "summary": "delete review candidate", "commit_sha": "delete-review", "base_sha": "delete-base", "review_ref": delete_ref}},
+        obj={"result": {"status": "completed", "summary": "delete review candidate", "commit_sha": delete_candidate, "base_sha": delete_base, "review_ref": delete_ref}},
         headers=lease_headers(worker_headers, delete_impl["lease_capability"]),
     )
     expect(delete_impl_finish.status == 204, "delete-review implementation finish failed")
