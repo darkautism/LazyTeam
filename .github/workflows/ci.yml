@@ -37,6 +37,7 @@ jobs:
             cargo test -p lazyteam-worker real_opencode_run_writes_through_agent_sandbox -- --ignored --nocapture
       - run: cargo test --workspace
       - run: python3 scripts/ui-regression.py
+      - run: node scripts/check-ui-js.mjs
       - run: sh scripts/pi-auto-update-smoke.sh
 
       - name: Development OAuth and scheduler smoke tests
