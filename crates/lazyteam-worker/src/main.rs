@@ -60,6 +60,9 @@ struct Args {
     /// Probe Pi providers/models through the real Ubuntu container + inner sandbox and exit.
     #[arg(long)]
     capabilities_diagnose: bool,
+    /// Probe OpenCode providers/models through the real worker sandbox and exit.
+    #[arg(long)]
+    opencode_capabilities_diagnose: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,7 +241,7 @@ async fn async_main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&args.workspace_dir).await?;
     let mut local_installed_capabilities = load_local_installed_capabilities(&args.state_dir).await?;
     let mut agent_rootfs = build_agent_rootfs(&args.state_dir, &local_installed_capabilities).await?;
-    let mut agent_sandbox = AgentSandbox::prepare(&args.state_dir, &args.pi_bin, Some(&agent_rootfs)).await?;
+    let mut agent_sandbox = AgentSandbox::prepare_with_agent_binaries(&args.state_dir, &args.pi_bin, &args.opencode_bin, Some(&agent_rootfs)).await?;
     if local_installed_capabilities.contains("rust") {
         let installed = agent_sandbox.probe_managed_rust_toolchain().await?;
         info!(toolchain = %installed.replace('\n', "; "), "managed Rust toolchain verified through agent sandbox");
@@ -246,6 +249,22 @@ async fn async_main() -> anyhow::Result<()> {
     info!(rootfs = %agent_rootfs.display(), "agent Ubuntu rootfs + intuitive tooling + sandboxed Git ready");
     if args.sandbox_diagnose {
         println!("LazyTeam agent sandbox {}", agent_sandbox.diagnostic_summary());
+        return Ok(());
+    }
+    if args.opencode_capabilities_diagnose {
+        let runtime = OpenCodeRuntime {
+            binary: args.opencode_bin.clone(),
+            provider: None,
+            model: None,
+            session_dir: None,
+            sandbox: agent_sandbox.clone(),
+        };
+        runtime.force_refresh_models().await?;
+        let capabilities = runtime.capabilities().await;
+        println!("{}", serde_json::to_string_pretty(&capabilities)?);
+        if let Some(error) = capabilities.probe_error {
+            bail!("OpenCode capability diagnostic failed: {error}");
+        }
         return Ok(());
     }
     if args.capabilities_diagnose {
@@ -342,7 +361,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
     let mut runtime_config = fetch_runtime_config(&client, &server, &worker_credential, worker_id).await?;
     match reconcile_managed_capabilities(
-        &client, &server, &worker_credential, worker_id, &args.state_dir, &args.pi_bin,
+        &client, &server, &worker_credential, worker_id, &args.state_dir, &args.pi_bin, &args.opencode_bin,
         &mut runtime_config, &mut local_installed_capabilities, &mut agent_rootfs,
         &mut agent_sandbox, &mut probe_runtime,
     ).await {
@@ -543,7 +562,7 @@ async fn async_main() -> anyhow::Result<()> {
             continue;
         }
         if let Err(error) = reconcile_managed_capabilities(
-            &client, &server, &worker_credential, worker_id, &args.state_dir, &args.pi_bin,
+            &client, &server, &worker_credential, worker_id, &args.state_dir, &args.pi_bin, &args.opencode_bin,
             &mut runtime_config, &mut local_installed_capabilities, &mut agent_rootfs,
             &mut agent_sandbox, &mut probe_runtime,
         ).await {
@@ -887,6 +906,7 @@ async fn reconcile_managed_capabilities(
     worker_id: Uuid,
     state_dir: &Path,
     pi_bin: &str,
+    opencode_bin: &str,
     runtime_config: &mut WorkerRuntimeConfig,
     local_installed: &mut BTreeSet<String>,
     agent_rootfs: &mut PathBuf,
@@ -902,7 +922,7 @@ async fn reconcile_managed_capabilities(
         let rootfs = build_agent_rootfs_with_heartbeat(client, server, credential, worker_id, state_dir, &target, local_installed).await?;
         let tail = capability_build_log_tail(state_dir).await;
         let _ = report_capability_build(client, server, credential, worker_id, local_installed, "activating", &tail).await;
-        let sandbox = AgentSandbox::prepare(state_dir, pi_bin, Some(&rootfs)).await?;
+        let sandbox = AgentSandbox::prepare_with_agent_binaries(state_dir, pi_bin, opencode_bin, Some(&rootfs)).await?;
         if target.contains("rust") {
             let installed = sandbox.probe_managed_rust_toolchain().await?;
             info!(toolchain = %installed.replace('\n', "; "), "managed Rust toolchain verified before rootfs activation");

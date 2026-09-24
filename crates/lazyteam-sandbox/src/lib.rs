@@ -16,7 +16,7 @@ const PARENT_KILL_PROBE_ARG: &str = "__lazyteam-sandbox-parent-kill-probe";
 const PATH_ACCESS_PROBE_ARG: &str = "__lazyteam-sandbox-path-access-probe";
 const SPEC_ENV: &str = "LAZYTEAM_SANDBOX_SPEC";
 const UID_ISOLATION_ENV: &str = "LAZYTEAM_SANDBOX_UID";
-const SANDBOX_PI_SHARED_GID: u32 = 19_999;
+const SANDBOX_AGENT_SHARED_GID: u32 = 19_999;
 const SANDBOX_UID_MIN: u32 = 20_000;
 const SANDBOX_UID_MAX: u32 = 59_999;
 const LOCAL_ARTIFACT_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".pytest_cache", ".venv"];
@@ -233,6 +233,7 @@ pub struct AgentSandbox {
     state_dir: PathBuf,
     pi_config_dir: PathBuf,
     home_dir: PathBuf,
+    opencode_home_dir: PathBuf,
     cargo_home: PathBuf,
     cargo_target_dir: PathBuf,
     tmp_dir: PathBuf,
@@ -252,6 +253,15 @@ pub struct AgentSandbox {
 
 impl AgentSandbox {
     pub async fn prepare(state_dir: &Path, pi_bin: &str, container_rootfs: Option<&Path>) -> anyhow::Result<Self> {
+        Self::prepare_with_agent_binaries(state_dir, pi_bin, "", container_rootfs).await
+    }
+
+    pub async fn prepare_with_agent_binaries(
+        state_dir: &Path,
+        pi_bin: &str,
+        opencode_bin: &str,
+        container_rootfs: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let state_dir = canonical_dir(state_dir).context("canonicalize worker state directory")?;
         let requested_container_rootfs = container_rootfs.map(canonical_dir).transpose().context("canonicalize agent rootfs")?;
         let container_rootfs = if requested_container_rootfs.is_some() && nested_mount_namespace_available() {
@@ -273,6 +283,7 @@ impl AgentSandbox {
             .is_some_and(|value| value == "1");
         let pi_config_dir = state_dir.join("pi-agent");
         let home_dir = state_dir.join("agent-home");
+        let opencode_home_dir = state_dir.join("opencode-home");
         let cargo_home = state_dir.join("agent-cache").join("cargo");
         let cargo_target_dir = state_dir.join("agent-cache").join("target");
         let tmp_dir = state_dir.join("agent-tmp");
@@ -282,12 +293,19 @@ impl AgentSandbox {
         if namespace_root_base.exists() {
             tokio::fs::remove_dir_all(&namespace_root_base).await?;
         }
-        for dir in [&home_dir, &cargo_home, &cargo_target_dir, &tmp_dir, &probe_dir, &namespace_root_base, &sandbox_uid_dir] {
+        for dir in [&home_dir, &opencode_home_dir, &cargo_home, &cargo_target_dir, &tmp_dir, &probe_dir, &namespace_root_base, &sandbox_uid_dir] {
             tokio::fs::create_dir_all(dir).await?;
             set_private_dir(dir).await?;
         }
         tokio::fs::create_dir_all(&pi_config_dir).await?;
         if trusted_container_daemon {
+            // OpenCode uses HOME for worker-scoped runtime state (including
+            // ~/.opencode). Every task has a distinct sandbox UID, so the
+            // shared backend home must be writable through the same dedicated
+            // supplementary group used for worker-scoped agent credentials.
+            // Repair the whole tree on startup so state created by older images
+            // cannot strand the next sandbox UID behind root-only permissions.
+            set_shared_agent_tree(&opencode_home_dir).await?;
             // Task sandboxes use distinct real UIDs for signal isolation, but
             // Pi authentication is worker-scoped state shared by those tasks.
             // Give only a dedicated supplementary group write/traverse access;
@@ -426,6 +444,19 @@ impl AgentSandbox {
             }
         }
 
+        // OpenCode's npm package installs a self-contained native executable
+        // behind /usr/local/bin/opencode. The outer worker image can execute it,
+        // but the nested Ubuntu rootfs needs that exact executable bind-mounted
+        // read-only at the same path. Do not expose the whole npm package tree.
+        if !opencode_bin.trim().is_empty() {
+            if let Some(program) = resolve_program(opencode_bin, &host_path) {
+                read_only.insert(program.clone());
+                if container_rootfs.is_some() {
+                    container_read_only.insert(program);
+                }
+            }
+        }
+
         let host_cargo_bin = container_rootfs.is_none().then(|| std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
@@ -472,6 +503,7 @@ impl AgentSandbox {
             state_dir,
             pi_config_dir,
             home_dir,
+            opencode_home_dir,
             cargo_home,
             cargo_target_dir,
             tmp_dir,
@@ -545,10 +577,18 @@ impl AgentSandbox {
         } else {
             None
         };
+        let program_is_opencode = Path::new(program).file_name() == Some(OsStr::new("opencode"));
+        if program_is_opencode && self.trusted_container_daemon {
+            // OpenCode may create private 0700/0600 state. Normalize it before
+            // every invocation so the next task's distinct sandbox UID can use
+            // the same worker-scoped backend home.
+            set_shared_agent_tree_sync(&self.opencode_home_dir)?;
+        }
+        let runtime_home = if program_is_opencode { &self.opencode_home_dir } else { &self.home_dir };
         let mut read_write = vec![
             workspace.clone(),
             self.pi_config_dir.clone(),
-            self.home_dir.clone(),
+            runtime_home.clone(),
             self.cargo_home.clone(),
             self.cargo_target_dir.clone(),
             self.tmp_dir.clone(),
@@ -582,7 +622,7 @@ impl AgentSandbox {
         command.env_clear();
         command.env(SPEC_ENV, serde_json::to_string(&spec)?);
         command.env("PATH", &self.path);
-        command.env("HOME", &self.home_dir);
+        command.env("HOME", runtime_home);
         command.env("PI_CODING_AGENT_DIR", &self.pi_config_dir);
         if let Some(pi_package_dir) = current_pi_package_dir(
             self.pi_entrypoint.as_deref(),
@@ -597,8 +637,9 @@ impl AgentSandbox {
         }
         command.env("CARGO_HOME", &self.cargo_home);
         command.env("CARGO_TARGET_DIR", &self.cargo_target_dir);
-        command.env("XDG_CACHE_HOME", self.home_dir.join(".cache"));
-        command.env("XDG_CONFIG_HOME", self.home_dir.join(".config"));
+        command.env("XDG_CACHE_HOME", runtime_home.join(".cache"));
+        command.env("XDG_CONFIG_HOME", runtime_home.join(".config"));
+        command.env("XDG_DATA_HOME", runtime_home.join(".local/share"));
         command.env("TMPDIR", &self.tmp_dir);
         command.env("GIT_TERMINAL_PROMPT", "0");
         command.env("GIT_CONFIG_NOSYSTEM", "1");
@@ -1257,7 +1298,7 @@ fn enter_sandbox_uid(uid: u32) -> anyhow::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) } != 0 {
         bail!("enable keepcaps for sandbox uid switch failed: {}", std::io::Error::last_os_error());
     }
-    let shared_groups = [SANDBOX_PI_SHARED_GID as libc::gid_t];
+    let shared_groups = [SANDBOX_AGENT_SHARED_GID as libc::gid_t];
     if unsafe { libc::setgroups(shared_groups.len(), shared_groups.as_ptr()) } != 0 {
         bail!("set sandbox supplementary groups failed: {}", std::io::Error::last_os_error());
     }
@@ -1285,7 +1326,7 @@ fn enter_sandbox_uid(uid: u32) -> anyhow::Result<()> {
     }
     // Preserve only DAC override across exec so the isolated uid can use the
     // already-Landlock-confined shared caches/config and its workspace. Pi's
-    // worker-scoped credential store additionally uses SANDBOX_PI_SHARED_GID,
+    // worker-scoped credential store additionally uses SANDBOX_AGENT_SHARED_GID,
     // so access(2)-style checks agree with the intended filesystem policy.
     // No
     // CAP_KILL, CAP_SYS_ADMIN, CAP_SETUID, or CAP_SETGID survives into the agent.
@@ -1914,7 +1955,7 @@ async fn set_private_dir(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(unix)]
 fn shared_pi_metadata(gid: u32, mode: u32) -> bool {
-    gid == SANDBOX_PI_SHARED_GID && mode & 0o070 == 0o030
+    gid == SANDBOX_AGENT_SHARED_GID && mode & 0o070 == 0o030
 }
 
 #[cfg(unix)]
@@ -1965,16 +2006,49 @@ fn set_sandbox_owned_tree(path: &Path, uid: u32) -> anyhow::Result<()> {
 fn set_sandbox_owned_tree(_path: &Path, _uid: u32) -> anyhow::Result<()> { Ok(()) }
 
 #[cfg(unix)]
+fn set_shared_agent_tree_sync(path: &Path) -> anyhow::Result<()> {
+    use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::PermissionsExt}};
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat shared agent path {}", path.display()))?;
+    let c_path = CString::new(path.as_os_str().as_bytes()).context("shared agent path contains NUL")?;
+    if unsafe { libc::lchown(c_path.as_ptr(), u32::MAX, SANDBOX_AGENT_SHARED_GID) } != 0 {
+        bail!("set shared agent group failed for {}: {}", path.display(), std::io::Error::last_os_error());
+    }
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2770))?;
+        for entry in std::fs::read_dir(path)? {
+            set_shared_agent_tree_sync(&entry?.path())?;
+        }
+    } else if metadata.is_file() {
+        let exec = if metadata.permissions().mode() & 0o111 != 0 { 0o110 } else { 0 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660 | exec))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_shared_agent_tree_sync(_path: &Path) -> anyhow::Result<()> { Ok(()) }
+
+async fn set_shared_agent_tree(path: &Path) -> anyhow::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || set_shared_agent_tree_sync(&path)).await??;
+    Ok(())
+}
+
+#[cfg(unix)]
 async fn set_shared_pi_dir(path: &Path) -> anyhow::Result<()> {
     use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::{MetadataExt, PermissionsExt}}};
     let c_path = CString::new(path.as_os_str().as_bytes()).context("Pi config path contains NUL")?;
-    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, SANDBOX_PI_SHARED_GID) } != 0 {
+    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, SANDBOX_AGENT_SHARED_GID) } != 0 {
         bail!("set Pi config shared group failed: {}", std::io::Error::last_os_error());
     }
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2730)).await?;
     let metadata = tokio::fs::metadata(path).await?;
     let mode = metadata.permissions().mode();
-    if metadata.gid() != SANDBOX_PI_SHARED_GID || mode & 0o2000 == 0 || !shared_pi_metadata(metadata.gid(), mode) {
+    if metadata.gid() != SANDBOX_AGENT_SHARED_GID || mode & 0o2000 == 0 || !shared_pi_metadata(metadata.gid(), mode) {
         bail!(
             "Pi config shared permissions did not persist (gid={}, mode={:o}); worker container requires CAP_FSETID",
             metadata.gid(),
@@ -1991,7 +2065,7 @@ async fn set_shared_pi_dir(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 async fn set_shared_pi_file(path: &Path) -> anyhow::Result<()> {
     use std::{ffi::CString, os::unix::{ffi::OsStrExt, fs::PermissionsExt}};
     let c_path = CString::new(path.as_os_str().as_bytes()).context("Pi credential path contains NUL")?;
-    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, SANDBOX_PI_SHARED_GID) } != 0 {
+    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, SANDBOX_AGENT_SHARED_GID) } != 0 {
         bail!("set Pi credential shared group failed: {}", std::io::Error::last_os_error());
     }
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)).await?;
@@ -2018,13 +2092,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shared_pi_marker_survives_missing_setgid_but_rejects_private_dir() {
-        assert!(shared_pi_metadata(SANDBOX_PI_SHARED_GID, 0o2730));
+        assert!(shared_pi_metadata(SANDBOX_AGENT_SHARED_GID, 0o2730));
         // A deployment missing CAP_FSETID may have already lost setgid.
         // The marker must still prevent an auxiliary diagnostic from
         // downgrading the worker-scoped directory to 0700.
-        assert!(shared_pi_metadata(SANDBOX_PI_SHARED_GID, 0o0730));
-        assert!(!shared_pi_metadata(SANDBOX_PI_SHARED_GID, 0o0700));
-        assert!(!shared_pi_metadata(SANDBOX_PI_SHARED_GID + 1, 0o2730));
+        assert!(shared_pi_metadata(SANDBOX_AGENT_SHARED_GID, 0o0730));
+        assert!(!shared_pi_metadata(SANDBOX_AGENT_SHARED_GID, 0o0700));
+        assert!(!shared_pi_metadata(SANDBOX_AGENT_SHARED_GID + 1, 0o2730));
     }
 
     #[cfg(unix)]
@@ -2043,6 +2117,7 @@ mod tests {
             state_dir: root.clone(),
             pi_config_dir: pi_config_dir.clone(),
             home_dir: root.join("home"),
+            opencode_home_dir: root.join("opencode-home"),
             cargo_home: root.join("cargo"),
             cargo_target_dir: root.join("target"),
             tmp_dir: root.join("tmp"),
@@ -2082,12 +2157,13 @@ mod tests {
             std::fs::write(&path, b"{}").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
             let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-            assert_eq!(unsafe { libc::chown(c_path.as_ptr(), 20_000, SANDBOX_PI_SHARED_GID) }, 0);
+            assert_eq!(unsafe { libc::chown(c_path.as_ptr(), 20_000, SANDBOX_AGENT_SHARED_GID) }, 0);
         }
         let sandbox = AgentSandbox {
             state_dir: root.clone(),
             pi_config_dir: pi_config_dir.clone(),
             home_dir: root.join("home"),
+            opencode_home_dir: root.join("opencode-home"),
             cargo_home: root.join("cargo"),
             cargo_target_dir: root.join("target"),
             tmp_dir: root.join("tmp"),
@@ -2108,7 +2184,7 @@ mod tests {
         for name in ["auth.json", "models-store.json"] {
             let metadata = std::fs::metadata(pi_config_dir.join(name)).unwrap();
             assert_eq!(metadata.uid(), 20_000, "repair must not steal file ownership from the sandbox UID");
-            assert_eq!(metadata.gid(), SANDBOX_PI_SHARED_GID);
+            assert_eq!(metadata.gid(), SANDBOX_AGENT_SHARED_GID);
             assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -2138,6 +2214,7 @@ mod tests {
             state_dir: root.clone(),
             pi_config_dir: pi_config_dir.clone(),
             home_dir: root.join("home"),
+            opencode_home_dir: root.join("opencode-home"),
             cargo_home: root.join("cargo"),
             cargo_target_dir: root.join("target"),
             tmp_dir: root.join("tmp"),
@@ -2189,6 +2266,7 @@ mod tests {
             state_dir: root.clone(),
             pi_config_dir: pi_config_dir.clone(),
             home_dir: root.join("home"),
+            opencode_home_dir: root.join("opencode-home"),
             cargo_home: root.join("cargo"),
             cargo_target_dir: root.join("target"),
             tmp_dir: root.join("tmp"),
@@ -2209,7 +2287,7 @@ mod tests {
         for name in ["auth.json", "models-store.json"] {
             let metadata = std::fs::metadata(pi_config_dir.join(name)).unwrap();
             assert_eq!(metadata.uid(), 20_000, "repair must not steal recreated file from the sandbox UID");
-            assert_eq!(metadata.gid(), SANDBOX_PI_SHARED_GID, "recreated {name} must be reshared");
+            assert_eq!(metadata.gid(), SANDBOX_AGENT_SHARED_GID, "recreated {name} must be reshared");
             assert_eq!(metadata.permissions().mode() & 0o777, 0o660, "recreated {name} must be group-usable");
         }
         assert_eq!(std::fs::read(pi_config_dir.join("auth.json")).unwrap(), auth_before,
