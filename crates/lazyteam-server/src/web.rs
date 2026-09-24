@@ -36,8 +36,9 @@ mod tests {
         assert!(INDEX.contains("Initial prompt"));
         assert!(INDEX.contains("worker-config-provider"));
         assert!(INDEX.contains("worker-config-model"));
-        assert!(INDEX.contains("Real Pi catalog from this worker"));
-        assert!(INDEX.contains("Pi-reported metadata"));
+        assert!(INDEX.contains("Real agent catalog from this worker"));
+        assert!(INDEX.contains("<option value=\"opencode\">OpenCode</option>"));
+        assert!(INDEX.contains("agent-reported metadata"));
         assert!(INDEX.contains("Choose provider"));
         assert!(INDEX.contains("No available models yet"));
         assert!(INDEX.contains("configured, currently unavailable"));
