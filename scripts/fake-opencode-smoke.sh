@@ -11,7 +11,8 @@ case "${1:-}" in
     case "$args" in *' --agent build '*) ;; *) echo 'missing --agent build' >&2; exit 65;; esac
     case "$args" in *' --auto '*) ;; *) echo 'missing --auto' >&2; exit 66;; esac
     case "$args" in *' --model opencode/smoke-free '*) ;; *) echo 'wrong model selector' >&2; exit 67;; esac
-    printf 'ok\n' > opencode-write-proof.txt
+    printf 'fake-opencode cwd=%s\n' "$PWD" >&2
+    printf 'ok\n' > /app/state/agent-probe/opencode-write-proof.txt
     printf '%s\n' '{"type":"session.created","id":"ses_smoke"}'
     printf '%s\n' '{"type":"text","part":{"type":"text","text":"Done."}}'
     ;;
