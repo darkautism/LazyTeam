@@ -237,6 +237,43 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Read-only snapshot of every backend record bound to a logical
+    /// (task, role). Used by post-merge retirement to invoke each backend's
+    /// session-delete hook before `release` removes local metadata. Creates
+    /// nothing and never fails: unreadable entries are skipped because
+    /// `release` remains the fail-closed authority on local state.
+    pub async fn sessions_for(&self, task_id: Uuid, role: SessionRole) -> Vec<AgentSession> {
+        let mut out: Vec<AgentSession> = Vec::new();
+        let scoped_dir = self.scoped_dir(task_id, role);
+        if let Ok(mut entries) = tokio::fs::read_dir(&scoped_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+                    if let Ok(session) = serde_json::from_str::<AgentSession>(&raw) {
+                        out.push(session);
+                    }
+                }
+            }
+        }
+        let legacy_path = self.legacy_metadata_path(task_id, role);
+        if let Ok(raw) = tokio::fs::read_to_string(&legacy_path).await {
+            if let Ok(session) = serde_json::from_str::<AgentSession>(&raw) {
+                out.push(session);
+            }
+        }
+        // One record per backend identity; the filename is only a lookup hint.
+        out.sort_by(|a, b| a.backend.cmp(&b.backend).then(a.data_dir.cmp(&b.data_dir)));
+        out.dedup_by(|a, b| {
+            a.backend == b.backend
+                && a.backend_session_id == b.backend_session_id
+                && a.data_dir == b.data_dir
+        });
+        out
+    }
+
     /// Remove every backend-scoped record plus any legacy record for this
     /// logical (task, role), along with each record's backend-local data dir.
     /// `release` is intentionally backend-agnostic: cleanup items carry only

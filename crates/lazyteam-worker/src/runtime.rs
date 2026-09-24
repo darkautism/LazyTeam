@@ -1133,6 +1133,12 @@ pub trait AgentRuntime: Send + Sync {
     async fn capabilities(&self) -> AgentCapabilities;
     async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult>;
     fn supports_reviewer_mcp(&self) -> bool { false }
+    /// Delete a backend-owned session when its logical session is retired
+    /// (post-merge cleanup). The default is a no-op so backends without
+    /// backend-owned identity (Pi reuses caller-chosen IDs) are unchanged.
+    async fn delete_backend_session(&self, _workspace: &Path, _backend_session_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn run_review_with_mcp(
         &self,
         _workspace: &Path,
@@ -1942,6 +1948,415 @@ impl AgentRuntime for PiRuntime {
     }
 }
 
+const DEFAULT_OPENCODE_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_OPENCODE_STALL_SECS: u64 = 360;
+const OPENCODE_DELETE_TIMEOUT_SECS: u64 = 15;
+const OPENCODE_EXIT_GRACE_SECS: u64 = 5;
+
+fn opencode_timeout() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_OPENCODE_TIMEOUT_SECS",
+        DEFAULT_OPENCODE_TIMEOUT_SECS,
+        30,
+        1800,
+    )
+}
+
+fn opencode_stall_window() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_OPENCODE_STALL_SECS",
+        DEFAULT_OPENCODE_STALL_SECS,
+        30,
+        1500,
+    )
+}
+
+/// Exact Host-selected `provider/model` selector for the headless OpenCode
+/// CLI (`opencode run --model <provider/model>`). Both halves are required:
+/// a missing half is an error, never a silent fallback to a default model.
+fn opencode_model_selector(provider: Option<&str>, model: Option<&str>) -> anyhow::Result<String> {
+    match (provider.map(str::trim), model.map(str::trim)) {
+        (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
+            Ok(format!("{provider}/{model}"))
+        }
+        _ => bail!(
+            "OpenCode runtime requires the exact Host-selected provider and model; refusing to fall back to a default model"
+        ),
+    }
+}
+
+/// Headless, machine-readable argv for one OpenCode run. New sessions omit
+/// `--session` so the backend creates an opaque ID; resumed sessions pass the
+/// previously returned opaque ID back verbatim. `--format json` keeps the
+/// stream parseable without TUI scraping.
+fn opencode_run_argv(model: &str, backend_session_id: Option<&str>, prompt: &str) -> Vec<String> {
+    let mut argv = vec![
+        "run".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--model".to_string(),
+        model.to_string(),
+    ];
+    if let Some(session) = backend_session_id {
+        argv.push("--session".to_string());
+        argv.push(session.to_string());
+    }
+    argv.push(prompt.to_string());
+    argv
+}
+
+#[derive(Debug, Default)]
+struct OpenCodeStreamState {
+    /// First opaque backend session ID announced on the JSON stream.
+    session_id: Option<String>,
+    /// Concatenated final assistant text only (never prompt/user/transcript).
+    assistant_text: String,
+}
+
+fn opencode_session_id_from_event(event: &Value) -> Option<String> {
+    for key in ["sessionID", "sessionId", "session_id"] {
+        if let Some(id) = event.get(key).and_then(Value::as_str) {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    if !matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("session.created" | "session_created" | "session")
+    ) {
+        return None;
+    }
+    for key in ["id", "session"] {
+        if let Some(id) = event.get(key).and_then(Value::as_str) {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    for container in ["data", "session"] {
+        if let Some(obj) = event.get(container).and_then(Value::as_object) {
+            for key in ["sessionID", "sessionId", "session_id", "id"] {
+                if let Some(id) = obj.get(key).and_then(Value::as_str) {
+                    let trimmed = id.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract final assistant text from one headless OpenCode JSON event.
+/// Only events with an explicit `assistant` role contribute; prompt, user,
+/// system, tool, and transcript shapes are never final output.
+fn opencode_assistant_text_from_event(event: &Value) -> Option<String> {
+    const NON_FINAL_TYPES: &[&str] = &[
+        "prompt",
+        "user",
+        "transcript",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "session.created",
+        "session_created",
+        "session",
+        "response",
+    ];
+    if let Some(event_type) = event.get("type").and_then(Value::as_str) {
+        if NON_FINAL_TYPES.contains(&event_type) {
+            return None;
+        }
+    }
+    if let Some(nested) = event.get("message").and_then(Value::as_object) {
+        let role = nested.get("role").and_then(Value::as_str).unwrap_or("");
+        if role != "assistant" {
+            return None;
+        }
+        return opencode_text_parts(event.get("message").unwrap_or(event));
+    }
+    if event.get("role").and_then(Value::as_str).unwrap_or("") != "assistant" {
+        return None;
+    }
+    opencode_text_parts(event)
+}
+
+fn opencode_text_parts(scoped: &Value) -> Option<String> {
+    if let Some(text) = scoped.get("text").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    if let Some(delta) = scoped.get("delta").and_then(Value::as_str) {
+        if !delta.is_empty() {
+            return Some(delta.to_string());
+        }
+    }
+    if let Some(parts) = scoped.get("content").and_then(Value::as_array) {
+        let mut out = String::new();
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    out.push_str(text);
+                }
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn apply_opencode_event(state: &mut OpenCodeStreamState, event: &Value) {
+    if state.session_id.is_none() {
+        if let Some(id) = opencode_session_id_from_event(event) {
+            state.session_id = Some(id);
+        }
+    }
+    if let Some(text) = opencode_assistant_text_from_event(event) {
+        state.assistant_text.push_str(&text);
+    }
+}
+
+/// Map the announced backend session ID to the scheduler-visible binding:
+/// a fresh create returns the announced ID, a rotation returns the new ID,
+/// and a clean resume (announced == input, or nothing announced) returns
+/// `None` so the existing binding is kept as-is.
+fn opencode_backend_result(
+    backend_session_id: Option<&str>,
+    announced: Option<String>,
+) -> Option<String> {
+    match (backend_session_id, announced) {
+        (None, announced) => announced,
+        (Some(input), Some(announced)) if announced != input => Some(announced),
+        _ => None,
+    }
+}
+
+fn opencode_model_from_value(value: &Value) -> Option<AgentModel> {
+    let obj = value.as_object()?;
+    let id = obj.get("id")?.as_str()?;
+    let provider = match obj.get("provider").and_then(Value::as_str) {
+        Some(provider) => provider.to_string(),
+        None => id.split_once('/')?.0.to_string(),
+    };
+    if provider.trim().is_empty() || id.trim().is_empty() {
+        return None;
+    }
+    Some(AgentModel {
+        provider,
+        id: id.to_string(),
+        name: obj.get("name").and_then(Value::as_str).map(str::to_string),
+        context_window: obj.get("contextWindow").and_then(Value::as_u64),
+        reasoning: obj.get("reasoning").and_then(Value::as_bool).unwrap_or(false),
+        cost: None,
+    })
+}
+
+/// Concrete headless OpenCode runtime.
+///
+/// Every run spawns `opencode run --format json --model <provider/model>`
+/// inside the existing [`AgentSandbox`] (which strips Host Git credentials
+/// and confines the filesystem), parses only the machine-readable JSON
+/// stream, and returns final-assistant-only text plus the backend-owned
+/// opaque session ID. Cancellation, timeouts, and stalls terminate and reap
+/// the child through the same bounded path as the Pi runtime.
+#[derive(Debug, Clone)]
+pub struct OpenCodeRuntime {
+    pub binary: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub session_dir: Option<PathBuf>,
+    pub sandbox: AgentSandbox,
+}
+
+impl OpenCodeRuntime {
+    async fn run_with_limits(
+        &self,
+        workspace: &Path,
+        prompt: &str,
+        backend_session_id: Option<&str>,
+        timeout: Duration,
+        stall: Duration,
+    ) -> anyhow::Result<AgentRunResult> {
+        let model = opencode_model_selector(self.provider.as_deref(), self.model.as_deref())?;
+        if let Some(session_dir) = &self.session_dir {
+            tokio::fs::create_dir_all(session_dir).await?;
+        }
+        let argv = opencode_run_argv(&model, backend_session_id, prompt);
+        let mut command = self.sandbox.command(&self.binary, workspace, self.session_dir.as_deref())?;
+        command.args(&argv);
+        command.current_dir(workspace).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
+
+        let mut child = command.spawn().with_context(|| format!("spawn {} headless run", self.binary))?;
+        let stdout = child.stdout.take().context("OpenCode run stdout missing")?;
+        let stderr = child.stderr.take().context("OpenCode run stderr missing")?;
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(target: "opencode", "{line}");
+            }
+        });
+
+        let deadline = Instant::now() + timeout;
+        let mut last_progress = Instant::now();
+        let mut state = OpenCodeStreamState::default();
+        let mut lines = BufReader::new(stdout).lines();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                terminate_pi_child(&mut child).await?;
+                bail!("OpenCode run exceeded its {}s timeout", timeout.as_secs());
+            }
+            let idle = now.saturating_duration_since(last_progress);
+            if idle >= stall {
+                terminate_pi_child(&mut child).await?;
+                bail!(
+                    "OpenCode run produced no output for {}s (stall limit {}s)",
+                    idle.as_secs(),
+                    stall.as_secs(),
+                );
+            }
+            let wait = (deadline.saturating_duration_since(now)).min(stall.saturating_sub(idle));
+            match tokio::time::timeout(wait, lines.next_line()).await {
+                Err(_) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        terminate_pi_child(&mut child).await?;
+                        bail!("OpenCode run exceeded its {}s timeout", timeout.as_secs());
+                    }
+                    terminate_pi_child(&mut child).await?;
+                    bail!(
+                        "OpenCode run produced no output for {}s (stall limit {}s)",
+                        now.saturating_duration_since(last_progress).as_secs(),
+                        stall.as_secs(),
+                    );
+                }
+                Ok(Err(error)) => {
+                    terminate_pi_child(&mut child).await?;
+                    bail!("OpenCode run output failed: {error:#}");
+                }
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(line))) => {
+                    last_progress = Instant::now();
+                    let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    apply_opencode_event(&mut state, &event);
+                }
+            }
+        }
+
+        let status = match tokio::time::timeout(Duration::from_secs(OPENCODE_EXIT_GRACE_SECS), child.wait()).await {
+            Ok(Ok(status)) => status,
+            _ => {
+                terminate_pi_child(&mut child).await?;
+                bail!("OpenCode run did not exit within {OPENCODE_EXIT_GRACE_SECS}s after output EOF");
+            }
+        };
+        if !status.success() {
+            bail!("OpenCode headless run failed: {status}");
+        }
+        Ok(AgentRunResult {
+            summary: state.assistant_text,
+            backend_session_id: opencode_backend_result(backend_session_id, state.session_id),
+        })
+    }
+
+    /// Remove a backend-owned OpenCode session through the supported
+    /// headless session operation. Runs inside the sandbox with a bounded
+    /// wait so cleanup can neither leak Host credentials nor strand a child.
+    /// This is the [`AgentRuntime::delete_backend_session`] hook body,
+    /// invoked by post-merge retirement before local metadata is released.
+    pub async fn delete_session(&self, workspace: &Path, backend_session_id: &str) -> anyhow::Result<()> {
+        let session = backend_session_id.trim();
+        if session.is_empty() {
+            bail!("OpenCode session ID must not be empty");
+        }
+        let mut command = self.sandbox.command(&self.binary, workspace, self.session_dir.as_deref())?;
+        command.args(["session", "delete", session, "--format", "json"]);
+        command.current_dir(workspace).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
+        let mut child = command.spawn().with_context(|| format!("spawn {} session delete", self.binary))?;
+        match tokio::time::timeout(Duration::from_secs(OPENCODE_DELETE_TIMEOUT_SECS), child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => bail!("OpenCode session delete failed: {status}"),
+            _ => {
+                terminate_pi_child(&mut child).await?;
+                bail!("OpenCode session delete timed out after {OPENCODE_DELETE_TIMEOUT_SECS}s");
+            }
+        }
+    }
+
+    async fn probe_models(&self) -> anyhow::Result<Vec<AgentModel>> {
+        let sandbox = self.sandbox.clone();
+        let binary = self.binary.clone();
+        // Resolve the binary exactly like a run does: a session-scoped helper
+        // lives next to the session, while a PATH binary needs no session.
+        let session_dir = self.session_dir.clone();
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let mut command = sandbox.command(&binary, sandbox.probe_workspace(), session_dir.as_deref())?;
+            command.args(["models", "--format", "json"]);
+            command.kill_on_drop(true);
+            command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = command.output().await.context("run OpenCode model catalog probe")?;
+            if !output.status.success() {
+                bail!(
+                    "OpenCode model catalog probe failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let value: Value = serde_json::from_slice(&output.stdout).context("parse OpenCode model catalog output")?;
+            let items = match &value {
+                Value::Array(items) => items.clone(),
+                Value::Object(map) => map.get("models").and_then(Value::as_array).cloned().unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            Ok(items.iter().filter_map(opencode_model_from_value).collect())
+        })
+        .await
+        .context("OpenCode capability probe timed out")?
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for OpenCodeRuntime {
+    fn kind(&self) -> &'static str { "opencode" }
+
+    async fn capabilities(&self) -> AgentCapabilities {
+        match self.probe_models().await {
+            Ok(models) => AgentCapabilities {
+                model_discovery: true,
+                login_mode: AgentLoginMode::Remote,
+                providers: Vec::new(),
+                models,
+                probe_error: None,
+            },
+            Err(error) => AgentCapabilities {
+                model_discovery: true,
+                login_mode: AgentLoginMode::Remote,
+                providers: Vec::new(),
+                models: Vec::new(),
+                probe_error: Some(format!("opencode model catalog: {error:#}")),
+            },
+        }
+    }
+
+    async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
+        self.run_with_limits(workspace, prompt, backend_session_id, opencode_timeout(), opencode_stall_window()).await
+    }
+
+    async fn delete_backend_session(&self, workspace: &Path, backend_session_id: &str) -> anyhow::Result<()> {
+        self.delete_session(workspace, backend_session_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2580,5 +2995,329 @@ mod tests {
         let workspace = Path::new("/tmp");
         let resumed = runtime.run(workspace, "prompt", Some("task-derived-id")).await.unwrap();
         assert_eq!(resumed.backend_session_id, Option::<String>::None);
+    }
+
+    #[test]
+    fn opencode_model_selector_requires_exact_host_selection() {
+        assert_eq!(
+            opencode_model_selector(Some("host-provider"), Some("host-model")).unwrap(),
+            "host-provider/host-model",
+        );
+        assert_eq!(
+            opencode_model_selector(Some("  host-provider "), Some(" host-model ")).unwrap(),
+            "host-provider/host-model",
+        );
+        // No fallback: any missing/blank half is an error.
+        for (provider, model) in [
+            (None, None),
+            (Some("host-provider"), None),
+            (None, Some("host-model")),
+            (Some(""), Some("host-model")),
+            (Some("host-provider"), Some("   ")),
+        ] {
+            assert!(
+                opencode_model_selector(provider, model).is_err(),
+                "must not fall back for {provider:?}/{model:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_argv_creates_and_resumes_headless_sessions() {
+        let create = opencode_run_argv("host-provider/host-model", None, "do the task");
+        assert_eq!(create[..5], ["run", "--format", "json", "--model", "host-provider/host-model"]);
+        assert!(!create.iter().any(|arg| arg == "--session"), "create must not pass a session flag");
+        assert_eq!(create.last().map(String::as_str), Some("do the task"));
+
+        let resume = opencode_run_argv("host-provider/host-model", Some("ses_opaque_123"), "continue");
+        let session_pos = resume.iter().position(|arg| arg == "--session").expect("resume passes --session");
+        assert_eq!(resume[session_pos + 1], "ses_opaque_123");
+        assert_eq!(resume[3..5], ["--model".to_string(), "host-provider/host-model".to_string()]);
+    }
+
+    #[test]
+    fn opencode_final_output_excludes_prompt_user_and_transcript() {
+        let mut state = OpenCodeStreamState::default();
+        for event in [
+            json!({"type": "session.created", "sessionID": "ses_opaque_123"}),
+            json!({"type": "prompt", "role": "user", "text": "PROMPT MUST NOT LEAK"}),
+            json!({"role": "user", "text": "USER MUST NOT LEAK"}),
+            json!({"type": "transcript", "role": "assistant", "text": "TRANSCRIPT MUST NOT LEAK"}),
+            json!({"type": "tool_execution_start", "role": "assistant", "text": "TOOL MUST NOT LEAK"}),
+            json!({"role": "assistant", "text": "final-a "}),
+            json!({"message": {"role": "assistant", "content": [{"type": "text", "text": "final-b"}]}}),
+            json!({"message": {"role": "user", "content": [{"type": "text", "text": "NESTED USER MUST NOT LEAK"}]}}),
+        ] {
+            apply_opencode_event(&mut state, &event);
+        }
+        assert_eq!(state.session_id.as_deref(), Some("ses_opaque_123"));
+        assert_eq!(state.assistant_text, "final-a final-b");
+        for leaked in ["PROMPT", "USER", "TRANSCRIPT", "TOOL", "NESTED"] {
+            assert!(!state.assistant_text.contains(leaked), "leaked {leaked}");
+        }
+    }
+
+    #[test]
+    fn opencode_backend_result_maps_create_resume_and_rotation() {
+        assert_eq!(
+            opencode_backend_result(None, Some("ses_new".to_string())),
+            Some("ses_new".to_string()),
+        );
+        assert_eq!(opencode_backend_result(None, None), None);
+        assert_eq!(opencode_backend_result(Some("ses_keep"), Some("ses_keep".to_string())), None);
+        assert_eq!(opencode_backend_result(Some("ses_keep"), None), None);
+        assert_eq!(
+            opencode_backend_result(Some("ses_old"), Some("ses_rotated".to_string())),
+            Some("ses_rotated".to_string()),
+        );
+    }
+
+    #[test]
+    fn opencode_model_catalog_parses_provider_qualified_ids() {
+        let model = opencode_model_from_value(&json!({"provider": "host-provider", "id": "host-model"})).unwrap();
+        assert_eq!(model.provider, "host-provider");
+        assert_eq!(model.id, "host-model");
+        let qualified = opencode_model_from_value(&json!({"id": "other-provider/other-model"})).unwrap();
+        assert_eq!(qualified.provider, "other-provider");
+        assert_eq!(qualified.id, "other-provider/other-model");
+        assert!(opencode_model_from_value(&json!({"id": "unqualified"})).is_none());
+    }
+
+
+    /// Fake headless `opencode` CLI: `run` announces an opaque session ID and
+    /// emits assistant-only output; `session delete` records the cleanup next
+    /// to the script (the sandbox clears the environment, so no env pointer
+    /// can be passed through).
+    async fn write_fake_opencode(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-opencode.sh");
+        let script = r#"#!/bin/sh
+marker="$(dirname "$0")/deleted-marker"
+if [ "$1" = "session" ] && [ "$2" = "delete" ]; then
+  echo "$3" > "$marker"
+  echo '{"type":"session.deleted"}'
+  exit 0
+fi
+if [ "$1" = "models" ]; then
+  echo '[{"provider":"host-provider","id":"host-model"}]'
+  exit 0
+fi
+session=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--session" ]; then session="$arg"; fi
+  prev="$arg"
+done
+if [ -z "$session" ]; then session="ses_fake_created"; fi
+echo "{\"type\":\"session.created\",\"sessionID\":\"$session\"}"
+echo '{"type":"prompt","role":"user","text":"PROMPT MUST NOT LEAK"}'
+echo '{"role":"assistant","text":"final for '"$session"'"}'
+"#;
+        tokio::fs::write(&path, script).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&path).await.unwrap().permissions();
+            perms.set_mode(0o755);
+            tokio::fs::set_permissions(&path, perms).await.unwrap();
+        }
+        path
+    }
+
+    /// Real sandbox launcher for tests that must genuinely enforce the
+    /// sandbox. The test-harness binary cannot re-exec as the launcher
+    /// (libtest swallows the helper argv), so these tests point
+    /// `LAZYTEAM_SANDBOX_LAUNCHER` at the built worker binary, which handles
+    /// the sandbox entrypoint. Requires `cargo build -p lazyteam-worker`
+    /// before `cargo test` (the focused validation flow does this).
+    fn use_real_sandbox_launcher() {
+        let candidates = [
+            std::env::var("CARGO_TARGET_DIR").map(|dir| format!("{dir}/debug/lazyteam-worker")).unwrap_or_default(),
+            "../../.target/debug/lazyteam-worker".to_string(),
+            "../../target/debug/lazyteam-worker".to_string(),
+        ];
+        let launcher = candidates
+            .iter()
+            .find(|path| !path.is_empty() && Path::new(path).is_file())
+            .unwrap_or_else(|| panic!("built worker launcher missing; run cargo build -p lazyteam-worker first"));
+        // SAFETY: test-scoped, idempotent launcher pointer for sandbox tests.
+        unsafe { std::env::set_var("LAZYTEAM_SANDBOX_LAUNCHER", launcher); }
+    }
+
+    async fn opencode_test_runtime(binary: &Path, session_dir: PathBuf) -> OpenCodeRuntime {
+        use_real_sandbox_launcher();
+        let root = session_dir.parent().unwrap().join(format!("state-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let sandbox = AgentSandbox::prepare(&root, "pi", None).await.unwrap();
+        OpenCodeRuntime {
+            binary: binary.to_string_lossy().to_string(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            session_dir: Some(session_dir),
+            sandbox,
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_run_creates_resumes_and_cleans_sessions() {
+        let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+            let root = std::env::temp_dir().join(format!("lazyteam-opencode-{}", Uuid::new_v4()));
+            let workspace = root.join("workspace");
+            let session_dir = root.join("sessions").join("task");
+            tokio::fs::create_dir_all(&workspace).await.unwrap();
+            tokio::fs::create_dir_all(&session_dir).await.unwrap();
+            let binary = write_fake_opencode(&session_dir).await;
+            let runtime = opencode_test_runtime(&binary, session_dir.clone()).await;
+
+            // Create: no input session, backend announces an opaque ID and the
+            // result carries final-assistant-only text.
+            let created = runtime.run(&workspace, "do the task", None).await.unwrap();
+            assert_eq!(created.backend_session_id.as_deref(), Some("ses_fake_created"));
+            assert_eq!(created.summary, "final for ses_fake_created");
+
+            // Resume: the bound opaque ID is passed back verbatim and a clean
+            // resume reports no new identity.
+            let resumed = runtime.run(&workspace, "continue", created.backend_session_id.as_deref()).await.unwrap();
+            assert_eq!(resumed.backend_session_id, Option::<String>::None);
+            assert_eq!(resumed.summary, "final for ses_fake_created");
+
+            // Capabilities use the machine-readable catalog, not TUI output.
+            let capabilities = runtime.capabilities().await;
+            assert!(capabilities.probe_error.is_none());
+            assert!(capabilities.models.iter().any(|m| m.provider == "host-provider" && m.id == "host-model"));
+
+            // Cleanup goes through the supported backend session operation.
+            runtime.delete_session(&workspace, "ses_fake_created").await.unwrap();
+            assert_eq!(
+                tokio::fs::read_to_string(session_dir.join("deleted-marker")).await.unwrap().trim(),
+                "ses_fake_created",
+            );
+            assert!(runtime.delete_session(&workspace, "  ").await.is_err());
+
+            let _ = tokio::fs::remove_dir_all(&root).await;
+        })
+        .await;
+        assert!(outcome.is_ok(), "opencode create/resume/cleanup must be bounded");
+        outcome.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opencode_stall_path_terminates_and_reaps_bounded() {
+        let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+            let root = std::env::temp_dir().join(format!("lazyteam-opencode-stall-{}", Uuid::new_v4()));
+            let workspace = root.join("workspace");
+            let session_dir = root.join("sessions").join("task");
+            tokio::fs::create_dir_all(&workspace).await.unwrap();
+            let sleeper = session_dir.join("sleeper.sh");
+            tokio::fs::create_dir_all(&session_dir).await.unwrap();
+            tokio::fs::write(&sleeper, "#!/bin/sh\nsleep 30\n").await.unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = tokio::fs::metadata(&sleeper).await.unwrap().permissions();
+                perms.set_mode(0o755);
+                tokio::fs::set_permissions(&sleeper, perms).await.unwrap();
+            }
+            let runtime = opencode_test_runtime(&sleeper, session_dir).await;
+            let started = Instant::now();
+            let result = runtime
+                .run_with_limits(&workspace, "stall", None, Duration::from_secs(30), Duration::from_secs(2))
+                .await;
+            let elapsed = started.elapsed();
+            assert!(result.is_err(), "silent child must hit the stall path");
+            assert!(elapsed < Duration::from_secs(20), "stall cleanup must be bounded, took {elapsed:?}");
+            let _ = tokio::fs::remove_dir_all(&root).await;
+        })
+        .await;
+        assert!(outcome.is_ok(), "stall test itself must be bounded");
+        outcome.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opencode_sandbox_hides_host_env_and_git_helpers() {
+        let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+            use_real_sandbox_launcher();
+            let marker = format!("LAZYTEAM_OPENCODE_TEST_MARKER_{}", Uuid::new_v4().simple());
+            let secret = format!("secret-{}", Uuid::new_v4());
+            // SAFETY: test-scoped marker proving sandbox env isolation.
+            unsafe { std::env::set_var(&marker, &secret); }
+            let root = std::env::temp_dir().join(format!("lazyteam-opencode-env-{}", Uuid::new_v4()));
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            let sandbox = AgentSandbox::prepare(&root, "pi", None).await.unwrap();
+            let mut command = sandbox.command("/usr/bin/env", sandbox.probe_workspace(), None).unwrap();
+            command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = command.output().await.unwrap();
+            assert!(output.status.success());
+            let env = String::from_utf8(output.stdout).unwrap();
+            assert!(!env.contains(&secret), "sandbox child must not inherit Host env");
+            assert!(
+                env.lines().any(|line| line == "GIT_SSH_COMMAND=/bin/false"),
+                "sandbox must neutralize Host Git credentials",
+            );
+            // SAFETY: remove the test-scoped marker.
+            unsafe { std::env::remove_var(&marker); }
+            let _ = tokio::fs::remove_dir_all(&root).await;
+        })
+        .await;
+        assert!(outcome.is_ok(), "sandbox isolation probe must be bounded");
+        outcome.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opencode_retirement_deletes_backend_session_before_release() {
+        use crate::session::{SessionManager, SessionRole};
+        let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+            let root = std::env::temp_dir().join(format!("lazyteam-opencode-retire-{}", Uuid::new_v4()));
+            let state_dir = root.join("state");
+            let workspace = root.join("workspace");
+            tokio::fs::create_dir_all(&workspace).await.unwrap();
+            let manager = SessionManager::new(&state_dir);
+            let task_id = Uuid::new_v4();
+            // Bind an opencode backend-owned session and stage the fake CLI
+            // in its data dir (the sandbox resolves the helper there).
+            let bound = manager.bind_backend_session(task_id, SessionRole::Implementation, "opencode", "ses_retire_me").await.unwrap();
+            let binary = write_fake_opencode(&bound.data_dir).await;
+            // A Pi record on the same logical session carries no
+            // backend-owned identity; its hook must be a silent no-op.
+            let pi = manager.acquire(task_id, SessionRole::Implementation, "pi").await.unwrap();
+            assert!(pi.backend_session_id.is_some());
+            // An unknown future backend must never wedge retirement.
+            let future = manager.bind_backend_session(task_id, SessionRole::Implementation, "future-backend", "ses_future").await.unwrap();
+            assert!(future.data_dir.exists());
+
+            use_real_sandbox_launcher();
+            let sandbox_root = root.join("sandbox-state");
+            tokio::fs::create_dir_all(&sandbox_root).await.unwrap();
+            let sandbox = AgentSandbox::prepare(&sandbox_root, "pi", None).await.unwrap();
+            crate::retire_backend_sessions(
+                &manager,
+                &sandbox,
+                "pi",
+                &binary.to_string_lossy(),
+                task_id,
+                SessionRole::Implementation,
+            )
+            .await
+            .unwrap();
+
+            // The production retire path invoked the supported backend delete
+            // op once, for the opencode binding only.
+            assert_eq!(
+                tokio::fs::read_to_string(bound.data_dir.join("deleted-marker")).await.unwrap().trim(),
+                "ses_retire_me",
+            );
+            // Retirement preserves the binding so a retry could still resume;
+            // only `release` drops local metadata.
+            let resumed = manager.acquire(task_id, SessionRole::Implementation, "opencode").await.unwrap();
+            assert_eq!(resumed.backend_session_id.as_deref(), Some("ses_retire_me"));
+            assert_eq!(resumed.data_dir, bound.data_dir);
+            manager.release(task_id, SessionRole::Implementation).await.unwrap();
+            assert!(!bound.data_dir.exists());
+            let fresh = manager.acquire(task_id, SessionRole::Implementation, "opencode").await.unwrap();
+            assert_eq!(fresh.backend_session_id, Option::<String>::None);
+            let _ = tokio::fs::remove_dir_all(&root).await;
+        })
+        .await;
+        assert!(outcome.is_ok(), "retirement lifecycle must be bounded");
+        outcome.unwrap();
     }
 }

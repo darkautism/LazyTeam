@@ -15,7 +15,7 @@ mod review_mcp;
 mod runtime;
 mod session;
 use review_mcp::ReviewSlot;
-use runtime::{AgentRunResult, AgentRuntime, PiRuntime};
+use runtime::{AgentRunResult, AgentRuntime, OpenCodeRuntime, PiRuntime};
 use lazyteam_sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
 use session::{AgentSession, SessionLock, SessionManager, SessionRole};
 
@@ -52,6 +52,8 @@ struct Args {
     workspace_dir: PathBuf,
     #[arg(long, env = "LAZYTEAM_PI_BIN", default_value = "pi")]
     pi_bin: String,
+    #[arg(long, env = "LAZYTEAM_OPENCODE_BIN", default_value = "opencode")]
+    opencode_bin: String,
     /// Verify the embedded Linux agent sandbox and exit without contacting the server.
     #[arg(long)]
     sandbox_diagnose: bool,
@@ -277,6 +279,7 @@ async fn async_main() -> anyhow::Result<()> {
     let enrollment_credential = args.join_code.as_deref().or(args.worker_token.as_deref());
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let pi_bin = args.pi_bin.clone();
+    let opencode_bin = args.opencode_bin.clone();
     let mut probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None, session_dir: None, sandbox: agent_sandbox.clone() };
     let mut agent_capabilities = probe_runtime.capabilities().await;
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
@@ -460,7 +463,7 @@ async fn async_main() -> anyhow::Result<()> {
             sleep(Duration::from_secs(5)).await;
             continue;
         }
-        if let Err(error) = process_cleanup(&client, &server, &worker_credential, worker_id, &args.workspace_dir, &args.state_dir, &session_manager).await {
+        if let Err(error) = process_cleanup(&client, &server, &worker_credential, worker_id, &args.workspace_dir, &args.state_dir, &session_manager, &agent_sandbox, &pi_bin, &opencode_bin).await {
             warn!(%error, "post-merge cleanup poll failed");
         }
         match poll_agent_auth(&client, &server, &worker_credential, worker_id).await {
@@ -568,9 +571,10 @@ async fn async_main() -> anyhow::Result<()> {
                                 break;
                             }
                         };
-                        let runtime = match runtime_for_config(
+                        let runtime = match slot_runtime_for_config(
                             &runtime_config.agent,
                             &pi_bin,
+                            &opencode_bin,
                             session.data_dir.clone(),
                             agent_sandbox.clone(),
                         ) {
@@ -624,9 +628,10 @@ async fn async_main() -> anyhow::Result<()> {
                                 break;
                             }
                         };
-                        let runtime = match runtime_for_config(
+                        let runtime = match slot_runtime_for_config(
                             &runtime_config.agent,
                             &pi_bin,
+                            &opencode_bin,
                             session.data_dir.clone(),
                             agent_sandbox.clone(),
                         ) {
@@ -1491,6 +1496,34 @@ fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, session_dir: PathBuf, s
     }))
 }
 
+fn opencode_runtime_for_config(agent: &AgentConfig, opencode_bin: &str, session_dir: PathBuf, sandbox: AgentSandbox) -> anyhow::Result<Arc<OpenCodeRuntime>> {
+    if agent.agent_type != "opencode" { bail!("unsupported agent type {}", agent.agent_type); }
+    Ok(Arc::new(OpenCodeRuntime {
+        binary: opencode_bin.to_string(),
+        provider: agent.provider.clone(),
+        model: agent.model.clone(),
+        session_dir: Some(session_dir),
+        sandbox,
+    }))
+}
+
+/// Explicit Pi/OpenCode dispatch on the Host-owned `agent_type`. The exact
+/// Host-selected provider/model is passed through untouched in both
+/// backends; worker-local overrides remain unsupported.
+fn slot_runtime_for_config(agent: &AgentConfig, pi_bin: &str, opencode_bin: &str, session_dir: PathBuf, sandbox: AgentSandbox) -> anyhow::Result<Arc<dyn AgentRuntime>> {
+    match agent.agent_type.as_str() {
+        "pi" => {
+            let runtime: Arc<dyn AgentRuntime> = runtime_for_config(agent, pi_bin, session_dir, sandbox)?;
+            Ok(runtime)
+        }
+        "opencode" => {
+            let runtime: Arc<dyn AgentRuntime> = opencode_runtime_for_config(agent, opencode_bin, session_dir, sandbox)?;
+            Ok(runtime)
+        }
+        other => bail!("unsupported agent type {other}"),
+    }
+}
+
 /// Persist an opaque backend session ID returned by a runtime without
 /// interpreting it. Scheduler code stays backend-neutral: the ID is treated
 /// as an opaque string scoped to the logical (task, role, backend) session.
@@ -1519,7 +1552,49 @@ async fn persist_backend_session_binding(
     Ok(())
 }
 
-async fn process_cleanup(client: &Client, server: &str, credential: &str, worker_id: Uuid, workspace_root: &Path, state_dir: &Path, session_manager: &SessionManager) -> anyhow::Result<()> {
+/// Retire every backend-owned session bound to a logical (task, role)
+/// that is being merged/retired. Each bound record is dispatched through
+/// the explicit Pi/OpenCode runtime selection and its backend-neutral
+/// `delete_backend_session` hook (a no-op for Pi's caller-chosen IDs,
+/// `opencode session delete` for OpenCode) inside the agent sandbox.
+/// Local metadata is left intact so a retry can still resume the bound
+/// session; the caller must run this exactly once per retirement, before
+/// `SessionManager::release`. Unknown backends are skipped with a warning
+/// so a future backend can never wedge post-merge cleanup.
+async fn retire_backend_sessions(
+    session_manager: &SessionManager,
+    sandbox: &AgentSandbox,
+    pi_bin: &str,
+    opencode_bin: &str,
+    task_id: Uuid,
+    role: SessionRole,
+) -> anyhow::Result<()> {
+    for session in session_manager.sessions_for(task_id, role).await {
+        let Some(backend_session_id) = session.backend_session_id.as_deref() else {
+            continue;
+        };
+        if !matches!(session.backend.as_str(), "pi" | "opencode") {
+            warn!(task = %task_id, role = role.as_str(), backend = %session.backend, "skipping retirement for unknown agent backend");
+            continue;
+        }
+        let agent = AgentConfig {
+            agent_type: session.backend.clone(),
+            provider: None,
+            model: None,
+            initial_prompt: String::new(),
+        };
+        let runtime = slot_runtime_for_config(&agent, pi_bin, opencode_bin, session.data_dir.clone(), sandbox.clone())
+            .with_context(|| format!("build {} cleanup runtime for task {}", session.backend, task_id))?;
+        runtime
+            .delete_backend_session(&session.data_dir, backend_session_id)
+            .await
+            .with_context(|| format!("delete {} backend session for task {}", session.backend, task_id))?;
+        info!(task = %task_id, role = role.as_str(), backend = %session.backend, "retired backend-owned agent session");
+    }
+    Ok(())
+}
+
+async fn process_cleanup(client: &Client, server: &str, credential: &str, worker_id: Uuid, workspace_root: &Path, state_dir: &Path, session_manager: &SessionManager, sandbox: &AgentSandbox, pi_bin: &str, opencode_bin: &str) -> anyhow::Result<()> {
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/cleanup")), credential).send().await?;
     let items: Vec<WorkerCleanup> = ensure_success(response).await?.json().await?;
     for item in items {
@@ -1535,6 +1610,14 @@ async fn process_cleanup(client: &Client, server: &str, credential: &str, worker
                 if agent_workspace.exists() { tokio::fs::remove_dir_all(&agent_workspace).await?; }
             }
         }
+        // Retire backend-owned sessions through each backend's supported
+        // delete operation before local metadata is released. Runs before
+        // `release` (which removes the data dirs the sandboxed delete runs
+        // from) and only on the post-merge path, so retries can still resume
+        // the bound session until the task is actually retired.
+        retire_backend_sessions(session_manager, sandbox, pi_bin, opencode_bin, item.task_id, item.role)
+            .await
+            .with_context(|| format!("retire {} backend sessions for task {}", item.role.as_str(), item.task_id))?;
         session_manager.release(item.task_id, item.role).await?;
         let response = worker_auth(
             client.post(format!("{server}/api/workers/{worker_id}/cleanup/{}/{}", item.task_id, item.role.as_str())),
@@ -2436,6 +2519,38 @@ mod tests {
         assert!(Args::try_parse_from(["lazyteam-worker", "--pi-model", "legacy"]).is_err());
         let args = Args::try_parse_from(["lazyteam-worker"]).unwrap();
         assert_eq!(args.pi_bin, "pi");
+        assert_eq!(args.opencode_bin, "opencode");
+    }
+
+    #[tokio::test]
+    async fn slot_dispatch_selects_pi_or_opencode_explicitly() {
+        let root = std::env::temp_dir().join(format!("lazyteam-runtime-dispatch-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let sandbox = AgentSandbox::prepare(&root, "pi", None).await.unwrap();
+        let pi = AgentConfig {
+            agent_type: "pi".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        };
+        let runtime = slot_runtime_for_config(&pi, "pi", "opencode", root.join("session-pi"), sandbox.clone()).unwrap();
+        assert_eq!(runtime.kind(), "pi");
+        let opencode = AgentConfig {
+            agent_type: "opencode".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        };
+        let runtime = slot_runtime_for_config(&opencode, "pi", "opencode", root.join("session-opencode"), sandbox.clone()).unwrap();
+        assert_eq!(runtime.kind(), "opencode");
+        let unknown = AgentConfig {
+            agent_type: "other".into(),
+            provider: None,
+            model: None,
+            initial_prompt: "prompt".into(),
+        };
+        assert!(slot_runtime_for_config(&unknown, "pi", "opencode", root.join("session-other"), sandbox).is_err());
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
