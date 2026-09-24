@@ -346,6 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn oauth_callback_draft_survives_status_poll_rerender() {
+        // Polling must not destroy a callback URL/code while the human is
+        // typing or pasting it. Preserve it only for the exact worker /
+        // provider / OAuth request; a different context or terminal state
+        // must clear the draft instead of carrying credentials across flows.
+        assert!(INDEX.contains("box.dataset.oauthFlowKey===nextFlowKey"));
+        assert!(INDEX.contains("draft=sameFlow&&current?current.value:''"));
+        assert!(INDEX.contains("document.activeElement===current"));
+        assert!(INDEX.contains("next.setSelectionRange(start,end)"));
+        assert!(INDEX.contains("contextKey+':'+state.id"));
+        assert!(INDEX.contains("delete box.dataset.oauthFlowKey"));
+        assert!(INDEX.contains("flow.dataset.oauthContext!==oauthContext"));
+    }
+
+    #[test]
     fn remote_oauth_url_and_paste_completion_are_surfaced() {
         // Pi's browser OAuth redirects to worker-local localhost, so the
         // Host UI must surface the real authorization URL in a copyable
