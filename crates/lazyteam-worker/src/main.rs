@@ -463,7 +463,7 @@ async fn async_main() -> anyhow::Result<()> {
             sleep(Duration::from_secs(5)).await;
             continue;
         }
-        if let Err(error) = process_cleanup(&client, &server, &worker_credential, worker_id, &args.workspace_dir, &args.state_dir, &session_manager).await {
+        if let Err(error) = process_cleanup(&client, &server, &worker_credential, worker_id, &args.workspace_dir, &args.state_dir, &session_manager, &agent_sandbox, &pi_bin, &opencode_bin).await {
             warn!(%error, "post-merge cleanup poll failed");
         }
         match poll_agent_auth(&client, &server, &worker_credential, worker_id).await {
@@ -1539,7 +1539,49 @@ async fn persist_backend_session_binding(
     Ok(())
 }
 
-async fn process_cleanup(client: &Client, server: &str, credential: &str, worker_id: Uuid, workspace_root: &Path, state_dir: &Path, session_manager: &SessionManager) -> anyhow::Result<()> {
+/// Retire every backend-owned session bound to a logical (task, role)
+/// that is being merged/retired. Each bound record is dispatched through
+/// the explicit Pi/OpenCode runtime selection and its backend-neutral
+/// `delete_backend_session` hook (a no-op for Pi's caller-chosen IDs,
+/// `opencode session delete` for OpenCode) inside the agent sandbox.
+/// Local metadata is left intact so a retry can still resume the bound
+/// session; the caller must run this exactly once per retirement, before
+/// `SessionManager::release`. Unknown backends are skipped with a warning
+/// so a future backend can never wedge post-merge cleanup.
+async fn retire_backend_sessions(
+    session_manager: &SessionManager,
+    sandbox: &AgentSandbox,
+    pi_bin: &str,
+    opencode_bin: &str,
+    task_id: Uuid,
+    role: SessionRole,
+) -> anyhow::Result<()> {
+    for session in session_manager.sessions_for(task_id, role).await {
+        let Some(backend_session_id) = session.backend_session_id.as_deref() else {
+            continue;
+        };
+        if !matches!(session.backend.as_str(), "pi" | "opencode") {
+            warn!(task = %task_id, role = role.as_str(), backend = %session.backend, "skipping retirement for unknown agent backend");
+            continue;
+        }
+        let agent = AgentConfig {
+            agent_type: session.backend.clone(),
+            provider: None,
+            model: None,
+            initial_prompt: String::new(),
+        };
+        let runtime = slot_runtime_for_config(&agent, pi_bin, opencode_bin, session.data_dir.clone(), sandbox.clone())
+            .with_context(|| format!("build {} cleanup runtime for task {}", session.backend, task_id))?;
+        runtime
+            .delete_backend_session(&session.data_dir, backend_session_id)
+            .await
+            .with_context(|| format!("delete {} backend session for task {}", session.backend, task_id))?;
+        info!(task = %task_id, role = role.as_str(), backend = %session.backend, "retired backend-owned agent session");
+    }
+    Ok(())
+}
+
+async fn process_cleanup(client: &Client, server: &str, credential: &str, worker_id: Uuid, workspace_root: &Path, state_dir: &Path, session_manager: &SessionManager, sandbox: &AgentSandbox, pi_bin: &str, opencode_bin: &str) -> anyhow::Result<()> {
     let response = worker_auth(client.get(format!("{server}/api/workers/{worker_id}/cleanup")), credential).send().await?;
     let items: Vec<WorkerCleanup> = ensure_success(response).await?.json().await?;
     for item in items {
@@ -1555,6 +1597,14 @@ async fn process_cleanup(client: &Client, server: &str, credential: &str, worker
                 if agent_workspace.exists() { tokio::fs::remove_dir_all(&agent_workspace).await?; }
             }
         }
+        // Retire backend-owned sessions through each backend's supported
+        // delete operation before local metadata is released. Runs before
+        // `release` (which removes the data dirs the sandboxed delete runs
+        // from) and only on the post-merge path, so retries can still resume
+        // the bound session until the task is actually retired.
+        retire_backend_sessions(session_manager, sandbox, pi_bin, opencode_bin, item.task_id, item.role)
+            .await
+            .with_context(|| format!("retire {} backend sessions for task {}", item.role.as_str(), item.task_id))?;
         session_manager.release(item.task_id, item.role).await?;
         let response = worker_auth(
             client.post(format!("{server}/api/workers/{worker_id}/cleanup/{}/{}", item.task_id, item.role.as_str())),

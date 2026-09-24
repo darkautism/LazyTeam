@@ -1133,6 +1133,12 @@ pub trait AgentRuntime: Send + Sync {
     async fn capabilities(&self) -> AgentCapabilities;
     async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult>;
     fn supports_reviewer_mcp(&self) -> bool { false }
+    /// Delete a backend-owned session when its logical session is retired
+    /// (post-merge cleanup). The default is a no-op so backends without
+    /// backend-owned identity (Pi reuses caller-chosen IDs) are unchanged.
+    async fn delete_backend_session(&self, _workspace: &Path, _backend_session_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn run_review_with_mcp(
         &self,
         _workspace: &Path,
@@ -2266,6 +2272,8 @@ impl OpenCodeRuntime {
     /// Remove a backend-owned OpenCode session through the supported
     /// headless session operation. Runs inside the sandbox with a bounded
     /// wait so cleanup can neither leak Host credentials nor strand a child.
+    /// This is the [`AgentRuntime::delete_backend_session`] hook body,
+    /// invoked by post-merge retirement before local metadata is released.
     pub async fn delete_session(&self, workspace: &Path, backend_session_id: &str) -> anyhow::Result<()> {
         let session = backend_session_id.trim();
         if session.is_empty() {
@@ -2342,6 +2350,10 @@ impl AgentRuntime for OpenCodeRuntime {
 
     async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
         self.run_with_limits(workspace, prompt, backend_session_id, opencode_timeout(), opencode_stall_window()).await
+    }
+
+    async fn delete_backend_session(&self, workspace: &Path, backend_session_id: &str) -> anyhow::Result<()> {
+        self.delete_session(workspace, backend_session_id).await
     }
 }
 
@@ -3247,6 +3259,65 @@ echo '{"role":"assistant","text":"final for '"$session"'"}'
         })
         .await;
         assert!(outcome.is_ok(), "sandbox isolation probe must be bounded");
+        outcome.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opencode_retirement_deletes_backend_session_before_release() {
+        use crate::session::{SessionManager, SessionRole};
+        let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+            let root = std::env::temp_dir().join(format!("lazyteam-opencode-retire-{}", Uuid::new_v4()));
+            let state_dir = root.join("state");
+            let workspace = root.join("workspace");
+            tokio::fs::create_dir_all(&workspace).await.unwrap();
+            let manager = SessionManager::new(&state_dir);
+            let task_id = Uuid::new_v4();
+            // Bind an opencode backend-owned session and stage the fake CLI
+            // in its data dir (the sandbox resolves the helper there).
+            let bound = manager.bind_backend_session(task_id, SessionRole::Implementation, "opencode", "ses_retire_me").await.unwrap();
+            let binary = write_fake_opencode(&bound.data_dir).await;
+            // A Pi record on the same logical session carries no
+            // backend-owned identity; its hook must be a silent no-op.
+            let pi = manager.acquire(task_id, SessionRole::Implementation, "pi").await.unwrap();
+            assert!(pi.backend_session_id.is_some());
+            // An unknown future backend must never wedge retirement.
+            let future = manager.bind_backend_session(task_id, SessionRole::Implementation, "future-backend", "ses_future").await.unwrap();
+            assert!(future.data_dir.exists());
+
+            use_real_sandbox_launcher();
+            let sandbox_root = root.join("sandbox-state");
+            tokio::fs::create_dir_all(&sandbox_root).await.unwrap();
+            let sandbox = AgentSandbox::prepare(&sandbox_root, "pi", None).await.unwrap();
+            crate::retire_backend_sessions(
+                &manager,
+                &sandbox,
+                "pi",
+                &binary.to_string_lossy(),
+                task_id,
+                SessionRole::Implementation,
+            )
+            .await
+            .unwrap();
+
+            // The production retire path invoked the supported backend delete
+            // op once, for the opencode binding only.
+            assert_eq!(
+                tokio::fs::read_to_string(bound.data_dir.join("deleted-marker")).await.unwrap().trim(),
+                "ses_retire_me",
+            );
+            // Retirement preserves the binding so a retry could still resume;
+            // only `release` drops local metadata.
+            let resumed = manager.acquire(task_id, SessionRole::Implementation, "opencode").await.unwrap();
+            assert_eq!(resumed.backend_session_id.as_deref(), Some("ses_retire_me"));
+            assert_eq!(resumed.data_dir, bound.data_dir);
+            manager.release(task_id, SessionRole::Implementation).await.unwrap();
+            assert!(!bound.data_dir.exists());
+            let fresh = manager.acquire(task_id, SessionRole::Implementation, "opencode").await.unwrap();
+            assert_eq!(fresh.backend_session_id, Option::<String>::None);
+            let _ = tokio::fs::remove_dir_all(&root).await;
+        })
+        .await;
+        assert!(outcome.is_ok(), "retirement lifecycle must be bounded");
         outcome.unwrap();
     }
 }
