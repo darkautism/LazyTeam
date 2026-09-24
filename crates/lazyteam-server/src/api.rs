@@ -474,6 +474,13 @@ struct AgentModelRefreshQueued {
 }
 
 #[derive(Debug, Serialize)]
+struct AgentModelRefreshStatus {
+    id: Uuid,
+    provider: Option<String>,
+    pending: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ManagedCapabilityOption {
     id: &'static str,
     label: &'static str,
@@ -619,6 +626,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/workers/{id}/oauth-login/{request_id}/input", get(claim_worker_oauth_login_input))
         .route("/api/workers/{id}/oauth-login/{request_id}/input/{input_id}/ack", post(ack_worker_oauth_login_input))
         .route("/api/workers/{id}/models/refresh", post(queue_worker_model_refresh))
+        .route("/api/workers/{id}/models/refresh/{request_id}", get(worker_model_refresh_status))
         .route("/api/workers/{id}/models/refresh/{request_id}/ack", post(ack_worker_model_refresh))
         .route("/api/workers/{id}/capabilities", post(update_worker_capabilities))
         .route("/api/workers/{id}/capability-build", post(report_capability_build))
@@ -1586,6 +1594,20 @@ async fn queue_worker_model_refresh(
     let response = AgentModelRefreshQueued { id: request.id, provider: request.provider.clone(), queued: true };
     state.model_refresh_requests.lock().await.entry(id).or_default().push_back(request);
     Ok(Json(response))
+}
+
+async fn worker_model_refresh_status(
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<AgentModelRefreshStatus> {
+    let requests = state.model_refresh_requests.lock().await;
+    let request = requests.get(&id)
+        .and_then(|queue| queue.iter().find(|request| request.id == request_id));
+    Ok(Json(AgentModelRefreshStatus {
+        id: request_id,
+        provider: request.map(|request| request.provider.clone()),
+        pending: request.is_some(),
+    }))
 }
 
 async fn ack_worker_model_refresh(
@@ -5151,6 +5173,12 @@ mod tests {
         ).await.unwrap();
         assert_eq!(config.model_refresh.as_ref().unwrap().id, first.id);
         assert_eq!(state.model_refresh_requests.lock().await.get(&worker_id).unwrap().len(), 2);
+        let Json(status) = worker_model_refresh_status(
+            Path((worker_id, first.id)),
+            State(state.clone()),
+        ).await.unwrap();
+        assert!(status.pending);
+        assert_eq!(status.provider.as_deref(), Some("key-only"));
 
         let err = ack_worker_model_refresh(
             Path((worker_id, second.id)),
@@ -5164,6 +5192,11 @@ mod tests {
             State(state.clone()),
             worker_headers("oauth-cred"),
         ).await.unwrap();
+        let Json(status) = worker_model_refresh_status(
+            Path((worker_id, first.id)),
+            State(state.clone()),
+        ).await.unwrap();
+        assert!(!status.pending);
         let Json(config) = worker_runtime_config(
             Path(worker_id),
             State(state.clone()),

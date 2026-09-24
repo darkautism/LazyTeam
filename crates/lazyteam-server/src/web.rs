@@ -348,7 +348,13 @@ mod tests {
         assert!(INDEX.contains("renderAgentCatalog(w,true)"));
         assert!(INDEX.contains("function workerAgentDraftChanged()"));
         assert!(INDEX.contains("Save agent backend first"));
+        assert!(INDEX.contains("worker-provider-search"));
+        assert!(INDEX.contains("worker-model-search"));
+        assert!(INDEX.contains("function filterWorkerProviders()"));
+        assert!(INDEX.contains("function filterWorkerModels()"));
         assert!(INDEX.contains("draftAgent===persistedAgent"));
+        assert!(INDEX.contains("/models/refresh/'+queued.id"));
+        assert!(INDEX.contains("if(!status.pending){completed=true;break}"));
         assert!(INDEX.contains("button.disabled=false"));
     }
 
