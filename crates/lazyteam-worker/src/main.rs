@@ -15,7 +15,7 @@ mod review_mcp;
 mod runtime;
 mod session;
 use review_mcp::ReviewSlot;
-use runtime::{AgentRunResult, AgentRuntime, PiRuntime};
+use runtime::{AgentRunResult, AgentRuntime, OpenCodeRuntime, PiRuntime};
 use lazyteam_sandbox::{AgentSandbox, prepare_agent_workspace, sync_agent_workspace};
 use session::{AgentSession, SessionLock, SessionManager, SessionRole};
 
@@ -52,6 +52,8 @@ struct Args {
     workspace_dir: PathBuf,
     #[arg(long, env = "LAZYTEAM_PI_BIN", default_value = "pi")]
     pi_bin: String,
+    #[arg(long, env = "LAZYTEAM_OPENCODE_BIN", default_value = "opencode")]
+    opencode_bin: String,
     /// Verify the embedded Linux agent sandbox and exit without contacting the server.
     #[arg(long)]
     sandbox_diagnose: bool,
@@ -277,6 +279,7 @@ async fn async_main() -> anyhow::Result<()> {
     let enrollment_credential = args.join_code.as_deref().or(args.worker_token.as_deref());
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let pi_bin = args.pi_bin.clone();
+    let opencode_bin = args.opencode_bin.clone();
     let mut probe_runtime = PiRuntime { binary: pi_bin.clone(), provider: None, model: None, session_dir: None, sandbox: agent_sandbox.clone() };
     let mut agent_capabilities = probe_runtime.capabilities().await;
     let tags: BTreeMap<String, String> = args.tags.into_iter().collect();
@@ -568,9 +571,10 @@ async fn async_main() -> anyhow::Result<()> {
                                 break;
                             }
                         };
-                        let runtime = match runtime_for_config(
+                        let runtime = match slot_runtime_for_config(
                             &runtime_config.agent,
                             &pi_bin,
+                            &opencode_bin,
                             session.data_dir.clone(),
                             agent_sandbox.clone(),
                         ) {
@@ -624,9 +628,10 @@ async fn async_main() -> anyhow::Result<()> {
                                 break;
                             }
                         };
-                        let runtime = match runtime_for_config(
+                        let runtime = match slot_runtime_for_config(
                             &runtime_config.agent,
                             &pi_bin,
+                            &opencode_bin,
                             session.data_dir.clone(),
                             agent_sandbox.clone(),
                         ) {
@@ -1476,6 +1481,34 @@ fn runtime_for_config(agent: &AgentConfig, pi_bin: &str, session_dir: PathBuf, s
         session_dir: Some(session_dir),
         sandbox,
     }))
+}
+
+fn opencode_runtime_for_config(agent: &AgentConfig, opencode_bin: &str, session_dir: PathBuf, sandbox: AgentSandbox) -> anyhow::Result<Arc<OpenCodeRuntime>> {
+    if agent.agent_type != "opencode" { bail!("unsupported agent type {}", agent.agent_type); }
+    Ok(Arc::new(OpenCodeRuntime {
+        binary: opencode_bin.to_string(),
+        provider: agent.provider.clone(),
+        model: agent.model.clone(),
+        session_dir: Some(session_dir),
+        sandbox,
+    }))
+}
+
+/// Explicit Pi/OpenCode dispatch on the Host-owned `agent_type`. The exact
+/// Host-selected provider/model is passed through untouched in both
+/// backends; worker-local overrides remain unsupported.
+fn slot_runtime_for_config(agent: &AgentConfig, pi_bin: &str, opencode_bin: &str, session_dir: PathBuf, sandbox: AgentSandbox) -> anyhow::Result<Arc<dyn AgentRuntime>> {
+    match agent.agent_type.as_str() {
+        "pi" => {
+            let runtime: Arc<dyn AgentRuntime> = runtime_for_config(agent, pi_bin, session_dir, sandbox)?;
+            Ok(runtime)
+        }
+        "opencode" => {
+            let runtime: Arc<dyn AgentRuntime> = opencode_runtime_for_config(agent, opencode_bin, session_dir, sandbox)?;
+            Ok(runtime)
+        }
+        other => bail!("unsupported agent type {other}"),
+    }
 }
 
 /// Persist an opaque backend session ID returned by a runtime without
@@ -2423,6 +2456,38 @@ mod tests {
         assert!(Args::try_parse_from(["lazyteam-worker", "--pi-model", "legacy"]).is_err());
         let args = Args::try_parse_from(["lazyteam-worker"]).unwrap();
         assert_eq!(args.pi_bin, "pi");
+        assert_eq!(args.opencode_bin, "opencode");
+    }
+
+    #[tokio::test]
+    async fn slot_dispatch_selects_pi_or_opencode_explicitly() {
+        let root = std::env::temp_dir().join(format!("lazyteam-runtime-dispatch-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let sandbox = AgentSandbox::prepare(&root, "pi", None).await.unwrap();
+        let pi = AgentConfig {
+            agent_type: "pi".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        };
+        let runtime = slot_runtime_for_config(&pi, "pi", "opencode", root.join("session-pi"), sandbox.clone()).unwrap();
+        assert_eq!(runtime.kind(), "pi");
+        let opencode = AgentConfig {
+            agent_type: "opencode".into(),
+            provider: Some("host-provider".into()),
+            model: Some("host-model".into()),
+            initial_prompt: "prompt".into(),
+        };
+        let runtime = slot_runtime_for_config(&opencode, "pi", "opencode", root.join("session-opencode"), sandbox.clone()).unwrap();
+        assert_eq!(runtime.kind(), "opencode");
+        let unknown = AgentConfig {
+            agent_type: "other".into(),
+            provider: None,
+            model: None,
+            initial_prompt: "prompt".into(),
+        };
+        assert!(slot_runtime_for_config(&unknown, "pi", "opencode", root.join("session-other"), sandbox).is_err());
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
