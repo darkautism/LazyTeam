@@ -2230,6 +2230,27 @@ mod tests {
                 if !libc::WIFSIGNALED(status) || libc::WTERMSIG(status) != libc::SIGKILL {
                     libc::_exit(24);
                 }
+                // Lifecycle: a second spawn/kill/reap cycle must still work
+                // after the first termination, so sandbox child management
+                // is repeatable and does not hang on reuse.
+                let second = libc::fork();
+                if second < 0 {
+                    libc::_exit(25);
+                }
+                if second == 0 {
+                    libc::pause();
+                    libc::_exit(0);
+                }
+                if libc::kill(second, libc::SIGKILL) != 0 {
+                    libc::_exit(26);
+                }
+                let mut second_status = 0;
+                if libc::waitpid(second, &mut second_status, 0) != second {
+                    libc::_exit(27);
+                }
+                if !libc::WIFSIGNALED(second_status) || libc::WTERMSIG(second_status) != libc::SIGKILL {
+                    libc::_exit(28);
+                }
                 libc::_exit(0);
             }
             let mut status = 0;
