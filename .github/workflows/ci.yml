@@ -15,6 +15,18 @@ jobs:
       # OpenCode sandbox tests re-exec the real worker binary as the sandbox
       # launcher; cargo test only builds the libtest harness, not that binary.
       - run: cargo build -p lazyteam-worker
+      - name: Real OpenCode CLI sandbox smoke
+        run: |
+          set -eu
+          version="$(awk -F= '/^ARG OPENCODE_VERSION=/{print $2}' Dockerfile.worker)"
+          test -n "$version"
+          rm -rf /tmp/lazyteam-opencode-real
+          npm install --prefix /tmp/lazyteam-opencode-real --no-audit --no-fund "opencode-ai@$version"
+          real_bin="$(find /tmp/lazyteam-opencode-real/node_modules -path '*/bin/opencode' -type f | grep 'opencode-linux-' | head -n 1)"
+          test -x "$real_bin"
+          "$real_bin" --version
+          LAZYTEAM_REAL_OPENCODE_BIN="$real_bin" \
+            cargo test -p lazyteam-worker real_opencode_catalog_refresh_works_through_agent_sandbox -- --ignored --nocapture
       - run: cargo test --workspace
       - run: python3 scripts/ui-regression.py
       - run: sh scripts/pi-auto-update-smoke.sh

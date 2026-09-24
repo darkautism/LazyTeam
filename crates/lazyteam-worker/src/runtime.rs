@@ -3311,6 +3311,38 @@ echo '{"role":"assistant","text":"final for '"$session"'"}'
     }
 
     #[tokio::test]
+    #[ignore = "staging-only: requires LAZYTEAM_REAL_OPENCODE_BIN and network access"]
+    async fn real_opencode_catalog_refresh_works_through_agent_sandbox() {
+        let source = std::env::var_os("LAZYTEAM_REAL_OPENCODE_BIN")
+            .map(PathBuf::from)
+            .expect("set LAZYTEAM_REAL_OPENCODE_BIN to a real OpenCode binary");
+        let root = std::env::temp_dir().join(format!("lazyteam-real-opencode-{}", Uuid::new_v4()));
+        let session_dir = root.join("sessions").join("catalog");
+        tokio::fs::create_dir_all(&session_dir).await.unwrap();
+        let binary = session_dir.join("opencode");
+        tokio::fs::copy(&source, &binary).await.unwrap();
+        let mut perms = tokio::fs::metadata(&binary).await.unwrap().permissions();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            tokio::fs::set_permissions(&binary, perms).await.unwrap();
+        }
+        let runtime = opencode_test_runtime(&binary, session_dir).await;
+        runtime.force_refresh_models().await.unwrap();
+        let capabilities = runtime.capabilities().await;
+        assert!(capabilities.probe_error.is_none(), "{:?}", capabilities.probe_error);
+        assert!(!capabilities.models.is_empty(), "real refreshed OpenCode catalog is empty");
+        if let Ok(expected) = std::env::var("LAZYTEAM_EXPECT_OPENCODE_MODEL") {
+            assert!(
+                capabilities.models.iter().any(|model| format!("{}/{}", model.provider, model.id) == expected),
+                "expected OpenCode model {expected} missing from real refreshed catalog: {:?}",
+                capabilities.models.iter().map(|model| format!("{}/{}", model.provider, model.id)).collect::<Vec<_>>()
+            );
+        }
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
     async fn opencode_run_creates_resumes_and_cleans_sessions() {
         let outcome = tokio::time::timeout(Duration::from_secs(120), async {
             let root = std::env::temp_dir().join(format!("lazyteam-opencode-{}", Uuid::new_v4()));

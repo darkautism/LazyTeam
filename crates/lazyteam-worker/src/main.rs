@@ -364,7 +364,7 @@ async fn async_main() -> anyhow::Result<()> {
             ).await {
                 warn!(%error, "startup capability-ready recovery report failed");
             }
-            agent_capabilities = probe_selected_capabilities(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
+            agent_capabilities = probe_selected_capabilities_on_startup(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
             if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                 warn!(%error, "agent capability refresh after rootfs reconciliation failed");
             }
@@ -504,7 +504,7 @@ async fn async_main() -> anyhow::Result<()> {
                 let backend_changed = config.agent.agent_type != runtime_config.agent.agent_type;
                 runtime_config = config;
                 if backend_changed {
-                    agent_capabilities = probe_selected_capabilities(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
+                    agent_capabilities = probe_selected_capabilities_on_startup(&runtime_config.agent, &probe_runtime, &opencode_bin, &agent_sandbox).await;
                     if let Err(error) = report_capabilities(&client, &server, &worker_credential, worker_id, &agent_capabilities).await {
                         warn!(%error, backend = %runtime_config.agent.agent_type, "agent capability report after backend switch failed");
                     }
@@ -1513,6 +1513,25 @@ async fn probe_selected_capabilities(
             ..AgentCapabilities::default()
         },
     }
+}
+
+async fn probe_selected_capabilities_on_startup(
+    agent: &AgentConfig,
+    pi_runtime: &PiRuntime,
+    opencode_bin: &str,
+    sandbox: &AgentSandbox,
+) -> AgentCapabilities {
+    if agent.agent_type == "opencode" {
+        match refresh_selected_models(agent, pi_runtime, opencode_bin, sandbox, "").await {
+            Ok(capabilities) => return capabilities,
+            Err(error) => {
+                let mut capabilities = probe_selected_capabilities(agent, pi_runtime, opencode_bin, sandbox).await;
+                capabilities.probe_error = Some(format!("OpenCode startup model refresh failed: {error:#}"));
+                return capabilities;
+            }
+        }
+    }
+    probe_selected_capabilities(agent, pi_runtime, opencode_bin, sandbox).await
 }
 
 async fn refresh_selected_models(

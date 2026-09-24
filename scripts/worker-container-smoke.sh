@@ -61,3 +61,12 @@ while [ "$attempt" -le 2 ]; do
   esac
   attempt=$((attempt + 1))
 done
+
+# The published worker image must contain the pinned real OpenCode CLI and its
+# refreshed catalog must be consumable before the image is allowed to publish.
+opencode_output="$(docker run --rm --entrypoint opencode "$image" models --refresh)"
+printf '%s\n' "$opencode_output"
+printf '%s\n' "$opencode_output" | grep -E '^opencode/[^[:space:]]+$' >/dev/null || {
+  echo "::error title=Worker OpenCode catalog smoke failed::no opencode/* models returned after models --refresh"
+  exit 1
+}
