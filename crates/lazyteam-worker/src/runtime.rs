@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::{Path, PathBuf}, process::Stdio};
+use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, process::Stdio};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -1962,6 +1962,7 @@ impl AgentRuntime for PiRuntime {
 
 const DEFAULT_OPENCODE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_OPENCODE_STALL_SECS: u64 = 360;
+const DEFAULT_OPENCODE_TOOL_HARD_LIMIT_SECS: u64 = 25 * 60;
 const OPENCODE_DELETE_TIMEOUT_SECS: u64 = 15;
 const OPENCODE_EXIT_GRACE_SECS: u64 = 5;
 const OPENCODE_STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -1981,6 +1982,15 @@ fn opencode_stall_window() -> Duration {
         DEFAULT_OPENCODE_STALL_SECS,
         30,
         1500,
+    )
+}
+
+fn opencode_tool_hard_limit() -> Duration {
+    bounded_duration_from_env(
+        "LAZYTEAM_OPENCODE_TOOL_HARD_LIMIT_SECS",
+        DEFAULT_OPENCODE_TOOL_HARD_LIMIT_SECS,
+        60,
+        25 * 60,
     )
 }
 
@@ -2144,6 +2154,33 @@ fn opencode_text_parts(scoped: &Value) -> Option<String> {
     None
 }
 
+fn opencode_completed_tool_timing(event: &Value) -> Option<(String, Duration)> {
+    if event.get("type").and_then(Value::as_str) != Some("tool_use") {
+        return None;
+    }
+    let part = event.get("part")?;
+    let state = part.get("state")?;
+    if state.get("status").and_then(Value::as_str) != Some("completed") {
+        return None;
+    }
+    let time = state.get("time")?;
+    let start = time.get("start")?.as_u64()?;
+    let end = time.get("end")?.as_u64()?;
+    if end < start {
+        return None;
+    }
+    let call_id = part
+        .get("callID")
+        .or_else(|| part.get("callId"))
+        .or_else(|| part.get("call_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{}:{start}:{end}", part.get("tool").and_then(Value::as_str).unwrap_or("unknown")));
+    Some((call_id, Duration::from_millis(end - start)))
+}
+
 fn apply_opencode_event(state: &mut OpenCodeStreamState, event: &Value) {
     if state.session_id.is_none() {
         if let Some(id) = opencode_session_id_from_event(event) {
@@ -2231,6 +2268,7 @@ impl OpenCodeRuntime {
         backend_session_id: Option<&str>,
         timeout: Duration,
         stall: Duration,
+        tool_hard_limit: Duration,
     ) -> anyhow::Result<AgentRunResult> {
         let model = opencode_model_selector(self.provider.as_deref(), self.model.as_deref())?;
         if let Some(session_dir) = &self.session_dir {
@@ -2255,15 +2293,23 @@ impl OpenCodeRuntime {
             tail
         });
 
-        let deadline = Instant::now() + timeout;
+        let started_at = Instant::now();
+        let mut credited_tool_runtime = Duration::ZERO;
+        let mut credited_tool_calls = BTreeSet::new();
         let mut last_progress = Instant::now();
         let mut state = OpenCodeStreamState::default();
         let mut lines = BufReader::new(stdout).lines();
         loop {
             let now = Instant::now();
-            if now >= deadline {
+            let active_elapsed = now.saturating_duration_since(started_at).saturating_sub(credited_tool_runtime);
+            if active_elapsed >= timeout {
                 terminate_pi_child(&mut child).await?;
-                bail!("OpenCode run exceeded its {}s timeout", timeout.as_secs());
+                bail!(
+                    "OpenCode agent/model work exceeded its {}s active-time budget (wall={}s, credited_tool={}s)",
+                    timeout.as_secs(),
+                    now.saturating_duration_since(started_at).as_secs(),
+                    credited_tool_runtime.as_secs(),
+                );
             }
             let idle = now.saturating_duration_since(last_progress);
             if idle >= stall {
@@ -2274,14 +2320,16 @@ impl OpenCodeRuntime {
                     stall.as_secs(),
                 );
             }
-            let wait = (deadline.saturating_duration_since(now)).min(stall.saturating_sub(idle));
+            // OpenCode 1.18 emits tool_use only after the tool completes, so
+            // a quiet build/test has no observable start event. Do not let the
+            // agent active-time budget kill an in-flight tool while waiting for
+            // the next JSON event; the stall watchdog still bounds a genuinely
+            // silent model/provider phase. Completed tool wall time is credited
+            // below before the active-time budget is checked again.
+            let wait = stall.saturating_sub(idle);
             match tokio::time::timeout(wait, lines.next_line()).await {
                 Err(_) => {
                     let now = Instant::now();
-                    if now >= deadline {
-                        terminate_pi_child(&mut child).await?;
-                        bail!("OpenCode run exceeded its {}s timeout", timeout.as_secs());
-                    }
                     terminate_pi_child(&mut child).await?;
                     bail!(
                         "OpenCode run produced no output for {}s (stall limit {}s)",
@@ -2299,6 +2347,22 @@ impl OpenCodeRuntime {
                     let Ok(event) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
+                    if let Some((call_id, duration)) = opencode_completed_tool_timing(&event) {
+                        if duration > tool_hard_limit {
+                            terminate_pi_child(&mut child).await?;
+                            bail!(
+                                "OpenCode tool exceeded its {}s hard runtime limit (tool={}s)",
+                                tool_hard_limit.as_secs(),
+                                duration.as_secs(),
+                            );
+                        }
+                        if credited_tool_calls.insert(call_id) {
+                            let wall_elapsed = Instant::now().saturating_duration_since(started_at);
+                            credited_tool_runtime = credited_tool_runtime
+                                .saturating_add(duration)
+                                .min(wall_elapsed);
+                        }
+                    }
                     apply_opencode_event(&mut state, &event);
                 }
             }
@@ -2410,7 +2474,14 @@ impl AgentRuntime for OpenCodeRuntime {
     }
 
     async fn run(&self, workspace: &Path, prompt: &str, backend_session_id: Option<&str>) -> anyhow::Result<AgentRunResult> {
-        self.run_with_limits(workspace, prompt, backend_session_id, opencode_timeout(), opencode_stall_window()).await
+        self.run_with_limits(
+            workspace,
+            prompt,
+            backend_session_id,
+            opencode_timeout(),
+            opencode_stall_window(),
+            opencode_tool_hard_limit(),
+        ).await
     }
 
     async fn delete_backend_session(&self, workspace: &Path, backend_session_id: &str) -> anyhow::Result<()> {
@@ -3422,6 +3493,71 @@ echo '{"role":"assistant","text":"final for '"$session"'"}'
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
+    #[test]
+    fn opencode_completed_tool_timing_reads_json_stream_shape() {
+        let event = json!({
+            "type": "tool_use",
+            "part": {
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_function_test_1",
+                "state": {
+                    "status": "completed",
+                    "time": {"start": 1000, "end": 4600}
+                }
+            }
+        });
+        let (call_id, duration) = opencode_completed_tool_timing(&event).expect("completed tool timing");
+        assert_eq!(call_id, "call_function_test_1");
+        assert_eq!(duration, Duration::from_millis(3600));
+        assert!(opencode_completed_tool_timing(&json!({"type":"step_start"})).is_none());
+        assert!(opencode_completed_tool_timing(&json!({
+            "type":"tool_use",
+            "part":{"tool":"bash","state":{"status":"running","time":{"start":1000,"end":4600}}}
+        })).is_none());
+    }
+
+    #[tokio::test]
+    async fn opencode_completed_tool_runtime_does_not_consume_agent_budget() {
+        let root = std::env::temp_dir().join(format!("lazyteam-opencode-tool-credit-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let session_dir = root.join("sessions").join("task");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&session_dir).await.unwrap();
+        let fake = session_dir.join("slow-tool-opencode.sh");
+        tokio::fs::write(
+            &fake,
+            r#"#!/bin/sh
+echo '{"type":"session.created","sessionID":"ses_slow_tool"}'
+sleep 3
+echo '{"type":"tool_use","part":{"type":"tool","tool":"bash","callID":"call_slow_1","state":{"status":"completed","input":{"command":"cargo test"},"output":"ok","time":{"start":1000,"end":4000}}}}'
+echo '{"type":"text","part":{"type":"text","text":"Done."}}'
+"#,
+        ).await.unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&fake).await.unwrap().permissions();
+            perms.set_mode(0o755);
+            tokio::fs::set_permissions(&fake, perms).await.unwrap();
+        }
+        let runtime = opencode_test_runtime(&fake, session_dir).await;
+        let started = Instant::now();
+        let result = runtime
+            .run_with_limits(
+                &workspace,
+                "run slow tool",
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(6),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("completed tool wall time must be excluded from the 2s agent budget");
+        assert_eq!(result.summary, "Done.");
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
     #[tokio::test]
     async fn opencode_run_creates_resumes_and_cleans_sessions() {
         let outcome = tokio::time::timeout(Duration::from_secs(120), async {
@@ -3485,7 +3621,14 @@ echo '{"role":"assistant","text":"final for '"$session"'"}'
             let runtime = opencode_test_runtime(&sleeper, session_dir).await;
             let started = Instant::now();
             let result = runtime
-                .run_with_limits(&workspace, "stall", None, Duration::from_secs(30), Duration::from_secs(2))
+                .run_with_limits(
+                    &workspace,
+                    "stall",
+                    None,
+                    Duration::from_secs(30),
+                    Duration::from_secs(2),
+                    Duration::from_secs(30),
+                )
                 .await;
             let elapsed = started.elapsed();
             assert!(result.is_err(), "silent child must hit the stall path");
