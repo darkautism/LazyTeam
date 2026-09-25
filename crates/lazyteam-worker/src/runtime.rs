@@ -2243,6 +2243,15 @@ fn opencode_model_from_line(line: &str) -> Option<AgentModel> {
     })
 }
 
+fn opencode_models_from_catalog(catalog: &str) -> Vec<AgentModel> {
+    let mut seen = BTreeSet::new();
+    catalog
+        .lines()
+        .filter_map(opencode_model_from_line)
+        .filter(|model| seen.insert((model.provider.clone(), model.id.clone())))
+        .collect()
+}
+
 /// Concrete headless OpenCode runtime.
 ///
 /// Every run spawns `opencode run --format json --agent build --auto --model <provider/model>`
@@ -2435,7 +2444,7 @@ impl OpenCodeRuntime {
                 );
             }
             let stdout = String::from_utf8(output.stdout).context("OpenCode model catalog output is not UTF-8")?;
-            Ok(stdout.lines().filter_map(opencode_model_from_line).collect())
+            Ok(opencode_models_from_catalog(&stdout))
         })
         .await
         .context("OpenCode capability probe timed out")?
@@ -3348,6 +3357,30 @@ export class ModelRuntime {
         assert!(providers.iter().all(|provider| provider.configured));
         assert!(opencode_model_from_line("Models cache refreshed").is_none());
         assert!(opencode_model_from_line("unqualified").is_none());
+    }
+
+    #[test]
+    fn opencode_model_catalog_deduplicates_entries_and_preserves_nested_ids() {
+        let models = opencode_models_from_catalog(
+            "openrouter/anthropic/claude-sonnet\n\
+             opencode/space-bunny-free\n\
+             \n\
+             Models cache refreshed\n\
+             unqualified\n\
+             openrouter/anthropic/claude-sonnet\n\
+             opencode/space-bunny-free\n",
+        );
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| (model.provider.as_str(), model.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("openrouter", "anthropic/claude-sonnet"),
+                ("opencode", "space-bunny-free"),
+            ],
+        );
     }
 
 
